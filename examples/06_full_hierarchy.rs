@@ -14,7 +14,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    
+
     info!("=== Full Hierarchy Example ===\n");
     info!("Demonstrating the complete order book hierarchy.\n");
 
@@ -45,41 +45,42 @@ fn main() {
     let exp_30 = ExpirationDate::Days(pos!(30.0));
 
     if let Ok(btc) = manager.get("BTC")
-        && let Ok(exp_book) = btc.get_expiration(&exp_30) {
-            // Find ATM strike
-            let spot = 50000u64;
-            if let Ok(atm) = exp_book.atm_strike(spot) {
-                info!("BTC Spot: {}", spot);
-                info!("ATM Strike: {}", atm);
+        && let Ok(exp_book) = btc.get_expiration(&exp_30)
+    {
+        // Find ATM strike
+        let spot = 50000u64;
+        if let Ok(atm) = exp_book.atm_strike(spot) {
+            info!("BTC Spot: {}", spot);
+            info!("ATM Strike: {}", atm);
 
-                // Quote around ATM
-                let strikes_to_quote = [atm - 2000, atm - 1000, atm, atm + 1000, atm + 2000];
+            // Quote around ATM
+            let strikes_to_quote = [atm - 2000, atm - 1000, atm, atm + 1000, atm + 2000];
 
-                info!("\nQuoting strikes: {:?}", strikes_to_quote);
+            info!("\nQuoting strikes: {:?}", strikes_to_quote);
 
-                for &strike in &strikes_to_quote {
-                    if let Ok(s) = exp_book.get_strike(strike) {
-                        // Update call quotes
-                        s.call()
-                            .add_limit_order(OrderId::new(), Side::Buy, 450, 50)
-                            .unwrap();
-                        s.call()
-                            .add_limit_order(OrderId::new(), Side::Sell, 480, 50)
-                            .unwrap();
+            for &strike in &strikes_to_quote {
+                if let Ok(s) = exp_book.get_strike(strike) {
+                    // Update call quotes
+                    s.call()
+                        .add_limit_order(OrderId::new(), Side::Buy, 450, 50)
+                        .unwrap();
+                    s.call()
+                        .add_limit_order(OrderId::new(), Side::Sell, 480, 50)
+                        .unwrap();
 
-                        // Update put quotes
-                        s.put()
-                            .add_limit_order(OrderId::new(), Side::Buy, 200, 50)
-                            .unwrap();
-                        s.put()
-                            .add_limit_order(OrderId::new(), Side::Sell, 230, 50)
-                            .unwrap();
-                    }
+                    // Update put quotes
+                    s.put()
+                        .add_limit_order(OrderId::new(), Side::Buy, 200, 50)
+                        .unwrap();
+                    s.put()
+                        .add_limit_order(OrderId::new(), Side::Sell, 230, 50)
+                        .unwrap();
                 }
-
-                info!("Added market maker quotes to 5 strikes");
             }
+
+            info!("Added market maker quotes to 5 strikes");
         }
+    }
 
     // =========================================
     // Trading Scenario 2: Quote Retrieval
@@ -87,30 +88,31 @@ fn main() {
     info!("\n\n=== Scenario 2: Quote Retrieval ===\n");
 
     if let Ok(btc) = manager.get("BTC")
-        && let Ok(exp_book) = btc.get_expiration(&exp_30) {
-            info!("BTC 30-day Option Chain Quotes:\n");
-            info!(
-                "{:<10} {:>12} {:>12} {:>12} {:>12}",
-                "Strike", "Call Bid", "Call Ask", "Put Bid", "Put Ask"
-            );
-            info!("{}", "-".repeat(60));
+        && let Ok(exp_book) = btc.get_expiration(&exp_30)
+    {
+        info!("BTC 30-day Option Chain Quotes:\n");
+        info!(
+            "{:<10} {:>12} {:>12} {:>12} {:>12}",
+            "Strike", "Call Bid", "Call Ask", "Put Bid", "Put Ask"
+        );
+        info!("{}", "-".repeat(60));
 
-            for strike in exp_book.strike_prices() {
-                if let Ok(s) = exp_book.get_strike(strike) {
-                    let call_quote = s.call_quote();
-                    let put_quote = s.put_quote();
+        for strike in exp_book.strike_prices() {
+            if let Ok(s) = exp_book.get_strike(strike) {
+                let call_quote = s.call_quote();
+                let put_quote = s.put_quote();
 
-                    info!(
-                        "{:<10} {:>12} {:>12} {:>12} {:>12}",
-                        strike,
-                        format!("{:?}", call_quote.bid_price()),
-                        format!("{:?}", call_quote.ask_price()),
-                        format!("{:?}", put_quote.bid_price()),
-                        format!("{:?}", put_quote.ask_price()),
-                    );
-                }
+                info!(
+                    "{:<10} {:>12} {:>12} {:>12} {:>12}",
+                    strike,
+                    format!("{:?}", call_quote.bid_price()),
+                    format!("{:?}", call_quote.ask_price()),
+                    format!("{:?}", put_quote.bid_price()),
+                    format!("{:?}", put_quote.ask_price()),
+                );
             }
         }
+    }
 
     // =========================================
     // Trading Scenario 3: Order Execution
@@ -119,45 +121,46 @@ fn main() {
 
     if let Ok(btc) = manager.get("BTC")
         && let Ok(exp_book) = btc.get_expiration(&exp_30)
-            && let Ok(strike) = exp_book.get_strike(50000) {
-                info!("Simulating order flow on BTC-50000 Call:\n");
+        && let Ok(strike) = exp_book.get_strike(50000)
+    {
+        info!("Simulating order flow on BTC-50000 Call:\n");
 
-                // Get initial state
-                let initial_quote = strike.call_quote();
-                info!(
-                    "Initial: {} @ {:?} / {} @ {:?}",
-                    initial_quote.bid_size(),
-                    initial_quote.bid_price(),
-                    initial_quote.ask_size(),
-                    initial_quote.ask_price()
-                );
+        // Get initial state
+        let initial_quote = strike.call_quote();
+        info!(
+            "Initial: {} @ {:?} / {} @ {:?}",
+            initial_quote.bid_size(),
+            initial_quote.bid_price(),
+            initial_quote.ask_size(),
+            initial_quote.ask_price()
+        );
 
-                // Simulate aggressive buyer
-                info!("\n[Buyer] Lifting offer - buying 30 contracts");
-                strike
-                    .call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 480, 30)
-                    .unwrap();
+        // Simulate aggressive buyer
+        info!("\n[Buyer] Lifting offer - buying 30 contracts");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 480, 30)
+            .unwrap();
 
-                // Simulate aggressive seller
-                info!("[Seller] Hitting bid - selling 20 contracts");
-                strike
-                    .call()
-                    .add_limit_order(OrderId::new(), Side::Sell, 450, 20)
-                    .unwrap();
+        // Simulate aggressive seller
+        info!("[Seller] Hitting bid - selling 20 contracts");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 450, 20)
+            .unwrap();
 
-                // Check new state
-                let new_quote = strike.call_quote();
-                info!(
-                    "\nAfter flow: {} @ {:?} / {} @ {:?}",
-                    new_quote.bid_size(),
-                    new_quote.bid_price(),
-                    new_quote.ask_size(),
-                    new_quote.ask_price()
-                );
+        // Check new state
+        let new_quote = strike.call_quote();
+        info!(
+            "\nAfter flow: {} @ {:?} / {} @ {:?}",
+            new_quote.bid_size(),
+            new_quote.bid_price(),
+            new_quote.ask_size(),
+            new_quote.ask_price()
+        );
 
-                info!("\nTotal orders on strike: {}", strike.order_count());
-            }
+        info!("\nTotal orders on strike: {}", strike.order_count());
+    }
 
     // =========================================
     // Trading Scenario 4: Risk Analysis
@@ -215,36 +218,37 @@ fn main() {
 
     if let Ok(btc) = manager.get("BTC")
         && let Ok(exp_book) = btc.get_expiration(&exp_30)
-            && let Ok(strike) = exp_book.get_strike(50000) {
-                info!("BTC 50000 Strike Analysis:\n");
+        && let Ok(strike) = exp_book.get_strike(50000)
+    {
+        info!("BTC 50000 Strike Analysis:\n");
 
-                // Access by option style
-                let call = strike.get(OptionStyle::Call);
-                let put = strike.get(OptionStyle::Put);
+        // Access by option style
+        let call = strike.get(OptionStyle::Call);
+        let put = strike.get(OptionStyle::Put);
 
-                info!("\nCall Option:");
-                info!("  Orders: {}", call.order_count());
-                let bid_depth = call.total_bid_depth();
-                let ask_depth = call.total_ask_depth();
-                info!("  Bid depth: {}", bid_depth);
-                info!("  Ask depth: {}", ask_depth);
-                let imbalance = call.imbalance(5);
-                info!("  Imbalance: {:.1}%", imbalance * 100.0);
+        info!("\nCall Option:");
+        info!("  Orders: {}", call.order_count());
+        let bid_depth = call.total_bid_depth();
+        let ask_depth = call.total_ask_depth();
+        info!("  Bid depth: {}", bid_depth);
+        info!("  Ask depth: {}", ask_depth);
+        let imbalance = call.imbalance(5);
+        info!("  Imbalance: {:.1}%", imbalance * 100.0);
 
-                info!("\nPut Option:");
-                info!("  Orders: {}", put.order_count());
-                let bid_depth = put.total_bid_depth();
-                let ask_depth = put.total_ask_depth();
-                info!("  Bid depth: {}", bid_depth);
-                info!("  Ask depth: {}", ask_depth);
-                let imbalance = put.imbalance(5);
-                info!("  Imbalance: {:.1}%", imbalance * 100.0);
+        info!("\nPut Option:");
+        info!("  Orders: {}", put.order_count());
+        let bid_depth = put.total_bid_depth();
+        let ask_depth = put.total_ask_depth();
+        info!("  Bid depth: {}", bid_depth);
+        info!("  Ask depth: {}", ask_depth);
+        let imbalance = put.imbalance(5);
+        info!("  Imbalance: {:.1}%", imbalance * 100.0);
 
-                info!(
-                    "\nPut/Call Ratio (by order count): {:.2}",
-                    put.order_count() as f64 / call.order_count() as f64
-                );
-            }
+        info!(
+            "\nPut/Call Ratio (by order count): {:.2}",
+            put.order_count() as f64 / call.order_count() as f64
+        );
+    }
 
     // === Final Statistics ===
     info!("\n\n=== Final Market Statistics ===\n");

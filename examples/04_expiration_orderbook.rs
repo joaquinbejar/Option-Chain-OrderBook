@@ -14,7 +14,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    
+
     info!("=== ExpirationOrderBook Example ===\n");
     info!("This level wraps OptionChainOrderBook with expiration-specific features.\n");
 

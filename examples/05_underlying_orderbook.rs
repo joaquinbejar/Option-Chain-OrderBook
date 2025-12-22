@@ -14,7 +14,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    
+
     info!("=== UnderlyingOrderBook Example ===\n");
     info!("This level manages all expirations for a single underlying asset.\n");
 

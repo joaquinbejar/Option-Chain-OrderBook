@@ -318,4 +318,102 @@ mod tests {
         assert!(msg.contains("Deribit"));
         assert!(msg.contains("connection timeout"));
     }
+
+    #[test]
+    fn test_strike_not_found_error() {
+        let err = Error::strike_not_found(50000);
+        let msg = err.to_string();
+        assert!(msg.contains("50000"));
+    }
+
+    #[test]
+    fn test_underlying_not_found_error() {
+        let err = Error::underlying_not_found("BTC");
+        let msg = err.to_string();
+        assert!(msg.contains("BTC"));
+    }
+
+    #[test]
+    fn test_orderbook_error() {
+        let err = Error::orderbook("order rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("order rejected"));
+    }
+
+    #[test]
+    fn test_pricing_error() {
+        let err = Error::pricing("invalid volatility");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid volatility"));
+    }
+
+    #[test]
+    fn test_greeks_error() {
+        let err = Error::greeks("delta calculation failed");
+        let msg = err.to_string();
+        assert!(msg.contains("delta calculation failed"));
+    }
+
+    #[test]
+    fn test_risk_limit_breached_error() {
+        let err = Error::risk_limit_breached("max_delta");
+        let msg = err.to_string();
+        assert!(msg.contains("max_delta"));
+    }
+
+    #[test]
+    fn test_hedging_error() {
+        let err = Error::hedging("hedge order failed");
+        let msg = err.to_string();
+        assert!(msg.contains("hedge order failed"));
+    }
+
+    #[test]
+    fn test_quoting_error() {
+        let err = Error::quoting("spread too wide");
+        let msg = err.to_string();
+        assert!(msg.contains("spread too wide"));
+    }
+
+    #[test]
+    fn test_market_data_error() {
+        let err = Error::market_data("stale data");
+        let msg = err.to_string();
+        assert!(msg.contains("stale data"));
+    }
+
+    #[test]
+    fn test_configuration_error() {
+        let err = Error::configuration("missing API key");
+        let msg = err.to_string();
+        assert!(msg.contains("missing API key"));
+    }
+
+    #[test]
+    fn test_validation_error() {
+        let err = Error::validation("invalid quantity");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid quantity"));
+    }
+
+    #[test]
+    fn test_decimal_error() {
+        let err = Error::decimal("overflow");
+        let msg = err.to_string();
+        assert!(msg.contains("overflow"));
+    }
+
+    #[test]
+    fn test_no_data_error() {
+        let err = Error::no_data("no strikes available");
+        let msg = err.to_string();
+        assert!(msg.contains("no strikes available"));
+    }
+
+    #[test]
+    fn test_expiration_not_found_error() {
+        let err = Error::expiration_not_found("2024-03-29");
+        let msg = err.to_string();
+        assert!(msg.contains("2024-03-29"));
+    }
 }

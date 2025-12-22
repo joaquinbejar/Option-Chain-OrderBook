@@ -14,7 +14,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    
+
     info!("=== OptionOrderBook Example ===\n");
     info!("This is the lowest level: a single option contract order book.\n");
 

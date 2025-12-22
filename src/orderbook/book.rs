@@ -441,4 +441,160 @@ mod tests {
         let imbalance = book.imbalance(5);
         assert!((imbalance - 0.2).abs() < 0.01);
     }
+
+    #[test]
+    fn test_inner_access() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let _inner = book.inner();
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn test_inner_mut_access() {
+        let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let _inner_mut = book.inner_mut();
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn test_add_limit_order_with_tif() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
+            .unwrap();
+
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_best_bid_ask() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        assert!(book.best_bid().is_none());
+        assert!(book.best_ask().is_none());
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .unwrap();
+
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.best_ask(), Some(105));
+    }
+
+    #[test]
+    fn test_spread_bps() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 102, 5)
+            .unwrap();
+
+        let spread_bps = book.spread_bps();
+        assert!(spread_bps.is_some());
+    }
+
+    #[test]
+    fn test_snapshot() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .unwrap();
+
+        let snapshot = book.snapshot(5);
+        assert_eq!(snapshot.bids.len(), 1);
+        assert_eq!(snapshot.asks.len(), 1);
+    }
+
+    #[test]
+    fn test_clear() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .unwrap();
+
+        assert_eq!(book.order_count(), 2);
+        book.clear();
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn test_update_last_quote() {
+        let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+
+        let changed = book.update_last_quote();
+        assert!(changed);
+
+        let changed_again = book.update_last_quote();
+        assert!(!changed_again);
+
+        let _last = book.last_quote();
+    }
+
+    #[test]
+    fn test_depth_at_price() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .unwrap();
+
+        assert_eq!(book.bid_depth_at_price(100), 10);
+        assert_eq!(book.bid_depth_at_price(99), 0);
+        assert_eq!(book.ask_depth_at_price(105), 5);
+        assert_eq!(book.ask_depth_at_price(106), 0);
+    }
+
+    #[test]
+    fn test_vwap() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Buy, 99, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 10)
+            .unwrap();
+
+        let vwap_sell = book.vwap(5, Side::Sell);
+        assert!(vwap_sell.is_some());
+
+        let vwap_buy = book.vwap(5, Side::Buy);
+        assert!(vwap_buy.is_some());
+    }
+
+    #[test]
+    fn test_micro_price() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 102, 10)
+            .unwrap();
+
+        let micro = book.micro_price();
+        assert!(micro.is_some());
+    }
+
+    #[test]
+    fn test_market_impact() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        book.add_limit_order(OrderId::new(), Side::Sell, 105, 10)
+            .unwrap();
+
+        let impact = book.market_impact(5, Side::Buy);
+        assert!(impact.average_price.is_some());
+    }
 }
