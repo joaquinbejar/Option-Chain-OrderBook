@@ -226,6 +226,7 @@
 //! use option_chain_orderbook::hedging::{DeltaHedger, HedgeParams};
 //! use option_chain_orderbook::pricing::Greeks;
 //! use rust_decimal_macros::dec;
+//! use tracing::info;
 //!
 //! let params = HedgeParams::default();
 //! let mut hedger = DeltaHedger::new(params);
@@ -236,7 +237,7 @@
 //!
 //! // Check if hedging is needed
 //! if let Some(order) = hedger.calculate_hedge("BTC", dec!(50000), 0) {
-//!     println!("Hedge needed: {} units", order.quantity);
+//!     tracing::info!("Hedge needed: {} units", order.quantity);
 //! }
 //! ```
 //!
@@ -255,7 +256,7 @@
 //! // Check for limit breaches
 //! let breaches = controller.check_greek_limits(&greeks);
 //! if !breaches.is_empty() {
-//!     println!("Risk limits breached!");
+//!     tracing::info!("Risk limits breached!");
 //! }
 //! ```
 //!
