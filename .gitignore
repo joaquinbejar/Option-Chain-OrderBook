@@ -28,3 +28,4 @@ src/.DS_Store
 /tarpaulin-report.html
 .secrets
 /Option-Chain-OrderBook.code-workspace
+/coverage/
