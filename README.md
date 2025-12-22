@@ -12,7 +12,7 @@
 
 
 
-## Option Chain Order Book - Professional Options Market Making Infrastructure
+## Option Chain Order Book - Options Market Making Infrastructure
 
 A high-performance Rust library for options market making infrastructure,
 providing a complete Option Chain Order Book system built on top of
