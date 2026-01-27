@@ -87,7 +87,7 @@ pub fn orderbook_scaling(c: &mut Criterion) {
                 || OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call),
                 |book| {
                     for i in 0..depth {
-                        book.add_limit_order(OrderId::new(), Side::Buy, (1000 - i) as u64, 10)
+                        book.add_limit_order(OrderId::new(), Side::Buy, (1000 - i) as u128, 10)
                             .unwrap();
                     }
                 },
@@ -101,9 +101,9 @@ pub fn orderbook_scaling(c: &mut Criterion) {
             |b, &depth| {
                 let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
                 for i in 0..depth {
-                    book.add_limit_order(OrderId::new(), Side::Buy, (1000 - i) as u64, 10)
+                    book.add_limit_order(OrderId::new(), Side::Buy, (1000 - i) as u128, 10)
                         .unwrap();
-                    book.add_limit_order(OrderId::new(), Side::Sell, (1001 + i) as u64, 10)
+                    book.add_limit_order(OrderId::new(), Side::Sell, (1001 + i) as u128, 10)
                         .unwrap();
                 }
                 b.iter(|| book.best_quote());

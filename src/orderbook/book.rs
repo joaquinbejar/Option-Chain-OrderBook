@@ -116,13 +116,13 @@ impl OptionOrderBook {
     ///
     /// * `order_id` - Unique identifier for the order
     /// * `side` - Buy or Sell side
-    /// * `price` - Limit price in smallest units (u64)
+    /// * `price` - Limit price in smallest units (u128)
     /// * `quantity` - Order quantity in smallest units (u64)
     pub fn add_limit_order(
         &self,
         order_id: OrderId,
         side: Side,
-        price: u64,
+        price: u128,
         quantity: u64,
     ) -> Result<()> {
         self.book
@@ -137,14 +137,14 @@ impl OptionOrderBook {
     ///
     /// * `order_id` - Unique identifier for the order
     /// * `side` - Buy or Sell side
-    /// * `price` - Limit price in smallest units (u64)
+    /// * `price` - Limit price in smallest units (u128)
     /// * `quantity` - Order quantity in smallest units (u64)
     /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
     pub fn add_limit_order_with_tif(
         &self,
         order_id: OrderId,
         side: Side,
-        price: u64,
+        price: u128,
         quantity: u64,
         tif: TimeInForce,
     ) -> Result<()> {
@@ -192,13 +192,13 @@ impl OptionOrderBook {
 
     /// Returns the best bid price.
     #[must_use]
-    pub fn best_bid(&self) -> Option<u64> {
+    pub fn best_bid(&self) -> Option<u128> {
         self.book.best_bid()
     }
 
     /// Returns the best ask price.
     #[must_use]
-    pub fn best_ask(&self) -> Option<u64> {
+    pub fn best_ask(&self) -> Option<u128> {
         self.book.best_ask()
     }
 
@@ -210,7 +210,7 @@ impl OptionOrderBook {
 
     /// Returns the spread if both sides exist.
     #[must_use]
-    pub fn spread(&self) -> Option<u64> {
+    pub fn spread(&self) -> Option<u128> {
         self.book.spread()
     }
 
@@ -312,14 +312,14 @@ impl OptionOrderBook {
 
     /// Returns depth at a specific price level on the bid side.
     #[must_use]
-    pub fn bid_depth_at_price(&self, price: u64) -> u64 {
+    pub fn bid_depth_at_price(&self, price: u128) -> u64 {
         let (bid_volumes, _) = self.book.get_volume_by_price();
         bid_volumes.get(&price).copied().unwrap_or(0)
     }
 
     /// Returns depth at a specific price level on the ask side.
     #[must_use]
-    pub fn ask_depth_at_price(&self, price: u64) -> u64 {
+    pub fn ask_depth_at_price(&self, price: u128) -> u64 {
         let (_, ask_volumes) = self.book.get_volume_by_price();
         ask_volumes.get(&price).copied().unwrap_or(0)
     }

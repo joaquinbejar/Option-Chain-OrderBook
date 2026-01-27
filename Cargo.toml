@@ -1,6 +1,6 @@
 [package]
 name = "option-chain-orderbook"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A high-performance Rust library for options market making infrastructure, providing a complete Option Chain Order Book system built on top of OrderBook-rs, PriceLevel, and OptionStratLib."
@@ -58,12 +58,12 @@ crate-type = ["rlib"]
 
 [workspace.dependencies]
 optionstratlib = { version = "0.14", default-features = false }
-orderbook-rs = "0.4"
+orderbook-rs = { version = "0.5", features = ["special_orders"] }
 tracing = "0.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rust_decimal = { version = "1.39", features = ["serde-with-float", "maths"] }
-rust_decimal_macros = "1.39"
+rust_decimal_macros = "1.40"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
 crossbeam-skiplist = "0.1"

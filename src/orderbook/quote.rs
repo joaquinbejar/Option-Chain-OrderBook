@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Quote {
     /// Best bid price (None if no bids).
-    bid_price: Option<u64>,
+    bid_price: Option<u128>,
     /// Size available at best bid.
     bid_size: u64,
     /// Best ask price (None if no asks).
-    ask_price: Option<u64>,
+    ask_price: Option<u128>,
     /// Size available at best ask.
     ask_size: u64,
     /// Timestamp in milliseconds.
@@ -40,9 +40,9 @@ impl Quote {
     /// * `timestamp_ms` - Timestamp in milliseconds
     #[must_use]
     pub fn new(
-        bid_price: Option<u64>,
+        bid_price: Option<u128>,
         bid_size: u64,
-        ask_price: Option<u64>,
+        ask_price: Option<u128>,
         ask_size: u64,
         timestamp_ms: u64,
     ) -> Self {
@@ -77,7 +77,7 @@ impl Quote {
 
     /// Returns the best bid price.
     #[must_use]
-    pub const fn bid_price(&self) -> Option<u64> {
+    pub const fn bid_price(&self) -> Option<u128> {
         self.bid_price
     }
 
@@ -89,7 +89,7 @@ impl Quote {
 
     /// Returns the best ask price.
     #[must_use]
-    pub const fn ask_price(&self) -> Option<u64> {
+    pub const fn ask_price(&self) -> Option<u128> {
         self.ask_price
     }
 
@@ -119,7 +119,7 @@ impl Quote {
 
     /// Returns the spread if both sides exist.
     #[must_use]
-    pub fn spread(&self) -> Option<u64> {
+    pub fn spread(&self) -> Option<u128> {
         match (self.bid_price, self.ask_price) {
             (Some(bid), Some(ask)) if ask >= bid => Some(ask - bid),
             _ => None,

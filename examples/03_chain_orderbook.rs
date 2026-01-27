@@ -37,21 +37,41 @@ fn main() {
         // Add call orders
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100 + strike_price / 1000, 10)
+            .add_limit_order(
+                OrderId::new(),
+                Side::Buy,
+                (100 + strike_price / 1000) as u128,
+                10,
+            )
             .unwrap();
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 120 + strike_price / 1000, 8)
+            .add_limit_order(
+                OrderId::new(),
+                Side::Sell,
+                (120 + strike_price / 1000) as u128,
+                8,
+            )
             .unwrap();
 
         // Add put orders
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50 + strike_price / 2000, 12)
+            .add_limit_order(
+                OrderId::new(),
+                Side::Buy,
+                (50 + strike_price / 2000) as u128,
+                12,
+            )
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 70 + strike_price / 2000, 6)
+            .add_limit_order(
+                OrderId::new(),
+                Side::Sell,
+                (70 + strike_price / 2000) as u128,
+                6,
+            )
             .unwrap();
 
         info!("Created strike {} with 4 orders", strike_price);
