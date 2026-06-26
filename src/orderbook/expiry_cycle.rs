@@ -108,10 +108,27 @@ impl Default for ExpiryCycleConfig {
                     count: 4,
                 },
             ],
-            // 08:00:00 / 08:30:00 are statically valid; `unwrap_or` only guards
-            // the unreachable `None` and never panics (no `expect`/`unwrap`).
-            expiry_time_utc: NaiveTime::from_hms_opt(8, 0, 0).unwrap_or(NaiveTime::MIN),
-            settlement_time_utc: NaiveTime::from_hms_opt(8, 30, 0).unwrap_or(NaiveTime::MIN),
+            // 08:00:00 / 08:30:00 are statically valid, so `from_hms_opt` returns
+            // `Some` and the `unwrap_or` fallback is never taken (no
+            // `expect`/`unwrap`). The `debug_assert!` catches a future edit to an
+            // invalid constant in debug/test builds rather than silently
+            // defaulting to midnight in release.
+            expiry_time_utc: {
+                let t = NaiveTime::from_hms_opt(8, 0, 0);
+                debug_assert!(
+                    t.is_some(),
+                    "default expiry time must be a valid time of day"
+                );
+                t.unwrap_or(NaiveTime::MIN)
+            },
+            settlement_time_utc: {
+                let t = NaiveTime::from_hms_opt(8, 30, 0);
+                debug_assert!(
+                    t.is_some(),
+                    "default settlement time must be a valid time of day"
+                );
+                t.unwrap_or(NaiveTime::MIN)
+            },
         }
     }
 }
