@@ -36,7 +36,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Scope for mass cancel operations in the option chain hierarchy.
+///
+/// This is a journaled (on-disk) type. The wire format is pinned: variant tags
+/// are `PascalCase` and any struct-variant fields are `snake_case`, and
+/// [`deny_unknown_fields`](https://serde.rs/container-attrs.html#deny_unknown_fields)
+/// makes a renamed/dropped field a hard decode error rather than a silent
+/// replay corruption. `rename_all` / `rename_all_fields` only make the existing
+/// casing explicit — they do not change the wire strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "PascalCase",
+    rename_all_fields = "snake_case"
+)]
 pub enum MassCancelScope {
     /// Cancel across the entire underlying (all expirations, all strikes).
     Underlying,
@@ -54,7 +66,17 @@ pub enum MassCancelScope {
 }
 
 /// Type of mass cancel operation.
+///
+/// Journaled (on-disk) type. Variant tags are pinned to `PascalCase` and
+/// unknown fields are rejected so journal schema drift fails loudly. All
+/// variants are unit or newtype, so `rename_all_fields` is a no-op here but is
+/// kept for parity with the other journal enums.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "PascalCase",
+    rename_all_fields = "snake_case"
+)]
 pub enum MassCancelType {
     /// Cancel all orders.
     All,
@@ -69,7 +91,16 @@ pub enum MassCancelType {
 /// Each variant represents an operation that can be sequenced through
 /// the option chain sequencer. Commands are serializable for journal
 /// persistence.
+///
+/// This is a journaled (on-disk) type: variant tags are pinned to `PascalCase`,
+/// struct-variant fields to `snake_case`, and unknown fields are rejected so a
+/// renamed/dropped field can never silently corrupt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "PascalCase",
+    rename_all_fields = "snake_case"
+)]
 pub enum OptionChainCommand {
     /// Add a limit order to a specific option book.
     AddOrder {
@@ -101,7 +132,15 @@ pub enum OptionChainCommand {
 }
 
 /// Result of executing an option chain command.
+///
+/// Journaled (on-disk) type: variant tags are pinned to `PascalCase`,
+/// struct-variant fields to `snake_case`, and unknown fields are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "PascalCase",
+    rename_all_fields = "snake_case"
+)]
 pub enum OptionChainResult {
     /// An order was successfully added.
     OrderAdded {
@@ -151,7 +190,13 @@ impl OptionChainResult {
 /// Every event carries a monotonically increasing `sequence_num` and a
 /// nanosecond-precision `timestamp_ns`, enabling deterministic replay
 /// and total ordering of all option chain operations.
+///
+/// This is the top-level journaled (on-disk) record. Its field names are pinned
+/// to `snake_case` and unknown fields are rejected on decode, so a journal
+/// written by a renamed/extended schema fails loudly instead of silently
+/// dropping data during replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct OptionChainEvent {
     /// Monotonically increasing sequence number.
     pub sequence_num: u64,
@@ -1744,6 +1789,223 @@ mod tests {
 
         assert_eq!(deserialized.sequence_num, 42);
         assert_eq!(deserialized.timestamp_ns, 1_000_000);
+    }
+
+    // ── Journal format pinning (deny_unknown_fields + back-compat) ──────────
+
+    /// Builds one representative `OptionChainEvent` per command variant and per
+    /// result variant, using deterministic ids so the encoding is stable. This
+    /// is the fixture the round-trip and back-compat guards exercise.
+    fn representative_journal_events() -> Vec<OptionChainEvent> {
+        // `OrderId::sequential` / a fixed `Hash32` keep the wire encoding stable
+        // (random ids would make the JSON non-reproducible).
+        let oid = OrderId::sequential(42);
+        let user = Hash32::from([7u8; 32]);
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
+
+        vec![
+            // AddOrder + OrderAdded
+            OptionChainEvent {
+                sequence_num: 1,
+                timestamp_ns: 1_700_000_000_000_000_000,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Buy,
+                    price: 100,
+                    quantity: 10,
+                },
+                result: OptionChainResult::OrderAdded { order_id: oid },
+            },
+            // CancelOrder + OrderCancelled
+            OptionChainEvent {
+                sequence_num: 2,
+                timestamp_ns: 1_700_000_000_000_000_001,
+                command: OptionChainCommand::CancelOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                },
+                result: OptionChainResult::OrderCancelled { order_id: oid },
+            },
+            // MassCancel(Strike, BySide) + MassCancelled
+            OptionChainEvent {
+                sequence_num: 3,
+                timestamp_ns: 1_700_000_000_000_000_002,
+                command: OptionChainCommand::MassCancel {
+                    scope: MassCancelScope::Strike {
+                        expiration: expiry,
+                        strike: 50000,
+                    },
+                    cancel_type: MassCancelType::BySide(Side::Sell),
+                },
+                result: OptionChainResult::MassCancelled { cancelled_count: 4 },
+            },
+            // MassCancel(Underlying, ByUser) + Rejected
+            OptionChainEvent {
+                sequence_num: 4,
+                timestamp_ns: 1_700_000_000_000_000_003,
+                command: OptionChainCommand::MassCancel {
+                    scope: MassCancelScope::Underlying,
+                    cancel_type: MassCancelType::ByUser(user),
+                },
+                result: OptionChainResult::Rejected {
+                    reason: "boom".to_string(),
+                },
+            },
+            // MassCancel(Book, All) + BookNotFound
+            OptionChainEvent {
+                sequence_num: 5,
+                timestamp_ns: 1_700_000_000_000_000_004,
+                command: OptionChainCommand::MassCancel {
+                    scope: MassCancelScope::Book("BTC-20240329-50000-C".to_string()),
+                    cancel_type: MassCancelType::All,
+                },
+                result: OptionChainResult::BookNotFound {
+                    symbol: "ETH-20240329-50000-C".to_string(),
+                },
+            },
+            // MassCancel(Expiration, All) + MassCancelled
+            OptionChainEvent {
+                sequence_num: 6,
+                timestamp_ns: 1_700_000_000_000_000_005,
+                command: OptionChainCommand::MassCancel {
+                    scope: MassCancelScope::Expiration(expiry),
+                    cancel_type: MassCancelType::All,
+                },
+                result: OptionChainResult::MassCancelled { cancelled_count: 0 },
+            },
+        ]
+    }
+
+    /// Back-compat / format-pin guard: a checked-in journal sample written under
+    /// the current schema MUST still decode into `OptionChainEvent`, and the
+    /// re-encoding MUST be value-identical to the on-disk bytes. If a future
+    /// change renames a variant tag or a field, or alters the casing, this test
+    /// fails loudly instead of silently corrupting replay of older journals.
+    ///
+    /// The fixture lives at `tests/fixtures/journal_event_v0.5.0.json`.
+    #[test]
+    fn test_journal_event_v0_5_0_fixture_decodes_and_is_stable() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/journal_event_v0.5.0.json");
+
+        // Decodes without error under the current schema.
+        let decoded: Vec<OptionChainEvent> =
+            serde_json::from_str(FIXTURE).expect("v0.5.0 journal fixture must decode");
+        assert_eq!(decoded.len(), 6, "fixture should hold six events");
+
+        // Spot-check that the variants landed in the expected shapes.
+        assert!(matches!(
+            decoded[0].command,
+            OptionChainCommand::AddOrder { .. }
+        ));
+        assert!(matches!(
+            decoded[0].result,
+            OptionChainResult::OrderAdded { .. }
+        ));
+        assert!(matches!(
+            decoded[2].command,
+            OptionChainCommand::MassCancel {
+                scope: MassCancelScope::Strike { strike: 50000, .. },
+                cancel_type: MassCancelType::BySide(Side::Sell),
+            }
+        ));
+        assert!(matches!(
+            decoded[3].command,
+            OptionChainCommand::MassCancel {
+                scope: MassCancelScope::Underlying,
+                cancel_type: MassCancelType::ByUser(_),
+            }
+        ));
+
+        // Re-encoding is value-identical to the on-disk fixture: the wire format
+        // is unchanged by the serde attributes (key order / whitespace aside).
+        let reencoded: serde_json::Value =
+            serde_json::to_value(&decoded).expect("re-encode decoded events");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("parse fixture as value");
+        assert_eq!(
+            reencoded, on_disk,
+            "re-encoded journal diverged from the checked-in v0.5.0 wire format"
+        );
+    }
+
+    /// Round-trip every command/result variant: serialize, deserialize, and
+    /// re-serialize, asserting the two encodings are byte-identical. A lossless
+    /// round-trip proves the pinned casing (`PascalCase` variant tags,
+    /// `snake_case` fields) is internally consistent.
+    #[test]
+    fn test_option_chain_event_roundtrip_all_variants() {
+        for event in representative_journal_events() {
+            let json = serde_json::to_string(&event).expect("serialize");
+            let back: OptionChainEvent =
+                serde_json::from_str(&json).expect("deserialize round-trip");
+            let json2 = serde_json::to_string(&back).expect("re-serialize");
+            assert_eq!(json, json2, "round-trip changed the encoding for {event:?}");
+        }
+    }
+
+    /// Negative guard proving `deny_unknown_fields` is active at every journal
+    /// layer: an extra field anywhere in the graph (top-level struct, a command
+    /// struct-variant, a result struct-variant, or the `Strike` scope variant)
+    /// MUST make decoding fail. Without `deny_unknown_fields` these would be
+    /// silently ignored and corrupt replay.
+    #[test]
+    fn test_option_chain_event_rejects_unknown_fields() {
+        // Extra field on the top-level OptionChainEvent struct.
+        let top_level = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "CancelOrder": { "symbol": "BTC-20240329-50000-C", "order_id": "42" } },
+            "result": { "OrderCancelled": { "order_id": "42" } },
+            "bogus": true
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(top_level).is_err(),
+            "unknown top-level field must be rejected"
+        );
+
+        // Extra field inside an AddOrder command struct-variant.
+        let in_command = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 10,
+                "extra": 1
+            } },
+            "result": { "OrderAdded": { "order_id": "42" } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_command).is_err(),
+            "unknown field inside a command struct-variant must be rejected"
+        );
+
+        // Extra field inside a Rejected result struct-variant.
+        let in_result = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "CancelOrder": { "symbol": "BTC-20240329-50000-C", "order_id": "42" } },
+            "result": { "Rejected": { "reason": "x", "extra": "y" } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_result).is_err(),
+            "unknown field inside a result struct-variant must be rejected"
+        );
+
+        // Extra field inside the Strike mass-cancel scope struct-variant.
+        let in_scope = r#"{ "Strike": {
+            "expiration": { "datetime": "2024-03-29T23:59:59Z" },
+            "strike": 50000,
+            "extra": 0
+        } }"#;
+        assert!(
+            serde_json::from_str::<MassCancelScope>(in_scope).is_err(),
+            "unknown field inside the Strike scope variant must be rejected"
+        );
     }
 
     // ── Helper ────────────────────────────────────────────────────────────
