@@ -18,7 +18,7 @@ use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
@@ -48,9 +48,15 @@ pub struct StrikeOrderBook {
     /// Put option order book.
     put: Arc<OptionOrderBook>,
     /// Greeks for the call option.
-    call_greeks: Option<Greek>,
-    /// Greeks for the put option.
-    put_greeks: Option<Greek>,
+    ///
+    /// Stored behind a [`RwLock`] for interior mutability so the Greeks
+    /// subsystem can attach Greeks through a shared `Arc<StrikeOrderBook>`
+    /// (the strike is never held by unique `&mut` once published into a chain).
+    /// The lock is read-heavy and held only for the brief store/clone; the
+    /// caller computes the [`Greek`] first, then calls the setter to store it.
+    call_greeks: RwLock<Option<Greek>>,
+    /// Greeks for the put option. See [`call_greeks`](Self::call_greeks).
+    put_greeks: RwLock<Option<Greek>>,
     /// Unique identifier for this strike order book.
     id: OrderId,
 }
@@ -80,8 +86,8 @@ impl StrikeOrderBook {
             strike,
             call: Arc::new(OptionOrderBook::new(call_symbol, OptionStyle::Call)),
             put: Arc::new(OptionOrderBook::new(put_symbol, OptionStyle::Put)),
-            call_greeks: None,
-            put_greeks: None,
+            call_greeks: RwLock::new(None),
+            put_greeks: RwLock::new(None),
             id: OrderId::new(),
         }
     }
@@ -126,8 +132,8 @@ impl StrikeOrderBook {
                 OptionStyle::Put,
                 config,
             )),
-            call_greeks: None,
-            put_greeks: None,
+            call_greeks: RwLock::new(None),
+            put_greeks: RwLock::new(None),
             id: OrderId::new(),
         }
     }
@@ -151,8 +157,8 @@ impl StrikeOrderBook {
             strike,
             call,
             put,
-            call_greeks: None,
-            put_greeks: None,
+            call_greeks: RwLock::new(None),
+            put_greeks: RwLock::new(None),
             id: OrderId::new(),
         }
     }
@@ -554,25 +560,51 @@ impl StrikeOrderBook {
     }
 
     /// Updates the Greeks for the call option.
-    pub fn update_call_greeks(&mut self, greeks: Greek) {
-        self.call_greeks = Some(greeks);
+    ///
+    /// Takes `&self` so the value can be stored through a shared
+    /// `Arc<StrikeOrderBook>` via interior mutability. The caller must compute
+    /// the [`Greek`] beforehand (e.g. via `optionstratlib`); this method only
+    /// takes the write lock briefly to store it and never holds the guard
+    /// across a Greeks computation. A poisoned lock is recovered in place.
+    pub fn update_call_greeks(&self, greeks: Greek) {
+        *self
+            .call_greeks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(greeks);
     }
 
     /// Updates the Greeks for the put option.
-    pub fn update_put_greeks(&mut self, greeks: Greek) {
-        self.put_greeks = Some(greeks);
+    ///
+    /// See [`update_call_greeks`](Self::update_call_greeks); the same interior
+    /// mutability and locking discipline apply.
+    pub fn update_put_greeks(&self, greeks: Greek) {
+        *self
+            .put_greeks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(greeks);
     }
 
-    /// Returns the Greeks for the call option.
+    /// Returns the Greeks for the call option, or `None` if none have been set.
+    ///
+    /// The value is cloned out of the read lock so the guard is released before
+    /// returning. [`Greek`] is `Clone`, so this is a cheap value copy.
     #[must_use]
-    pub const fn call_greeks(&self) -> Option<&Greek> {
-        self.call_greeks.as_ref()
+    pub fn call_greeks(&self) -> Option<Greek> {
+        self.call_greeks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
-    /// Returns the Greeks for the put option.
+    /// Returns the Greeks for the put option, or `None` if none have been set.
+    ///
+    /// See [`call_greeks`](Self::call_greeks) for the cloning/locking semantics.
     #[must_use]
-    pub const fn put_greeks(&self) -> Option<&Greek> {
-        self.put_greeks.as_ref()
+    pub fn put_greeks(&self) -> Option<Greek> {
+        self.put_greeks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -1615,7 +1647,7 @@ mod tests {
         use optionstratlib::greeks::Greek;
         use rust_decimal_macros::dec;
 
-        let mut strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
         assert!(strike.call_greeks().is_none());
         assert!(strike.put_greeks().is_none());
@@ -1652,8 +1684,65 @@ mod tests {
         strike.update_call_greeks(call_greeks);
         strike.update_put_greeks(put_greeks);
 
-        assert!(strike.call_greeks().is_some());
-        assert!(strike.put_greeks().is_some());
+        // The setters take `&self`, so no `&mut` receiver is needed: the values
+        // are stored through interior mutability and clone back out.
+        assert_eq!(strike.call_greeks().map(|g| g.delta), Some(dec!(0.5)));
+        assert_eq!(strike.put_greeks().map(|g| g.delta), Some(dec!(-0.5)));
+    }
+
+    #[test]
+    fn test_strike_greeks_attach_through_arc_returns_stored_value() {
+        use optionstratlib::greeks::Greek;
+        use rust_decimal_macros::dec;
+
+        // Hold the strike exactly as the hierarchy does: shared behind an `Arc`,
+        // where `Arc::get_mut` never yields `&mut`. Interior mutability must let
+        // the Greeks subsystem attach Greeks through the shared handle.
+        let strike: Arc<StrikeOrderBook> =
+            Arc::new(StrikeOrderBook::new("BTC", test_expiration(), 50000));
+
+        // A fresh strike has no Greeks on either leg.
+        assert!(strike.call_greeks().is_none());
+        assert!(strike.put_greeks().is_none());
+
+        let call_greeks = Greek {
+            delta: dec!(0.42),
+            gamma: dec!(0.02),
+            theta: dec!(-0.07),
+            vega: dec!(0.3),
+            rho: dec!(0.15),
+            rho_d: dec!(0.0),
+            alpha: dec!(0.0),
+            vanna: dec!(0.0),
+            vomma: dec!(0.0),
+            veta: dec!(0.0),
+            charm: dec!(0.0),
+            color: dec!(0.0),
+        };
+        let put_greeks = Greek {
+            delta: dec!(-0.58),
+            gamma: dec!(0.02),
+            theta: dec!(-0.07),
+            vega: dec!(0.3),
+            rho: dec!(-0.15),
+            rho_d: dec!(0.0),
+            alpha: dec!(0.0),
+            vanna: dec!(0.0),
+            vomma: dec!(0.0),
+            veta: dec!(0.0),
+            charm: dec!(0.0),
+            color: dec!(0.0),
+        };
+
+        // Attach via `&self` through a second shared clone of the same Arc — no
+        // `Arc::get_mut`, no unique ownership.
+        let writer = Arc::clone(&strike);
+        writer.update_call_greeks(call_greeks.clone());
+        writer.update_put_greeks(put_greeks.clone());
+
+        // Read them back off the original handle for both legs.
+        assert_eq!(strike.call_greeks(), Some(call_greeks));
+        assert_eq!(strike.put_greeks(), Some(put_greeks));
     }
 
     #[test]
