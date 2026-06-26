@@ -102,9 +102,11 @@ struct Subscriber {
     id: SubscriptionId,
     /// Latest pending update (keep-latest). Overwritten on each `set_price`;
     /// the drain thread `take`s the freshest value. Older un-consumed updates
-    /// are coalesced/dropped here.
-    mailbox: Arc<Mutex<Option<PriceUpdate>>>,
-    /// Bounded wakeup signal to the drain thread. `None` only after teardown.
+    /// are coalesced/dropped here. Held as an `Arc` so `set_price` allocates the
+    /// `PriceUpdate` once per tick and each subscriber stores a cheap clone.
+    mailbox: Arc<Mutex<Option<Arc<PriceUpdate>>>>,
+    /// Bounded wakeup signal to the drain thread. `None` after teardown, or when
+    /// the drain thread failed to spawn (so the subscriber does no per-tick work).
     signal: Option<SyncSender<()>>,
     /// Count of coalesced (dropped) intermediate updates, for the lag metric.
     coalesced: Arc<AtomicU64>,
@@ -116,15 +118,25 @@ struct Subscriber {
 impl Subscriber {
     /// Overwrites the latest-value mailbox and wakes the drain thread.
     ///
-    /// Never blocks. The mailbox keeps only the most recent update — an
-    /// un-consumed previous update is coalesced (keep-latest drop) and counted.
-    /// The wakeup is a non-blocking `try_send`; a `Full` slot means a wakeup is
-    /// already pending and this one coalesces into it.
+    /// Never blocks **on listener work** — the listener runs on the drain thread,
+    /// never here. The only lock taken is the mailbox `Mutex`, held solely for an
+    /// O(1) pointer swap (an `Arc::clone`, never an allocation and never across a
+    /// listener call), so at worst it briefly contends with the drain thread's
+    /// equally-brief `take()`; a slow listener cannot stall the producer. The
+    /// mailbox keeps only the most recent update — an un-consumed previous update
+    /// is coalesced (keep-latest drop) and counted. The wakeup is a non-blocking
+    /// `try_send`; a `Full` slot means a wakeup is already pending and this one
+    /// coalesces into it.
     #[inline]
-    fn enqueue(&self, update: &PriceUpdate) {
-        // Clone outside the mailbox lock so the critical section is only the
-        // pointer swap, never an allocation contended with the drain thread.
-        let cloned = update.clone();
+    fn enqueue(&self, update: &Arc<PriceUpdate>) {
+        // A subscriber whose drain thread failed to spawn has no sender and no
+        // consumer — skip all per-tick work for it.
+        let Some(signal) = &self.signal else {
+            return;
+        };
+        // Clone the Arc (a cheap refcount bump) outside the mailbox lock, so the
+        // critical section is only the pointer swap.
+        let cloned = Arc::clone(update);
         let previous = match self.mailbox.lock() {
             Ok(mut guard) => guard.replace(cloned),
             Err(poisoned) => poisoned.into_inner().replace(cloned),
@@ -143,14 +155,12 @@ impl Subscriber {
                 );
             }
         }
-        if let Some(signal) = &self.signal {
-            // Wake the drain thread without ever blocking the producer.
-            //   Ok            → wakeup queued
-            //   Err(Full)     → wakeup already pending; coalesced
-            //   Err(Disconnected) → drain thread gone (failed spawn / shutdown)
-            match signal.try_send(()) {
-                Ok(()) | Err(TrySendError::Full(())) | Err(TrySendError::Disconnected(())) => {}
-            }
+        // Wake the drain thread without ever blocking the producer.
+        //   Ok            → wakeup queued
+        //   Err(Full)     → wakeup already pending; coalesced
+        //   Err(Disconnected) → drain thread gone (shutdown in progress)
+        match signal.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) | Err(TrySendError::Disconnected(())) => {}
         }
     }
 
@@ -192,7 +202,7 @@ impl Subscriber {
 /// sender dropped) is the shutdown signal, and the loop exits.
 fn drain_loop(
     signal_rx: &Receiver<()>,
-    mailbox: &Mutex<Option<PriceUpdate>>,
+    mailbox: &Mutex<Option<Arc<PriceUpdate>>>,
     listener: &PriceUpdateListener,
 ) {
     while signal_rx.recv().is_ok() {
@@ -202,7 +212,7 @@ fn drain_loop(
                 Err(poisoned) => poisoned.into_inner().take(),
             };
             match pending {
-                Some(update) => listener(&update),
+                Some(update) => listener(update.as_ref()),
                 None => break,
             }
         }
@@ -306,11 +316,13 @@ impl MockPriceFeed {
     /// * `price` - New price in smallest units
     pub fn set_price(&self, price: u64) {
         let ts = nanos_since_epoch();
-        let update = PriceUpdate {
+        // Allocate the update (and its `source` String) once per tick; each
+        // subscriber stores a cheap `Arc::clone`, not a deep copy.
+        let update = Arc::new(PriceUpdate {
             price,
             timestamp_ns: ts,
             source: "mock".to_string(),
-        };
+        });
 
         // Hold the lock only for cheap, non-blocking per-subscriber enqueues —
         // never across a listener invocation. Listeners run on their own drain
@@ -385,14 +397,15 @@ impl IndexPriceFeed for MockPriceFeed {
     fn subscribe(&self, listener: PriceUpdateListener) -> SubscriptionId {
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
 
-        let mailbox = Arc::new(Mutex::new(None::<PriceUpdate>));
+        let mailbox = Arc::new(Mutex::new(None::<Arc<PriceUpdate>>));
         let coalesced = Arc::new(AtomicU64::new(0));
         let (signal_tx, signal_rx) = sync_channel::<()>(SIGNAL_CHANNEL_CAPACITY);
 
         // Spawn the dedicated drain thread. If the OS cannot create the thread,
         // degrade gracefully: the subscriber is registered (so the id stays
         // valid for `unsubscribe`) but receives no updates, and an ERROR is
-        // logged. The dropped `signal_rx` makes later `try_send`s disconnect.
+        // logged. Its wakeup sender is then dropped (`signal: None` below), so
+        // `enqueue` short-circuits and does no per-tick work for it.
         let drain_mailbox = Arc::clone(&mailbox);
         let handle = match std::thread::Builder::new()
             .name(format!("price-feed-drain-{}", id.0))
@@ -410,10 +423,19 @@ impl IndexPriceFeed for MockPriceFeed {
             }
         };
 
+        // Keep the wakeup sender only if the drain thread spawned. On spawn
+        // failure, dropping `signal_tx` leaves `signal: None`, so `enqueue`
+        // short-circuits and does no per-tick work for a subscriber that can
+        // never receive.
+        let signal = if handle.is_some() {
+            Some(signal_tx)
+        } else {
+            None
+        };
         let subscriber = Subscriber {
             id,
             mailbox,
-            signal: Some(signal_tx),
+            signal,
             coalesced,
             handle,
         };
