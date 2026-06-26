@@ -914,6 +914,17 @@ impl StrikeOrderBookManager {
     /// immediately after creation under contention should resolve them via the
     /// [`InstrumentRegistry`] / [`SymbolIndex`] once creation has settled rather
     /// than reading `instrument_id()` synchronously off the returned handle.
+    ///
+    /// ## Instrument-ID exhaustion
+    ///
+    /// This method is infallible by design so that the whole hierarchy and the
+    /// sequencer can create books without threading a `Result`. If the
+    /// instrument registry's `u32` ID space is ever exhausted (after roughly 4
+    /// billion allocations — astronomically unlikely), the winner logs a
+    /// `tracing::error!` and returns the strike book with its call/put pair left
+    /// at `instrument_id == 0`. The registry degrades gracefully; it never
+    /// panics. The symbol index is still populated, so symbol-based lookups
+    /// continue to work.
     pub fn get_or_create(&self, strike: u64) -> Arc<StrikeOrderBook> {
         if let Some(entry) = self.strikes.get(&strike) {
             return Arc::clone(entry.value());
@@ -931,7 +942,22 @@ impl StrikeOrderBookManager {
         let winner = Arc::clone(entry.value());
         if Arc::ptr_eq(&winner, &fresh) {
             // We won the race — allocate IDs and register symbols exactly once.
-            self.assign_instrument_ids(&winner, strike);
+            //
+            // On the astronomically-rare instrument-ID-space exhaustion we log
+            // and degrade rather than propagating a fallible signature through
+            // the entire hierarchy and the sequencer's
+            // `find_or_create_book_by_symbol`: the call/put pair is left at
+            // `instrument_id == 0` (the same value as the transient
+            // pre-assignment window described above), the symbol index stays
+            // populated, and no thread panics.
+            if let Err(err) = self.assign_instrument_ids(&winner, strike) {
+                tracing::error!(
+                    underlying = %self.underlying,
+                    strike,
+                    error = %err,
+                    "instrument-id exhaustion: registry full; strike books left with instrument_id 0",
+                );
+            }
         }
         winner
     }
@@ -978,15 +1004,40 @@ impl StrikeOrderBookManager {
     /// Assigns unique instrument IDs and registers the call/put books in the
     /// reverse index. Also registers symbols in the symbol index if present.
     /// Called only after confirming this book won the insertion race.
-    fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InstrumentIdExhausted`] if the instrument registry's
+    /// `u32` ID space is exhausted. On that error the call/put pair is left at
+    /// `instrument_id == 0`: IDs are allocated before being written to the
+    /// books, so a mid-pair exhaustion never leaves a half-assigned pair. The
+    /// symbol index is populated first (it is independent of numeric IDs and
+    /// never fails), so symbol lookups stay functional even when the registry
+    /// is full.
+    fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) -> Result<()> {
         let exp_str = format_expiration_yyyymmdd(&self.expiration)
             .unwrap_or_else(|_| self.expiration.to_string());
         let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
         let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
 
+        // Symbol-index registration is independent of numeric ID allocation and
+        // never fails; run it first so symbol lookups stay functional even if
+        // the registry is exhausted below.
+        if let Some(idx) = &self.symbol_index {
+            let call_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Call);
+            let put_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Put);
+            idx.register(&call_symbol, call_ref);
+            idx.register(&put_symbol, put_ref);
+        }
+
         if let Some(reg) = &self.registry {
-            let call_id = reg.allocate();
-            let put_id = reg.allocate();
+            // Allocate both IDs before mutating the books so that a mid-pair
+            // exhaustion leaves the pair untouched at `instrument_id == 0`
+            // rather than half-assigned.
+            let call_id = reg.allocate()?;
+            let put_id = reg.allocate()?;
 
             book.call().set_instrument_id(call_id);
             book.put().set_instrument_id(put_id);
@@ -1002,14 +1053,7 @@ impl StrikeOrderBookManager {
             );
         }
 
-        if let Some(idx) = &self.symbol_index {
-            let call_ref =
-                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Call);
-            let put_ref =
-                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Put);
-            idx.register(&call_symbol, call_ref);
-            idx.register(&put_symbol, put_ref);
-        }
+        Ok(())
     }
 
     /// Registers a call/put pair in the instrument registry.
@@ -1281,6 +1325,55 @@ mod tests {
         assert_ne!(call_id, 0);
         assert_ne!(put_id, 0);
         assert_ne!(call_id, put_id);
+    }
+
+    #[test]
+    fn test_get_or_create_degrades_on_id_exhaustion() {
+        use super::super::symbol_index::SymbolIndex;
+
+        // Seed the registry at its u32 ceiling so the very first allocation in
+        // `assign_instrument_ids` overflows. `get_or_create` must NOT panic: it
+        // logs and degrades, returning a fully usable strike book whose call/put
+        // pair is left at `instrument_id == 0`.
+        let registry = Arc::new(InstrumentRegistry::new_with_seed(u32::MAX));
+        let symbol_index = Arc::new(SymbolIndex::new());
+        let manager = StrikeOrderBookManager::new_with_registry_and_index(
+            "BTC",
+            test_expiration(),
+            Arc::clone(&registry),
+            Arc::clone(&symbol_index),
+        );
+
+        let book = manager.get_or_create(50000);
+
+        // No panic; the strike book exists and is mapped.
+        assert_eq!(manager.len(), 1);
+
+        // Degraded: both legs sit at the reserved id 0 (no IDs were allocated).
+        assert_eq!(book.call().instrument_id(), 0);
+        assert_eq!(book.put().instrument_id(), 0);
+
+        // Registry stayed pinned at the ceiling and registered nothing.
+        assert_eq!(registry.current_id(), u32::MAX);
+        assert_eq!(registry.len(), 0);
+
+        // Symbol lookups still work — the symbol index does not depend on the
+        // numeric instrument id, so it is populated even at exhaustion.
+        assert_eq!(symbol_index.len(), 2);
+    }
+
+    #[test]
+    fn test_get_or_create_idempotent_after_id_exhaustion() {
+        // A repeat call with the same strike returns the SAME handle even when
+        // the registry is exhausted (the degrade path does not break the
+        // idempotent `get_or_insert` contract).
+        let registry = Arc::new(InstrumentRegistry::new_with_seed(u32::MAX));
+        let manager = StrikeOrderBookManager::new_with_registry("BTC", test_expiration(), registry);
+
+        let first = manager.get_or_create(50000);
+        let second = manager.get_or_create(50000);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
     }
 
     #[test]

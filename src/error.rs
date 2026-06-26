@@ -191,6 +191,18 @@ pub enum Error {
         expected: String,
     },
 
+    /// Error when the instrument ID space is exhausted.
+    ///
+    /// The instrument registry allocates monotonically increasing `u32` IDs.
+    /// This variant is returned when the counter reaches its `u32::MAX` ceiling
+    /// and no further IDs can be handed out. The instrument ID is protocol state
+    /// (seeded across rebuilds, persisted via `current_id`, and exposed to
+    /// external sequencer consumers), so exhausting the reachable `2^32` space
+    /// surfaces as a recoverable, typed error rather than a process-aborting
+    /// panic. Reaching this ceiling is astronomically unlikely in practice.
+    #[error("instrument ID space exhausted: u32 counter reached its u32::MAX ceiling")]
+    InstrumentIdExhausted,
+
     /// Error when a journal operation fails.
     #[error("journal error: {message}")]
     JournalError {
@@ -395,6 +407,16 @@ impl Error {
         }
     }
 
+    /// Creates a new instrument ID exhaustion error.
+    ///
+    /// Returned by the instrument registry when the `u32` ID counter reaches
+    /// its `u32::MAX` ceiling and can allocate no further IDs.
+    #[must_use]
+    #[cold]
+    pub fn instrument_id_exhausted() -> Self {
+        Self::InstrumentIdExhausted
+    }
+
     /// Creates a new journal error.
     #[must_use]
     pub fn journal_error(message: impl Into<String>) -> Self {
@@ -579,6 +601,15 @@ mod tests {
         assert!(msg.contains("ETH-20240329-3000-C"));
         assert!(msg.contains("ETH"));
         assert!(msg.contains("BTC"));
+    }
+
+    #[test]
+    fn test_instrument_id_exhausted_error() {
+        let err = Error::instrument_id_exhausted();
+        let msg = err.to_string();
+        assert!(msg.contains("instrument ID space exhausted"));
+        assert!(msg.contains("u32::MAX"));
+        assert!(matches!(err, Error::InstrumentIdExhausted));
     }
 
     #[test]
