@@ -128,9 +128,13 @@ pub use sequencer::{
     SequencedUnderlyingOrderBook,
 };
 
-// Re-export upstream types used in the public API
+// Re-export upstream types used in the public API.
+//
+// The boundary newtypes (`OrderId`, `OrderType`, `Side`, `TimeInForce`, `Hash32`)
+// are re-exported here so downstream consumers need no direct `orderbook_rs` /
+// `pricelevel` dependency to use this crate's public surface.
 pub use orderbook_rs::{
-    CancelReason, FeeSchedule, MassCancelResult, OrderStateTracker, OrderStatus, STPMode,
-    TradeResult,
+    CancelReason, FeeSchedule, MassCancelResult, OrderId, OrderStateTracker, OrderStatus,
+    OrderType, STPMode, Side, TimeInForce, TradeResult,
 };
 pub use pricelevel::Hash32;

@@ -348,10 +348,9 @@ impl StrikeOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::StrikeOrderBook;
+    /// use option_chain_orderbook::{Side, StrikeOrderBook};
     /// use optionstratlib::ExpirationDate;
     /// use optionstratlib::prelude::pos_or_panic;
-    /// use orderbook_rs::Side;
     ///
     /// let strike = StrikeOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)), 50000);
     /// let result = match strike.cancel_by_side(Side::Buy) {

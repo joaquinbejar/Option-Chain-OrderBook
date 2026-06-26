@@ -620,8 +620,7 @@ impl UnderlyingOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::UnderlyingOrderBook;
-    /// use orderbook_rs::Side;
+    /// use option_chain_orderbook::{Side, UnderlyingOrderBook};
     ///
     /// let book = UnderlyingOrderBook::new("BTC");
     /// let result = match book.cancel_by_side(Side::Buy) {
@@ -1188,8 +1187,7 @@ impl UnderlyingOrderBookManager {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
-    /// use orderbook_rs::Side;
+    /// use option_chain_orderbook::{Side, UnderlyingOrderBookManager};
     ///
     /// let manager = UnderlyingOrderBookManager::new();
     /// let result = match manager.cancel_by_side_across_underlyings(Side::Buy) {

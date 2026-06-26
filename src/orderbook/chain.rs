@@ -348,10 +348,9 @@ impl OptionChainOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionChainOrderBook;
+    /// use option_chain_orderbook::{OptionChainOrderBook, Side};
     /// use optionstratlib::ExpirationDate;
     /// use optionstratlib::prelude::pos_or_panic;
-    /// use orderbook_rs::Side;
     ///
     /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
     /// let result = match chain.cancel_by_side(Side::Buy) {

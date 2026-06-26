@@ -300,10 +300,9 @@ impl ExpirationOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::ExpirationOrderBook;
+    /// use option_chain_orderbook::{ExpirationOrderBook, Side};
     /// use optionstratlib::ExpirationDate;
     /// use optionstratlib::prelude::pos_or_panic;
-    /// use orderbook_rs::Side;
     ///
     /// let book = ExpirationOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
     /// let result = match book.cancel_by_side(Side::Buy) {
