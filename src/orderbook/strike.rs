@@ -645,11 +645,16 @@ pub struct StrikeMassCancelResult {
 }
 
 impl StrikeMassCancelResult {
-    /// Returns the number of option books with cancelled orders.
+    /// Returns the number of leaf option books with cancelled orders.
     ///
     /// # Description
     ///
-    /// Counts how many option books recorded at least one cancelled order.
+    /// Counts how many leaf [`OptionOrderBook`](super::book::OptionOrderBook)s
+    /// (call/put contract books) recorded at least one cancelled order. This is
+    /// the leaf base case of `books_affected`: every higher level
+    /// (chain / expiration / underlying / global) drills down and sums these, so
+    /// the unit is a leaf contract book at every level and the counts aggregate
+    /// cleanly up the tree.
     ///
     /// # Arguments
     ///
@@ -657,7 +662,7 @@ impl StrikeMassCancelResult {
     ///
     /// # Returns
     ///
-    /// Number of books affected (books).
+    /// Number of leaf option books affected (call/put contract books).
     ///
     /// # Errors
     ///

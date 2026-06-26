@@ -70,7 +70,7 @@ fn main() {
         // Cancel all sell orders across the chain
         if let Ok(result) = chain.cancel_by_side(Side::Sell) {
             info!(
-                "Cancelled {} sell orders across {} strikes",
+                "Cancelled {} sell orders across {} contract books",
                 result.total_cancelled(),
                 result.books_affected()
             );
@@ -144,7 +144,7 @@ fn main() {
 
         if let Ok(result) = btc.cancel_all() {
             info!(
-                "Cancelled {} orders across {} expirations",
+                "Cancelled {} orders across {} contract books",
                 result.total_cancelled(),
                 result.books_affected()
             );
@@ -165,7 +165,7 @@ fn main() {
 
     if let Ok(result) = manager.cancel_all_across_underlyings() {
         info!(
-            "\nGlobal cancel: {} orders cancelled across {} underlyings",
+            "\nGlobal cancel: {} orders cancelled across {} contract books",
             result.total_cancelled(),
             result.books_affected()
         );
