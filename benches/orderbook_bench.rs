@@ -50,14 +50,14 @@ pub fn orderbook_operations(c: &mut Criterion) {
         );
     });
 
-    // Benchmark update_last_quote
-    group.bench_function("update_last_quote", |b| {
-        let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-            .unwrap();
-        b.iter(|| book.update_last_quote());
+    // Benchmark getting best quote from a one-sided (bid-only) book
+    group.bench_function("best_quote_one_sided", |b| {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        for i in 0..100 {
+            book.add_limit_order(OrderId::new(), Side::Buy, 100 - i, 10)
+                .unwrap();
+        }
+        b.iter(|| book.best_quote());
     });
 
     // Benchmark snapshot creation

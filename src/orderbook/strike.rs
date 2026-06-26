@@ -264,9 +264,13 @@ impl StrikeOrderBook {
     }
 
     /// Returns true if both call and put have two-sided quotes.
+    ///
+    /// Uses the leaf's [`has_both_sides`](OptionOrderBook::has_both_sides)
+    /// top-of-book check rather than constructing a full [`Quote`] per side, so
+    /// it never computes sizes or a timestamp just to test two-sidedness.
     #[must_use]
     pub fn is_fully_quoted(&self) -> bool {
-        self.call.best_quote().is_two_sided() && self.put.best_quote().is_two_sided()
+        self.call.has_both_sides() && self.put.has_both_sides()
     }
 
     /// Returns the total order count across call and put.
