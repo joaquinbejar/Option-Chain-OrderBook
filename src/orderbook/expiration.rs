@@ -978,11 +978,16 @@ pub struct ExpirationMassCancelResult {
 }
 
 impl ExpirationMassCancelResult {
-    /// Returns the number of chain books with cancelled orders.
+    /// Returns the number of leaf option books with cancelled orders.
     ///
     /// # Description
     ///
-    /// Counts how many chain books recorded at least one cancelled order.
+    /// Drills into each per-chain result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree and match
+    /// the same count read at the chain / underlying / global levels. This is NOT
+    /// a count of affected chains.
     ///
     /// # Arguments
     ///
@@ -990,7 +995,7 @@ impl ExpirationMassCancelResult {
     ///
     /// # Returns
     ///
-    /// Number of chain books affected (books).
+    /// Number of leaf option books affected (call/put contract books).
     ///
     /// # Errors
     ///
@@ -1008,8 +1013,8 @@ impl ExpirationMassCancelResult {
     pub fn books_affected(&self) -> usize {
         self.per_child
             .iter()
-            .filter(|(_, result)| result.total_cancelled() > 0)
-            .count()
+            .map(|(_, result)| result.books_affected())
+            .sum()
     }
 
     /// Returns the total number of cancelled orders across the expiration.

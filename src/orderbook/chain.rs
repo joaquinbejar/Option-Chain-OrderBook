@@ -639,11 +639,16 @@ pub struct ChainMassCancelResult {
 }
 
 impl ChainMassCancelResult {
-    /// Returns the number of strike books with cancelled orders.
+    /// Returns the number of leaf option books with cancelled orders.
     ///
     /// # Description
     ///
-    /// Counts how many strike books recorded at least one cancelled order.
+    /// Drills into each per-strike result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree (a chain
+    /// spanning `N` strikes with both legs touched reports `2N`). This is NOT a
+    /// count of affected strikes.
     ///
     /// # Arguments
     ///
@@ -651,7 +656,7 @@ impl ChainMassCancelResult {
     ///
     /// # Returns
     ///
-    /// Number of strike books affected (books).
+    /// Number of leaf option books affected (call/put contract books).
     ///
     /// # Errors
     ///
@@ -669,8 +674,8 @@ impl ChainMassCancelResult {
     pub fn books_affected(&self) -> usize {
         self.per_child
             .iter()
-            .filter(|(_, result)| result.total_cancelled() > 0)
-            .count()
+            .map(|(_, result)| result.books_affected())
+            .sum()
     }
 
     /// Returns the total number of cancelled orders across the chain.
@@ -728,6 +733,9 @@ pub struct OptionChainOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry propagated to newly created chains.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index propagated to newly created chains so that strikes created
+    /// through this manager register their call/put symbols for O(1) lookup.
+    symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode propagated to newly created chains.
     stp_mode: SharedSTPMode,
     /// Fee schedule propagated to newly created chains.
@@ -748,6 +756,7 @@ impl OptionChainOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -774,6 +783,43 @@ impl OptionChainOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            symbol_index: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Creates a new option chain manager with both an instrument registry and a
+    /// symbol index.
+    ///
+    /// Mirrors [`ExpirationOrderBookManager::new_with_registry_and_index`]: the
+    /// registry is propagated to newly created chains for unique instrument-ID
+    /// allocation, and the symbol index is propagated so that every strike
+    /// created beneath this manager registers its call/put symbols for O(1)
+    /// lookup. Both are forwarded together through
+    /// [`get_or_create`](Self::get_or_create) to the chain's strike manager.
+    ///
+    /// [`ExpirationOrderBookManager::new_with_registry_and_index`]: super::expiration::ExpirationOrderBookManager::new_with_registry_and_index
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        Self {
+            chains: SkipMap::new(),
+            underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -890,14 +936,19 @@ impl OptionChainOrderBookManager {
         // winning chain is configured-before-visible. Configuration only mutates
         // the fresh object (no global side effects), so a race loser's chain is
         // dropped harmlessly.
-        let fresh = if let Some(ref reg) = self.registry {
-            Arc::new(OptionChainOrderBook::new_with_registry(
+        let fresh = match (&self.registry, &self.symbol_index) {
+            (Some(reg), Some(idx)) => Arc::new(OptionChainOrderBook::new_with_registry_and_index(
                 &self.underlying,
                 expiration,
                 Arc::clone(reg),
-            ))
-        } else {
-            Arc::new(OptionChainOrderBook::new(&self.underlying, expiration))
+                Arc::clone(idx),
+            )),
+            (Some(reg), None) => Arc::new(OptionChainOrderBook::new_with_registry(
+                &self.underlying,
+                expiration,
+                Arc::clone(reg),
+            )),
+            _ => Arc::new(OptionChainOrderBook::new(&self.underlying, expiration)),
         };
         if let Some(ref config) = self.validation_config.get() {
             fresh.set_validation(config.clone());
@@ -1379,7 +1430,10 @@ mod tests {
         };
 
         assert_eq!(result.total_cancelled(), 3);
-        assert_eq!(result.books_affected(), 2);
+        // `books_affected` is the leaf option-book unit: strike 50000 touched
+        // both legs (call + put = 2 books) and strike 52000 touched only the
+        // call (1 book), so 3 leaf books are affected (NOT 2 strikes).
+        assert_eq!(result.books_affected(), 3);
         assert_eq!(chain.total_order_count(), 0);
     }
 
@@ -1737,5 +1791,66 @@ mod tests {
 
         let count = manager.iter().count();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_chain_manager_get_or_create_registers_strikes_in_symbol_index() {
+        use optionstratlib::OptionStyle;
+
+        // A strike created through the PUBLIC chain manager — wired with a
+        // registry + symbol index via `new_with_registry_and_index`, mirroring
+        // the expiration manager — must register its call/put symbols in the
+        // supplied `SymbolIndex`. Before this wiring the chain manager had no
+        // index and strikes created through it were invisible to symbol lookup.
+        let registry = Arc::new(InstrumentRegistry::new());
+        let symbol_index = Arc::new(SymbolIndex::new());
+        let manager = OptionChainOrderBookManager::new_with_registry_and_index(
+            "BTC",
+            Arc::clone(&registry),
+            Arc::clone(&symbol_index),
+        );
+
+        assert!(symbol_index.is_empty());
+
+        let chain = manager.get_or_create(test_expiration());
+        let _strike = chain.get_or_create_strike(50000);
+
+        // Exactly the call + put pair for the one strike is registered.
+        assert_eq!(symbol_index.len(), 2);
+
+        let entries = symbol_index.entries();
+        let call = entries
+            .iter()
+            .find(|(_, r)| r.option_style() == OptionStyle::Call)
+            .expect("call symbol registered");
+        let put = entries
+            .iter()
+            .find(|(_, r)| r.option_style() == OptionStyle::Put)
+            .expect("put symbol registered");
+        assert_eq!(call.1.underlying(), "BTC");
+        assert_eq!(call.1.strike(), 50000);
+        assert_eq!(put.1.underlying(), "BTC");
+        assert_eq!(put.1.strike(), 50000);
+
+        // Repeat creation of the same strike is idempotent and does not
+        // double-register in the index.
+        let again = chain.get_or_create_strike(50000);
+        assert!(Arc::ptr_eq(&again, &chain.get_or_create_strike(50000)));
+        assert_eq!(symbol_index.len(), 2);
+    }
+
+    #[test]
+    fn test_chain_manager_no_symbol_index_by_default() {
+        // The plain `new` constructor wires no symbol index, so strikes created
+        // through it allocate no index entries (the additive `new_with_registry`
+        // / `new_with_registry_and_index` opt-in path leaves `new` unchanged).
+        let symbol_index = Arc::new(SymbolIndex::new());
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        let chain = manager.get_or_create(test_expiration());
+        let _strike = chain.get_or_create_strike(50000);
+
+        // The externally held index is never touched by a manager built via `new`.
+        assert!(symbol_index.is_empty());
     }
 }

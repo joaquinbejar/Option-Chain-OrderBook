@@ -99,11 +99,16 @@ pub struct UnderlyingMassCancelResult {
 }
 
 impl UnderlyingMassCancelResult {
-    /// Returns the number of expiration books with cancelled orders.
+    /// Returns the number of leaf option books with cancelled orders.
     ///
     /// # Description
     ///
-    /// Counts how many expiration books recorded at least one cancelled order.
+    /// Drills into each per-expiration result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree and match
+    /// the same count read at the expiration / global levels. This is NOT a count
+    /// of affected expirations.
     ///
     /// # Arguments
     ///
@@ -111,7 +116,7 @@ impl UnderlyingMassCancelResult {
     ///
     /// # Returns
     ///
-    /// Number of expiration books affected (books).
+    /// Number of leaf option books affected (call/put contract books).
     ///
     /// # Errors
     ///
@@ -129,8 +134,8 @@ impl UnderlyingMassCancelResult {
     pub fn books_affected(&self) -> usize {
         self.per_child
             .iter()
-            .filter(|(_, result)| result.total_cancelled() > 0)
-            .count()
+            .map(|(_, result)| result.books_affected())
+            .sum()
     }
 
     /// Returns the total number of cancelled orders across the underlying.
@@ -1604,11 +1609,16 @@ pub struct GlobalMassCancelResult {
 }
 
 impl GlobalMassCancelResult {
-    /// Returns the number of underlying books with cancelled orders.
+    /// Returns the number of leaf option books with cancelled orders.
     ///
     /// # Description
     ///
-    /// Counts how many underlying books recorded at least one cancelled order.
+    /// Drills into each per-underlying result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so the global total equals the sum of the
+    /// per-underlying / per-expiration / per-chain leaf counts. This is NOT a
+    /// count of affected underlyings.
     ///
     /// # Arguments
     ///
@@ -1616,7 +1626,7 @@ impl GlobalMassCancelResult {
     ///
     /// # Returns
     ///
-    /// Number of underlying books affected (books).
+    /// Number of leaf option books affected (call/put contract books).
     ///
     /// # Errors
     ///
@@ -1634,8 +1644,8 @@ impl GlobalMassCancelResult {
     pub fn books_affected(&self) -> usize {
         self.per_child
             .iter()
-            .filter(|(_, result)| result.total_cancelled() > 0)
-            .count()
+            .map(|(_, result)| result.books_affected())
+            .sum()
     }
 
     /// Returns the total number of cancelled orders across all underlyings.
@@ -1714,8 +1724,74 @@ mod tests {
         };
 
         assert_eq!(result.total_cancelled(), 2);
+        // Each of the two expirations touched exactly one leaf option book, so
+        // the leaf-book unit (2) coincides with the expiration count here.
         assert_eq!(result.books_affected(), 2);
         assert_eq!(book.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_books_affected_consistent_leaf_unit_across_levels() {
+        // A mass cancel spanning N strikes with BOTH legs populated must report
+        // the SAME leaf-option-book count (2N) regardless of the level at which
+        // `books_affected` is read — chain, expiration, underlying, or global.
+        // Each level drills down to leaf contract books, so the unit is stable
+        // and the counts aggregate cleanly up the tree.
+        const N: u64 = 3;
+        let exp = test_expiration();
+        let expected = 2 * (N as usize); // 2 legs × N strikes
+
+        // Populate a single expiration with N strikes, an order on each leg.
+        let populate = |book: &UnderlyingOrderBook| {
+            let exp_book = book.get_or_create_expiration(exp);
+            for i in 0..N {
+                let strike = 50000 + i * 1000;
+                let s = exp_book.get_or_create_strike(strike);
+                s.call()
+                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .expect("add call");
+                s.put()
+                    .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
+                    .expect("add put");
+            }
+        };
+
+        // Chain level (drilled to the chain under the single expiration).
+        let book_a = UnderlyingOrderBook::new("BTC");
+        populate(&book_a);
+        let chain_result = book_a
+            .get_expiration(&exp)
+            .expect("expiration exists")
+            .chain()
+            .cancel_all()
+            .expect("chain cancel");
+        assert_eq!(chain_result.total_cancelled(), expected);
+        assert_eq!(chain_result.books_affected(), expected);
+
+        // Expiration level (fresh tree — cancel is destructive).
+        let book_b = UnderlyingOrderBook::new("BTC");
+        populate(&book_b);
+        let exp_result = book_b
+            .get_expiration(&exp)
+            .expect("expiration exists")
+            .cancel_all()
+            .expect("expiration cancel");
+        assert_eq!(exp_result.books_affected(), expected);
+
+        // Underlying level (fresh tree).
+        let book_c = UnderlyingOrderBook::new("BTC");
+        populate(&book_c);
+        let underlying_result = book_c.cancel_all().expect("underlying cancel");
+        assert_eq!(underlying_result.books_affected(), expected);
+
+        // Global level (fresh tree, through the top-level manager).
+        let manager = UnderlyingOrderBookManager::new();
+        let book_d = manager.get_or_create("BTC");
+        populate(&book_d);
+        let global_result = manager
+            .cancel_all_across_underlyings()
+            .expect("global cancel");
+        assert_eq!(global_result.books_affected(), expected);
     }
 
     #[test]

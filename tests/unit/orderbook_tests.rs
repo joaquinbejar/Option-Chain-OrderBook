@@ -96,7 +96,10 @@ fn test_cancel_all_across_underlyings() {
     };
 
     assert_eq!(result.total_cancelled(), 3);
-    assert_eq!(result.books_affected(), 2);
+    // `books_affected` reports leaf option books (call/put contract books):
+    // BTC touched both legs (2 books) and ETH touched only the call (1 book),
+    // so 3 leaf books are affected (NOT 2 underlyings).
+    assert_eq!(result.books_affected(), 3);
     assert_eq!(manager.total_order_count(), 0);
 }
 
