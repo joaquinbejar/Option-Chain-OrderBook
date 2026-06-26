@@ -137,8 +137,11 @@
 //!   Black-Scholes here).
 //! - **Async is opt-in.** `tokio` is pulled in only by the `nats` and
 //!   `sequencer` features. The default build, the hierarchy traversal, and the
-//!   order-submission / quote path are fully synchronous and lock-free — there
-//!   is no `.await` on the hot path.
+//!   order-submission / quote path are fully synchronous — there is no `.await`
+//!   on the hot path. The matching engine underneath (`orderbook-rs`) is
+//!   lock-free, and the hierarchy itself is lock-free skip-maps + atomics; the
+//!   only mutexes are around rarely-contended state (e.g. opt-in trade capture,
+//!   config holders), not the matching path.
 //! - **`ExpirationDate::Days` is wall-clock-relative.** A `Days(n)` expiry is a
 //!   moving relative day-count: it is resolved against the current clock when
 //!   materialized into a contract date or time-to-expiry, so the same `Days`
