@@ -566,18 +566,21 @@ impl OptionOrderBook {
 
     /// Expires the instrument, cancelling all resting orders.
     ///
-    /// Sets status to [`Expired`](InstrumentStatus::Expired), collects all
-    /// resting order IDs, and clears the book.
+    /// Sets status to [`Expired`](InstrumentStatus::Expired) and cancels every
+    /// resting order in a single pass via the underlying engine's
+    /// [`cancel_all_orders`](orderbook_rs::OrderBook::cancel_all_orders). Each
+    /// dropped order transitions to a terminal `Cancelled` state, the
+    /// price-level-changed listener fires (book-change events), the order
+    /// tracker counters advance, and the per-account pre-trade risk state is
+    /// reset. The status is set first so the book stops accepting new orders
+    /// before the sweep runs.
     ///
     /// # Returns
     ///
-    /// A vector of order IDs that were cancelled.
+    /// A vector of order IDs that were cancelled, in engine processing order.
     pub fn expire(&self) -> Vec<OrderId> {
         self.set_status(InstrumentStatus::Expired);
-        let orders = self.book.get_all_orders();
-        let ids: Vec<OrderId> = orders.iter().map(|o| o.id()).collect();
-        self.clear();
-        ids
+        self.book.cancel_all_orders().cancelled_order_ids().to_vec()
     }
 
     /// Checks that the instrument is accepting orders, returning an error if not.
@@ -1337,14 +1340,19 @@ impl OptionOrderBook {
     }
 
     /// Clears all orders from the book.
+    ///
+    /// Routes through the underlying engine's
+    /// [`cancel_all_orders`](orderbook_rs::OrderBook::cancel_all_orders) so
+    /// every dropped order transitions to a terminal `Cancelled` state, the
+    /// price-level-changed listener fires (book-change events), the order
+    /// tracker counters advance, and the per-account pre-trade risk state is
+    /// reset. A bare `restore_from_snapshot(empty)` would drop the orders
+    /// silently — leaving `active_order_count`, `get_order_status`, the
+    /// cancelled counter, downstream book-change publishers, and per-account
+    /// risk counters stale — so that path is reserved for genuine snapshot
+    /// restore only.
     pub fn clear(&self) {
-        let empty_snapshot = OrderBookSnapshot {
-            symbol: self.symbol.clone(),
-            timestamp: orderbook_rs::current_time_millis(),
-            bids: vec![],
-            asks: vec![],
-        };
-        let _ = self.book.restore_from_snapshot(empty_snapshot);
+        let _ = self.book.cancel_all_orders();
     }
 
     /// Returns the order book imbalance for top N levels.
@@ -1818,6 +1826,34 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_transitions_orders_to_cancelled_terminal() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id1 = OrderId::new();
+        let id2 = OrderId::new();
+        book.add_limit_order(id1, Side::Buy, 100, 10)
+            .expect("add bid");
+        book.add_limit_order(id2, Side::Sell, 105, 5)
+            .expect("add ask");
+        assert_eq!(book.active_order_count(), 2);
+
+        book.clear();
+
+        // Dropped orders must reach the terminal state, the active count must
+        // collapse to zero, and the cancelled counter must advance by the
+        // number of orders cleared.
+        assert_eq!(book.active_order_count(), 0);
+        assert!(matches!(
+            book.get_order_status(id1),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert!(matches!(
+            book.get_order_status(id2),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert_eq!(book.terminal_order_summary().cancelled, 2);
+    }
+
+    #[test]
     fn test_update_last_quote() {
         let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
@@ -2108,6 +2144,43 @@ mod tests {
         let cancelled = book.expire();
         assert_eq!(book.status(), InstrumentStatus::Expired);
         assert!(cancelled.is_empty());
+    }
+
+    #[test]
+    fn test_expire_transitions_orders_to_cancelled_and_rejects_new_adds() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id1 = OrderId::new();
+        let id2 = OrderId::new();
+        book.add_limit_order(id1, Side::Buy, 100, 10)
+            .expect("add bid");
+        book.add_limit_order(id2, Side::Sell, 105, 5)
+            .expect("add ask");
+        assert_eq!(book.active_order_count(), 2);
+
+        let cancelled = book.expire();
+
+        // All resting orders cancelled and transitioned to a terminal state.
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(book.active_order_count(), 0);
+        assert!(matches!(
+            book.get_order_status(id1),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert!(matches!(
+            book.get_order_status(id2),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert_eq!(book.terminal_order_summary().cancelled, 2);
+
+        // Instrument is now Expired and must reject new flow.
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+        let rejected = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1);
+        let err = match rejected {
+            Ok(()) => panic!("expected InstrumentNotActive error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("instrument not active"));
+        assert!(err.to_string().contains("Expired"));
     }
 
     #[test]
