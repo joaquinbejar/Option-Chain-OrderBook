@@ -539,6 +539,10 @@ impl ExpirationOrderBook {
 
     /// Returns the ATM strike closest to the given spot price.
     ///
+    /// Delegates to
+    /// [`StrikeOrderBookManager::atm_strike`](super::strike::StrikeOrderBookManager::atm_strike);
+    /// see it for the selection rule (nearest strike, lower strike on a tie).
+    ///
     /// # Errors
     ///
     /// Returns `Error::NoDataAvailable` if there are no strikes.
