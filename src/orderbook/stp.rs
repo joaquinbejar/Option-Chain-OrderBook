@@ -4,7 +4,7 @@
 //! contract books they create. STP prevents a trader's incoming order from
 //! matching against their own resting orders.
 //!
-//! The underlying `OrderBook<T>` supports these STP modes via
+//! The underlying `OrderBook<T>` supports all four STP modes via
 //! [`STPMode`](orderbook_rs::STPMode):
 //! - **None** (default) — no self-trade prevention
 //! - **CancelTaker** — cancel the incoming order on self-trade

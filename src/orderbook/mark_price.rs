@@ -341,10 +341,16 @@ impl MarkPriceConfigBuilder {
 ///
 /// ## Precision
 ///
-/// Prices are stored as `u64` and converted to `f64` for the weighted
-/// average calculation. Values above 2^53 (≈ 9 × 10^15) may lose
-/// integer precision through the `f64` round-trip. For typical financial
-/// prices in smallest units (satoshis, wei, cents) this is not a concern.
+/// Prices are stored as `u64` (smallest price units), and the weighted average
+/// and dampening are computed entirely in [`rust_decimal::Decimal`] — there is
+/// no `f64` round-trip in the calculation. Each `u64` input is converted to
+/// `Decimal` exactly (`Decimal` represents the full `u64` range), the weighting
+/// and the dampening band are exact `Decimal` arithmetic, and the result is then
+/// converted back to `u64`. The only loss is that final integer conversion,
+/// which deterministically truncates the fractional part (the mark is quantized
+/// to whole price units); it is not floating-point drift. The weight and
+/// dampening-factor values are also stored as `Decimal` (built once from `f64`
+/// at config time), so the running computation never touches `f64`.
 ///
 /// ## Example
 ///

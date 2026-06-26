@@ -91,6 +91,70 @@
 //! - [`orderbook::Quote`]: Two-sided market representation
 //! - [`orderbook::QuoteUpdate`]: Quote change tracking
 //!
+//! ## Microstructure Coverage
+//!
+//! This crate is the option-chain *organization and aggregation* layer; the
+//! matching engine itself is `orderbook-rs`. On top of that engine it provides:
+//!
+//! - **Hierarchical option chain**: underlying → expiration → chain → strike →
+//!   contract, where each leaf [`orderbook::OptionOrderBook`] wraps one
+//!   `orderbook_rs::OrderBook<T>`. `get_or_create_*` traversal is idempotent and
+//!   returns shared handles.
+//! - **Two-sided quotes**: [`orderbook::Quote`] / [`orderbook::QuoteUpdate`]
+//!   expose top-of-book per side; a one-sided book yields a one-sided quote.
+//! - **Mark price**: [`orderbook::MarkPriceCalculator`] computes a configurable
+//!   weighted average of index / mid / last-trade prices with `Decimal`
+//!   dampening to bound per-update movement.
+//! - **Greeks**: [`orderbook::GreeksEngine`] prices each contract through
+//!   `optionstratlib` from a supplied implied volatility (read from a
+//!   [`orderbook::VolSurface`] by the integrator and passed in — the engine
+//!   takes the IV directly, it does not query the surface itself), and
+//!   [`orderbook::GreeksAggregator`] sums per-position Greeks across the
+//!   hierarchy into [`orderbook::AggregatedGreeks`] using `Decimal`.
+//! - **Expiry lifecycle**: [`orderbook::ExpiryCycleConfig`] /
+//!   [`orderbook::CycleRule`], [`orderbook::ExpiryLifecycleManager`], and
+//!   [`orderbook::ExpiryScheduler`] drive roll/expiry transitions with listeners.
+//! - **Scoped mass-cancel**: contract / strike / chain / expiration /
+//!   underlying / global, each returning a typed result counting what it
+//!   cancelled, iterated deterministically from the ordered `SkipMap`.
+//! - **Instrument & symbol services**: [`orderbook::SymbolIndex`],
+//!   [`orderbook::InstrumentRegistry`], [`orderbook::InstrumentStatus`],
+//!   [`orderbook::ContractSpecs`], [`orderbook::StrikeGenerator`], and
+//!   [`orderbook::StrikeRangeConfig`] for fast lookup and strike management.
+//! - **Order policy hooks**: a crate-local [`orderbook::ValidationConfig`]
+//!   (order/price/qty limits) plus the upstream [`orderbook::FeeSchedule`] and
+//!   self-trade prevention [`orderbook::STPMode`] — all applied by `orderbook-rs`
+//!   at the leaf engine.
+//! - **Optional eventing**: NATS publishing (`nats` feature) and a
+//!   command/event/journal/replay sequencer (`sequencer` feature).
+//!
+//! ## Limitations
+//!
+//! - **Not a matching engine.** Order placement, matching, fills, fees, and STP
+//!   at the leaf are `orderbook-rs` behavior. This crate organizes and
+//!   aggregates many `OrderBook<T>` instances; it does not reimplement matching,
+//!   and options math is delegated to `optionstratlib` (no hand-rolled
+//!   Black-Scholes here).
+//! - **Async is opt-in.** `tokio` is pulled in only by the `nats` and
+//!   `sequencer` features. The default build, the hierarchy traversal, and the
+//!   order-submission / quote path are fully synchronous and lock-free — there
+//!   is no `.await` on the hot path.
+//! - **`ExpirationDate::Days` is wall-clock-relative.** A `Days(n)` expiry is a
+//!   moving relative day-count: it is resolved against the current clock when
+//!   materialized into a contract date or time-to-expiry, so the same `Days`
+//!   value maps to different calendar dates as time passes. Use
+//!   [`ExpirationDate::DateTime`](optionstratlib::ExpirationDate) for an
+//!   absolute, replay-stable expiry; lifecycle transitions operate only on the
+//!   `DateTime` form.
+//! - **Mark price is a derived, non-journaled value.** It is computed from
+//!   current inputs and is not part of the `sequencer` journal; replay
+//!   reconstructs order-book state, not historical mark prices.
+//! - **Pricing inputs are supplied by the integrator.** The crate ships only a
+//!   trivial [`orderbook::FlatVolSurface`] and mock / static index feeds
+//!   ([`orderbook::MockPriceFeed`], [`orderbook::StaticPriceFeed`]); a
+//!   production volatility surface and a live index price feed are the caller's
+//!   responsibility.
+//!
 //! ## Example Usage
 //!
 //! ### Creating a Hierarchical Order Book
@@ -224,12 +288,24 @@
 //!
 //! ## Dependencies
 //!
-//! - **orderbook-rs** (0.6): Lock-free order book engine
-//! - **optionstratlib** (0.15): Options pricing, Greeks, and strategy analysis
-//! - **crossbeam-skiplist** (0.1): Lock-free concurrent skip list
-//! - **rust_decimal** (1.40): Precise decimal arithmetic
-//! - **thiserror** (2.0): Error handling
-//! - **serde** (1.0): Serialization support
+//! See `Cargo.toml` for the exact pinned versions (kept there so this list
+//! cannot go stale). The core dependencies are:
+//!
+//! - **orderbook-rs**: lock-free matching engine and price levels — the actual
+//!   order book this crate organizes (`special_orders` feature on)
+//! - **pricelevel**: per-level engine and boundary newtypes (`OrderId`,
+//!   `Price`, `Quantity`, `Side`, `OrderType`, `TimeInForce`, `Hash32`)
+//! - **optionstratlib**: options pricing, Greeks, `ExpirationDate`,
+//!   `OptionStyle`, and `Positive`
+//! - **crossbeam-skiplist**: ordered lock-free skip list (manager children)
+//! - **dashmap**: lock-free concurrent hash map (secondary indexes)
+//! - **rust_decimal**: exact decimal arithmetic for mark price and Greeks
+//! - **thiserror**: typed error handling
+//! - **serde** / **serde_json**: serialization for events and config DTOs
+//! - **tracing**: structured logging (no global subscriber installed by the
+//!   library)
+//! - **tokio** *(optional)*: async runtime, pulled in only by the `nats` and
+//!   `sequencer` features
 
 pub mod error;
 pub mod orderbook;
