@@ -3,14 +3,13 @@
 //! This module provides the [`OptionChainOrderBook`] and [`OptionChainOrderBookManager`]
 //! for managing all strikes within a single expiration.
 
-use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
-use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
-use super::stp::SharedSTPMode;
+use super::shared::Shared;
 use super::strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
 use super::symbol_index::SymbolIndex;
-use super::validation::{SharedValidationConfig, ValidationConfig};
+use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
@@ -739,18 +738,18 @@ pub struct OptionChainOrderBookManager {
     /// The underlying asset symbol.
     underlying: String,
     /// Validation config applied to newly created chains.
-    validation_config: SharedValidationConfig,
+    validation_config: Shared<Option<ValidationConfig>>,
     /// Contract specs propagated to newly created chains.
-    contract_specs: SharedContractSpecs,
+    contract_specs: Shared<Option<ContractSpecs>>,
     /// Instrument registry propagated to newly created chains.
     registry: Option<Arc<InstrumentRegistry>>,
     /// Symbol index propagated to newly created chains so that strikes created
     /// through this manager register their call/put symbols for O(1) lookup.
     symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode propagated to newly created chains.
-    stp_mode: SharedSTPMode,
+    stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created chains.
-    fee_schedule: SharedFeeSchedule,
+    fee_schedule: Shared<Option<FeeSchedule>>,
 }
 
 impl OptionChainOrderBookManager {
@@ -764,12 +763,12 @@ impl OptionChainOrderBookManager {
         Self {
             chains: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: None,
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
         }
     }
 
@@ -791,12 +790,12 @@ impl OptionChainOrderBookManager {
         Self {
             chains: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
         }
     }
 
@@ -827,12 +826,12 @@ impl OptionChainOrderBookManager {
         Self {
             chains: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: Some(symbol_index),
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
         }
     }
 
@@ -841,7 +840,7 @@ impl OptionChainOrderBookManager {
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
     pub fn set_specs(&self, specs: ContractSpecs) {
-        self.contract_specs.set(specs);
+        self.contract_specs.set(Some(specs));
     }
 
     /// Returns the current contract specs, if any.
@@ -855,7 +854,7 @@ impl OptionChainOrderBookManager {
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have this config applied.
     pub fn set_validation(&self, config: ValidationConfig) {
-        self.validation_config.set(config);
+        self.validation_config.set(Some(config));
     }
 
     /// Returns the current validation config, if any.

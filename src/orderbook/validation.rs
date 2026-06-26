@@ -5,7 +5,6 @@
 //! across the option chain hierarchy.
 
 use crate::error::{Error, Result};
-use std::sync::RwLock;
 
 /// Configuration for order validation rules.
 ///
@@ -251,64 +250,6 @@ impl std::fmt::Display for ValidationConfig {
     }
 }
 
-/// Thread-safe shared validation configuration.
-///
-/// Wraps a [`ValidationConfig`] in a [`RwLock`] so that hierarchy managers
-/// can store and update the validation config for future children without
-/// requiring `&mut self`.
-pub(crate) struct SharedValidationConfig {
-    /// The inner validation config, protected by a read-write lock.
-    inner: RwLock<Option<ValidationConfig>>,
-}
-
-impl SharedValidationConfig {
-    /// Creates a new empty shared validation config.
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: RwLock::new(None),
-        }
-    }
-
-    /// Sets the validation config.
-    ///
-    /// Recovers from a poisoned lock to ensure the config is always written.
-    pub(crate) fn set(&self, config: ValidationConfig) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(config);
-    }
-
-    /// Returns a clone of the current validation config, if any.
-    ///
-    /// Recovers from a poisoned lock to avoid silently dropping a stored config.
-    #[must_use]
-    pub(crate) fn get(&self) -> Option<ValidationConfig> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.clone()
-    }
-}
-
-impl Default for SharedValidationConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for SharedValidationConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let config = self.get();
-        f.debug_struct("SharedValidationConfig")
-            .field("inner", &config)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,35 +321,6 @@ mod tests {
     fn test_validation_config_display_partial() {
         let config = ValidationConfig::new().with_lot_size(5);
         assert_eq!(format!("{config}"), "ValidationConfig(lot=5)");
-    }
-
-    #[test]
-    fn test_shared_validation_config_default() {
-        let shared = SharedValidationConfig::new();
-        assert!(shared.get().is_none());
-    }
-
-    #[test]
-    fn test_shared_validation_config_set_get() {
-        let shared = SharedValidationConfig::new();
-        let config = ValidationConfig::new().with_tick_size(100);
-        shared.set(config.clone());
-        assert_eq!(shared.get(), Some(config));
-    }
-
-    #[test]
-    fn test_shared_validation_config_overwrite() {
-        let shared = SharedValidationConfig::new();
-        shared.set(ValidationConfig::new().with_tick_size(100));
-        shared.set(ValidationConfig::new().with_tick_size(200));
-        assert_eq!(shared.get().map(|c| c.tick_size()), Some(Some(200)));
-    }
-
-    #[test]
-    fn test_shared_validation_config_debug() {
-        let shared = SharedValidationConfig::new();
-        let debug = format!("{shared:?}");
-        assert!(debug.contains("SharedValidationConfig"));
     }
 
     // ========== ValidationConfig::validate tests ==========

@@ -22,7 +22,6 @@ use crate::error::{Error, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use optionstratlib::ExpirationDate;
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
 
 // ─── CycleRule ───────────────────────────────────────────────────────────────
 
@@ -455,66 +454,6 @@ pub(crate) fn to_datetime(date: NaiveDate, time: NaiveTime) -> DateTime<Utc> {
 /// Combines a [`NaiveDate`] and a [`NaiveTime`] into an `ExpirationDate::DateTime`.
 fn to_expiration(date: NaiveDate, time: NaiveTime) -> ExpirationDate {
     ExpirationDate::DateTime(to_datetime(date, time))
-}
-
-// ─── SharedExpiryCycleConfig ──────────────────────────────────────────────────
-
-/// Thread-safe container for an optional [`ExpiryCycleConfig`].
-///
-/// Wraps `Option<ExpiryCycleConfig>` in a [`RwLock`] so that
-/// [`UnderlyingOrderBook`](super::underlying::UnderlyingOrderBook) can store
-/// and update the config without requiring `&mut self`.
-pub(crate) struct SharedExpiryCycleConfig {
-    /// Inner config, protected by a read-write lock.
-    inner: RwLock<Option<ExpiryCycleConfig>>,
-}
-
-impl SharedExpiryCycleConfig {
-    /// Creates a new empty shared expiry cycle config.
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: RwLock::new(None),
-        }
-    }
-
-    /// Stores a new config, replacing any existing one.
-    ///
-    /// Recovers from a poisoned lock to ensure the config is always written.
-    pub(crate) fn set(&self, config: ExpiryCycleConfig) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(config);
-    }
-
-    /// Returns a clone of the stored config, or `None` if unset.
-    ///
-    /// Recovers from a poisoned lock to avoid silently returning `None`.
-    #[must_use]
-    pub(crate) fn get(&self) -> Option<ExpiryCycleConfig> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.clone()
-    }
-
-    /// Clears the stored config.
-    pub(crate) fn clear(&self) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
-    }
-}
-
-impl Default for SharedExpiryCycleConfig {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1076,51 +1015,5 @@ mod tests {
         let json = serde_json::to_string(&rule).expect("serialize");
         let decoded: CycleRule = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(rule, decoded);
-    }
-
-    // ── SharedExpiryCycleConfig ───────────────────────────────────────────────
-
-    #[test]
-    fn test_shared_initially_none() {
-        let shared = SharedExpiryCycleConfig::new();
-        assert!(shared.get().is_none());
-    }
-
-    #[test]
-    fn test_shared_set_and_get() {
-        let shared = SharedExpiryCycleConfig::new();
-        let config = ExpiryCycleConfig::default();
-        shared.set(config.clone());
-        assert_eq!(shared.get(), Some(config));
-    }
-
-    #[test]
-    fn test_shared_overwrite() {
-        let shared = SharedExpiryCycleConfig::new();
-        shared.set(ExpiryCycleConfig::default());
-        let custom = ExpiryCycleConfig {
-            cycles: vec![CycleRule {
-                cycle_type: ExpiryType::Daily,
-                count: 5,
-            }],
-            expiry_time_utc: time(9, 0),
-            settlement_time_utc: time(9, 30),
-        };
-        shared.set(custom.clone());
-        assert_eq!(shared.get(), Some(custom));
-    }
-
-    #[test]
-    fn test_shared_clear() {
-        let shared = SharedExpiryCycleConfig::new();
-        shared.set(ExpiryCycleConfig::default());
-        shared.clear();
-        assert!(shared.get().is_none());
-    }
-
-    #[test]
-    fn test_shared_default_is_none() {
-        let shared = SharedExpiryCycleConfig::default();
-        assert!(shared.get().is_none());
     }
 }

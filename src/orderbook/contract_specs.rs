@@ -5,13 +5,12 @@
 //! style) and attaching them to the option chain hierarchy at the
 //! [`UnderlyingOrderBook`](super::underlying::UnderlyingOrderBook) level.
 //!
-//! It also provides [`SharedContractSpecs`], a thread-safe wrapper used internally
-//! by hierarchy managers to propagate specs to newly created children.
+//! Hierarchy managers propagate specs to newly created children through the
+//! generic [`Shared`](super::shared::Shared)`<Option<ContractSpecs>>` holder.
 
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
 
 /// Exercise style of the option contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -360,64 +359,6 @@ impl ContractSpecsBuilder {
     }
 }
 
-/// Thread-safe shared contract specifications.
-///
-/// Wraps a [`ContractSpecs`] in a [`RwLock`] so that hierarchy managers can
-/// store and propagate specs to newly created children without requiring
-/// `&mut self`.
-pub(crate) struct SharedContractSpecs {
-    /// The inner contract specs, protected by a read-write lock.
-    inner: RwLock<Option<ContractSpecs>>,
-}
-
-impl SharedContractSpecs {
-    /// Creates a new empty shared contract specs.
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: RwLock::new(None),
-        }
-    }
-
-    /// Sets the contract specs.
-    ///
-    /// Recovers from a poisoned lock to ensure the specs are always written.
-    pub(crate) fn set(&self, specs: ContractSpecs) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(specs);
-    }
-
-    /// Returns a clone of the current contract specs, if any.
-    ///
-    /// Recovers from a poisoned lock to avoid silently dropping stored specs.
-    #[must_use]
-    pub(crate) fn get(&self) -> Option<ContractSpecs> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.clone()
-    }
-}
-
-impl Default for SharedContractSpecs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for SharedContractSpecs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let specs = self.get();
-        f.debug_struct("SharedContractSpecs")
-            .field("inner", &specs)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,48 +563,6 @@ mod tests {
             .expect("valid specs");
         let cloned = specs.clone();
         assert_eq!(specs, cloned);
-    }
-
-    #[test]
-    fn test_shared_contract_specs_default() {
-        let shared = SharedContractSpecs::new();
-        assert!(shared.get().is_none());
-    }
-
-    #[test]
-    fn test_shared_contract_specs_set_get() {
-        let shared = SharedContractSpecs::new();
-        let specs = ContractSpecs::builder()
-            .tick_size(100)
-            .build()
-            .expect("valid specs");
-        shared.set(specs.clone());
-        assert_eq!(shared.get(), Some(specs));
-    }
-
-    #[test]
-    fn test_shared_contract_specs_overwrite() {
-        let shared = SharedContractSpecs::new();
-        shared.set(
-            ContractSpecs::builder()
-                .tick_size(100)
-                .build()
-                .expect("valid specs"),
-        );
-        shared.set(
-            ContractSpecs::builder()
-                .tick_size(200)
-                .build()
-                .expect("valid specs"),
-        );
-        assert_eq!(shared.get().map(|s| s.tick_size()), Some(200));
-    }
-
-    #[test]
-    fn test_shared_contract_specs_debug() {
-        let shared = SharedContractSpecs::new();
-        let debug = format!("{shared:?}");
-        assert!(debug.contains("SharedContractSpecs"));
     }
 
     #[test]
