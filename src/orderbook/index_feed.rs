@@ -61,12 +61,37 @@ pub struct SubscriptionId(pub(crate) u64);
 /// Receives a shared reference to the [`PriceUpdate`] to avoid cloning
 /// when multiple listeners are registered.
 ///
+/// ## Non-blocking, fast contract
+///
+/// A `PriceUpdateListener` **must be non-blocking and fast**. Implementations
+/// such as [`MockPriceFeed`](super::index_price_feed::MockPriceFeed) invoke the
+/// listener on a dedicated per-subscriber *background drain thread*, never
+/// inline on the price producer's thread, so the producer is never stalled by a
+/// slow listener. A listener that blocks (long I/O, lock contention, sleeping)
+/// only slows *its own* delivery; other subscribers and the producer are
+/// unaffected.
+///
+/// ### Drop / lag policy under overload
+///
+/// Delivery uses a **keep-latest** policy: each subscriber holds only the most
+/// recent pending update. If a listener cannot keep up, intermediate updates
+/// are coalesced (the freshest value wins) rather than queued unboundedly — so
+/// a lagging listener observes the *most recent deliverable* updates, not every
+/// intermediate tick. A listener must therefore tolerate gaps in the update
+/// sequence and must not assume it sees every price.
+///
 /// # Panics
 ///
-/// Listener implementations **must not panic**. If a listener panics during
-/// notification, subsequent listeners in the subscription list will not be
-/// called. Callers are responsible for ensuring their callbacks are
-/// panic-free.
+/// Listener implementations **must not panic**. A panic aborts that
+/// subscriber's drain thread; other subscribers are unaffected. Callers are
+/// responsible for ensuring their callbacks are panic-free.
+///
+/// # Re-entrancy
+///
+/// A listener may call back into the feed (including unsubscribing itself or
+/// dropping the feed) from within its callback without deadlocking — teardown
+/// detaches the current drain thread rather than joining it, so the thread
+/// simply exits once the callback returns.
 pub type PriceUpdateListener = Arc<dyn Fn(&PriceUpdate) + Send + Sync>;
 
 /// Trait for external index price sources.
