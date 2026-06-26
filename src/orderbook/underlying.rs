@@ -526,6 +526,26 @@ impl UnderlyingOrderBook {
         self.expirations.get_or_create(expiration)
     }
 
+    /// Gets or creates an expiration order book, reporting whether this call
+    /// performed the insertion.
+    ///
+    /// Returns `(book, inserted)` where `inserted` is `true` for exactly one
+    /// caller across all concurrent callers for a given expiration — the one
+    /// whose freshly built book won the atomic publish. Delegates to
+    /// [`ExpirationOrderBookManager::get_or_create_inserted`].
+    ///
+    /// This is the race-free signal the expiry scheduler uses to decide that an
+    /// expiration was genuinely created now, replacing a separate
+    /// [`get_expiration`](Self::get_expiration) probe that reopens a
+    /// check-then-act race under concurrency.
+    #[must_use]
+    pub fn get_or_create_expiration_inserted(
+        &self,
+        expiration: ExpirationDate,
+    ) -> (Arc<ExpirationOrderBook>, bool) {
+        self.expirations.get_or_create_inserted(expiration)
+    }
+
     /// Gets an expiration order book.
     ///
     /// # Errors
