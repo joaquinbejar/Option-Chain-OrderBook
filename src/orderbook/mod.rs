@@ -51,6 +51,7 @@ mod book;
 mod chain;
 mod contract_specs;
 mod expiration;
+mod expiration_key;
 mod expiry_cycle;
 mod expiry_lifecycle;
 mod expiry_scheduler;

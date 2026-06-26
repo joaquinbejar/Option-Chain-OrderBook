@@ -5,6 +5,7 @@
 
 use super::chain::{ChainMassCancelResult, OptionChainOrderBook};
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::expiration_key::ExpirationKey;
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
@@ -555,8 +556,14 @@ impl ExpirationOrderBook {
 /// Provides centralized access to all expirations for an underlying asset.
 /// Uses `SkipMap` for thread-safe concurrent access.
 pub struct ExpirationOrderBookManager {
-    /// Expiration order books indexed by expiration date.
-    expirations: SkipMap<ExpirationDate, Arc<ExpirationOrderBook>>,
+    /// Expiration order books indexed by a deterministic [`ExpirationKey`].
+    ///
+    /// Keyed on [`ExpirationKey`] rather than [`ExpirationDate`] directly
+    /// because the latter's `Ord`/`Eq` is wall-clock-relative and collides
+    /// distinct expirations (see [`ExpirationKey`] docs). Each stored
+    /// [`ExpirationOrderBook`] retains its original [`ExpirationDate`], so the
+    /// public API still hands back `ExpirationDate` values.
+    expirations: SkipMap<ExpirationKey, Arc<ExpirationOrderBook>>,
     /// The underlying asset symbol.
     underlying: String,
     /// Validation config applied to newly created expiration books.
@@ -737,7 +744,8 @@ impl ExpirationOrderBookManager {
     /// If a validation config has been set via [`set_validation`](Self::set_validation),
     /// newly created expiration books will have that config propagated to their chain.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<ExpirationOrderBook> {
-        if let Some(entry) = self.expirations.get(&expiration) {
+        let key = ExpirationKey::from(&expiration);
+        if let Some(entry) = self.expirations.get(&key) {
             return Arc::clone(entry.value());
         }
         let book = match (&self.registry, &self.symbol_index) {
@@ -767,7 +775,7 @@ impl ExpirationOrderBookManager {
         if let Some(schedule) = self.fee_schedule.get() {
             book.set_fee_schedule(schedule);
         }
-        self.expirations.insert(expiration, Arc::clone(&book));
+        self.expirations.insert(key, Arc::clone(&book));
         book
     }
 
@@ -778,7 +786,7 @@ impl ExpirationOrderBookManager {
     /// Returns `Error::ExpirationNotFound` if the expiration does not exist.
     pub fn get(&self, expiration: &ExpirationDate) -> Result<Arc<ExpirationOrderBook>> {
         self.expirations
-            .get(expiration)
+            .get(&ExpirationKey::from(expiration))
             .map(|e| Arc::clone(e.value()))
             .ok_or_else(|| Error::expiration_not_found(expiration.to_string()))
     }
@@ -786,20 +794,29 @@ impl ExpirationOrderBookManager {
     /// Returns true if an expiration exists.
     #[must_use]
     pub fn contains(&self, expiration: &ExpirationDate) -> bool {
-        self.expirations.contains_key(expiration)
+        self.expirations
+            .contains_key(&ExpirationKey::from(expiration))
     }
 
-    /// Returns an iterator over all expirations.
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = crossbeam_skiplist::map::Entry<'_, ExpirationDate, Arc<ExpirationOrderBook>>>
-    {
-        self.expirations.iter()
+    /// Returns an iterator over all expirations, ordered by expiration.
+    ///
+    /// Yields `(ExpirationDate, Arc<ExpirationOrderBook>)` tuples in ascending
+    /// order. Ordering is driven by an internal deterministic expiration key
+    /// (clock-independent and collision-free, unlike `ExpirationDate`'s own
+    /// `Ord`), so the traversal order is stable and replay-safe. The
+    /// `ExpirationDate` is the original value stored in each book; the internal
+    /// key is never exposed.
+    pub fn iter(&self) -> impl Iterator<Item = (ExpirationDate, Arc<ExpirationOrderBook>)> + '_ {
+        self.expirations
+            .iter()
+            .map(|e| (*e.value().expiration(), Arc::clone(e.value())))
     }
 
     /// Removes an expiration order book.
     pub fn remove(&self, expiration: &ExpirationDate) -> bool {
-        self.expirations.remove(expiration).is_some()
+        self.expirations
+            .remove(&ExpirationKey::from(expiration))
+            .is_some()
     }
 
     /// Returns the total order count across all expirations.
@@ -1120,6 +1137,70 @@ mod tests {
         drop(manager.get_or_create(ExpirationDate::Days(pos_or_panic!(90.0))));
 
         assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_expiration_manager_get_or_create_returns_same_handle() {
+        let manager = ExpirationOrderBookManager::new("BTC");
+        let exp = test_expiration();
+
+        let first = manager.get_or_create(exp);
+        let second = manager.get_or_create(exp);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_expiration_manager_same_day_of_month_distinct_months_both_retrievable() {
+        use chrono::{TimeZone, Utc};
+
+        // Regression for issue #50: two `DateTime` expirations sharing a
+        // day-of-month across different months must not collide into one
+        // `SkipMap` slot.
+        let jan = match Utc.with_ymd_and_hms(2026, 1, 15, 8, 0, 0) {
+            chrono::offset::LocalResult::Single(dt) => ExpirationDate::DateTime(dt),
+            _ => panic!("invalid jan fixture"),
+        };
+        let feb = match Utc.with_ymd_and_hms(2026, 2, 15, 8, 0, 0) {
+            chrono::offset::LocalResult::Single(dt) => ExpirationDate::DateTime(dt),
+            _ => panic!("invalid feb fixture"),
+        };
+
+        let manager = ExpirationOrderBookManager::new("BTC");
+
+        // Distinguish the two books by strike population.
+        let jan_book = manager.get_or_create(jan);
+        jan_book.get_or_create_strike(50000);
+
+        let feb_book = manager.get_or_create(feb);
+        feb_book.get_or_create_strike(50000);
+        feb_book.get_or_create_strike(51000);
+
+        // Both expirations survive — the second insert did not overwrite the first.
+        assert_eq!(manager.len(), 2);
+        assert!(manager.contains(&jan));
+        assert!(manager.contains(&feb));
+
+        // `get` returns the correct, independent book for each expiration.
+        let jan_got = match manager.get(&jan) {
+            Ok(book) => book,
+            Err(err) => panic!("jan not found: {}", err),
+        };
+        let feb_got = match manager.get(&feb) {
+            Ok(book) => book,
+            Err(err) => panic!("feb not found: {}", err),
+        };
+        assert_eq!(jan_got.strike_count(), 1);
+        assert_eq!(feb_got.strike_count(), 2);
+        assert_eq!(*jan_got.expiration(), jan);
+        assert_eq!(*feb_got.expiration(), feb);
+
+        // Removing one leaves the other intact.
+        assert!(manager.remove(&jan));
+        assert_eq!(manager.len(), 1);
+        assert!(!manager.contains(&jan));
+        assert!(manager.contains(&feb));
     }
 
     #[test]
