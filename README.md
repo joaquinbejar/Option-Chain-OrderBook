@@ -227,7 +227,9 @@ cargo bench -- hierarchy_benches
 Built on OrderBook-rs's lock-free architecture:
 
 - **Order Operations**: O(log N) for add/cancel operations
-- **Best Quote Lookup**: O(1) with caching
+- **Best Quote Lookup**: small bounded top-of-book read (best price per side
+  plus the aggregate size at that single best level); no caching and no
+  full-book scan or heap allocation
 - **Thread Safety**: Lock-free operations for concurrent access
 - **Hierarchy Traversal**: O(log N) access via `SkipMap`
 

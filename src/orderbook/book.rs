@@ -18,7 +18,7 @@ use orderbook_rs::{
 use pricelevel::{Hash32, MatchResult, Quantity};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -223,6 +223,25 @@ impl std::iter::Sum for TerminalOrderSummary {
     }
 }
 
+/// RAII guard that arms trade capture for a scope and restores the previous
+/// armed state on drop.
+///
+/// Constructed by [`OptionOrderBook::arm_capture_scope`] so the `_full` order
+/// methods capture their own trade without leaving the book permanently armed.
+struct CaptureArmGuard<'a> {
+    /// The book's armed flag.
+    flag: &'a AtomicBool,
+    /// Armed state observed at scope entry, restored on drop.
+    previous: bool,
+}
+
+impl Drop for CaptureArmGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.flag.store(self.previous, Ordering::Relaxed);
+    }
+}
+
 /// Internal atomic counters for terminal state tracking via listener.
 pub(crate) struct TerminalCounters {
     filled: AtomicUsize,
@@ -294,8 +313,6 @@ pub struct OptionOrderBook {
     symbol_hash: u64,
     /// The underlying order book from OrderBook-rs.
     book: Arc<DefaultOrderBook>,
-    /// Last known quote for change detection.
-    last_quote: Arc<Quote>,
     /// The option style (Call or Put).
     option_style: OptionStyle,
     /// Unique identifier for this order book.
@@ -308,9 +325,20 @@ pub struct OptionOrderBook {
     instrument_id: AtomicU32,
     /// Captured trade result from the last order submission.
     ///
-    /// Populated by the internal trade listener when a matching occurs.
-    /// Used by the `_full` order methods to return [`TradeResult`].
+    /// Populated by the internal trade listener when a matching occurs *and*
+    /// trade capture is armed. Used by the `_full` order methods to return
+    /// [`TradeResult`].
     last_trade_result: Arc<Mutex<Option<TradeResult>>>,
+    /// Cheap armed flag gating the trade-capture clone+lock on the match hot
+    /// path.
+    ///
+    /// Disarmed by default: the always-installed trade listener performs a
+    /// single relaxed atomic load and returns without cloning the
+    /// [`TradeResult`] or taking the capture lock. The `_full` order methods arm
+    /// it for the duration of their own submission so they still observe the
+    /// trade; [`arm_trade_capture`](Self::arm_trade_capture) opts a book into
+    /// continuous capture for [`last_trade_result`](Self::last_trade_result).
+    trade_capture_armed: Arc<AtomicBool>,
     /// Cumulative terminal order counters maintained by the state listener.
     ///
     /// `None` when state tracking is disabled via `BookConfig`.
@@ -348,10 +376,18 @@ impl OptionOrderBook {
             book.set_fee_schedule(Some(schedule));
         }
 
-        // Install trade-capture listener so `_full` methods can return TradeResult
+        // Install trade-capture listener so `_full` methods can return TradeResult.
+        // The clone+lock is gated behind a cheap relaxed atomic so the common
+        // (non-`_full`, unarmed) match path pays only one atomic load and never
+        // clones the TradeResult or takes the lock.
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
+        let armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let capture_clone = Arc::clone(&capture);
+        let armed_clone = Arc::clone(&armed);
         let capture_listener: TradeListener = Arc::new(move |tr: &TradeResult| {
+            if !armed_clone.load(Ordering::Relaxed) {
+                return;
+            }
             let mut guard = capture_clone
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -403,12 +439,12 @@ impl OptionOrderBook {
             symbol,
             symbol_hash,
             book: Arc::new(book),
-            last_quote: Arc::new(Quote::empty(0)),
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
+            trade_capture_armed: armed,
             terminal_counters,
         }
     }
@@ -627,19 +663,64 @@ impl OptionOrderBook {
     }
 
     /// Returns the trade result captured from the last order submission,
-    /// or `None` if no match occurred.
+    /// or `None` if no match occurred *while trade capture was armed*.
     ///
-    /// This is populated by the internal trade listener whenever a matching
-    /// event occurs. Prefer the `_full` order methods for reliable access.
+    /// Trade capture is **disarmed by default** to keep the per-match hot path
+    /// allocation-free: the internal listener only records a [`TradeResult`]
+    /// when the book is armed. The `_full` order methods arm capture for the
+    /// duration of their own submission, so they always observe their trade
+    /// regardless of this setting. To populate this accessor from the plain
+    /// (non-`_full`) order path, call
+    /// [`arm_trade_capture(true)`](Self::arm_trade_capture) first; with capture
+    /// disarmed this returns `None` (or the last value captured while armed).
     ///
     /// **Note:** concurrent calls to order methods on the same book may
-    /// overwrite this value before it is read.
+    /// overwrite this value before it is read — it is a single-slot,
+    /// last-write-wins poll, never a per-fill feed. For a reliable real-time
+    /// trade/fill stream use the NATS trade publisher (feature `nats`) or the
+    /// `_full` order methods' return values; for risk/PnL counters use the
+    /// order-state tracker. All three are independent of this arm flag.
+    ///
+    /// **Changed in 0.5.0:** trade capture is now disarmed by default, so the
+    /// plain order path no longer auto-populates this accessor. Pre-0.5.0 code
+    /// that polled `last_trade_result()` after a plain `add_*`/`cancel` must now
+    /// call [`arm_trade_capture(true)`](Self::arm_trade_capture) first, or switch
+    /// to one of the feeds above.
     #[must_use]
     pub fn last_trade_result(&self) -> Option<TradeResult> {
         self.last_trade_result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Arms or disarms continuous trade capture for this book.
+    ///
+    /// When armed, the internal trade listener clones each matching
+    /// [`TradeResult`] under a lock so it can be read back via
+    /// [`last_trade_result`](Self::last_trade_result). When disarmed (the
+    /// default), the listener short-circuits on a single relaxed atomic load,
+    /// adding no clone or lock cost to the match path.
+    ///
+    /// The `_full` order methods arm capture internally for their own
+    /// submission, so this toggle is only needed to observe trades made through
+    /// the plain (non-`_full`) order methods.
+    ///
+    /// Intended for a single controller: the `_full` methods save and restore
+    /// the prior arm state around their own submission, so interleaving a manual
+    /// `arm_trade_capture(true)` with concurrent `_full` calls on the same book
+    /// can race (a `_full` that captured the pre-arm `false` will restore it on
+    /// drop). Arm from one owner, not concurrently with `_full` traffic.
+    #[inline]
+    pub fn arm_trade_capture(&self, armed: bool) {
+        self.trade_capture_armed.store(armed, Ordering::Relaxed);
+    }
+
+    /// Returns whether continuous trade capture is currently armed.
+    #[must_use]
+    #[inline]
+    pub fn is_trade_capture_armed(&self) -> bool {
+        self.trade_capture_armed.load(Ordering::Relaxed)
     }
 
     /// Returns the current lifecycle status of this instrument.
@@ -993,6 +1074,21 @@ impl OptionOrderBook {
 
     // ── Full order methods (return TradeResult) ─────────────────────────
 
+    /// Arms trade capture for the lifetime of the returned guard, restoring the
+    /// previous armed state on drop.
+    ///
+    /// Used by the `_full` order methods so a trade is captured even when the
+    /// book is not under continuous capture. The guard restores (rather than
+    /// unconditionally disarming) so a `_full` call nested inside an armed scope
+    /// leaves capture armed afterwards.
+    fn arm_capture_scope(&self) -> CaptureArmGuard<'_> {
+        let previous = self.trade_capture_armed.swap(true, Ordering::Relaxed);
+        CaptureArmGuard {
+            flag: &self.trade_capture_armed,
+            previous,
+        }
+    }
+
     /// Clears the captured trade result before submitting an order.
     fn clear_trade_capture(&self) {
         let mut guard = self
@@ -1040,6 +1136,7 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        let _capture = self.arm_capture_scope();
         self.clear_trade_capture();
         self.book
             .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
@@ -1062,6 +1159,7 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        let _capture = self.arm_capture_scope();
         self.clear_trade_capture();
         self.book
             .add_limit_order(order_id, price, quantity, side, tif, None)?;
@@ -1084,6 +1182,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        let _capture = self.arm_capture_scope();
         self.clear_trade_capture();
         self.book.add_limit_order_with_user(
             order_id,
@@ -1115,6 +1214,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        let _capture = self.arm_capture_scope();
         self.clear_trade_capture();
         self.book
             .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
@@ -1499,45 +1599,76 @@ impl OptionOrderBook {
     }
 
     /// Returns the current best quote.
+    ///
+    /// This is a small bounded top-of-book read, not an O(1) cached lookup: it
+    /// reads the best price on each side and the aggregate size resting at that
+    /// single best level via
+    /// [`total_depth_at_levels`](orderbook_rs::OrderBook::total_depth_at_levels)
+    /// with `levels = 1`. It performs **no** full-book scan and **no** heap
+    /// allocation. A one-sided book yields a one-sided [`Quote`] (the empty side
+    /// has `None` price and zero size).
     #[must_use]
+    #[inline]
     pub fn best_quote(&self) -> Quote {
+        // Wall-clock stamp (non-monotonic). Safe here: `Quote` is a transient
+        // market-data read, is excluded from `Quote`'s `PartialEq`, and is never
+        // serialized into a journal record or NATS payload. Do NOT let a `Quote`
+        // (and hence this timestamp) feed a journaled/replayed path — thread an
+        // injected clock instead if that ever changes.
         let timestamp_ms = orderbook_rs::current_time_millis();
 
-        let (bid_price, bid_size) = self
-            .book
-            .best_bid()
-            .map(|p| (Some(p), self.bid_depth_at_price(p)))
-            .unwrap_or((None, 0));
+        // One ordered top-of-book read per populated side; `total_depth_at_levels`
+        // with `levels = 1` sums only the best level and never allocates.
+        let (bid_price, bid_size) = match self.book.best_bid() {
+            Some(p) => (Some(p), self.book.total_depth_at_levels(1, Side::Buy)),
+            None => (None, 0),
+        };
 
-        let (ask_price, ask_size) = self
-            .book
-            .best_ask()
-            .map(|p| (Some(p), self.ask_depth_at_price(p)))
-            .unwrap_or((None, 0));
+        let (ask_price, ask_size) = match self.book.best_ask() {
+            Some(p) => (Some(p), self.book.total_depth_at_levels(1, Side::Sell)),
+            None => (None, 0),
+        };
 
         Quote::new(bid_price, bid_size, ask_price, ask_size, timestamp_ms)
     }
 
+    /// Returns `true` if the book currently has resting orders on **both**
+    /// sides (a two-sided market).
+    ///
+    /// Cheaper than [`best_quote`](Self::best_quote) when only two-sidedness is
+    /// needed: it reads just the best price on each side and never computes
+    /// sizes or builds a [`Quote`]. Used by the strike layer to test whether a
+    /// contract is fully quoted.
+    #[must_use]
+    #[inline]
+    pub fn has_both_sides(&self) -> bool {
+        self.book.best_bid().is_some() && self.book.best_ask().is_some()
+    }
+
     /// Returns the best bid price.
     #[must_use]
+    #[inline]
     pub fn best_bid(&self) -> Option<u128> {
         self.book.best_bid()
     }
 
     /// Returns the best ask price.
     #[must_use]
+    #[inline]
     pub fn best_ask(&self) -> Option<u128> {
         self.book.best_ask()
     }
 
     /// Returns the mid price if both sides exist.
     #[must_use]
+    #[inline]
     pub fn mid_price(&self) -> Option<f64> {
         self.book.mid_price()
     }
 
     /// Returns the spread if both sides exist.
     #[must_use]
+    #[inline]
     pub fn spread(&self) -> Option<u128> {
         self.book.spread()
     }
@@ -1621,26 +1752,6 @@ impl OptionOrderBook {
     #[must_use]
     pub fn imbalance(&self, levels: usize) -> f64 {
         self.book.order_book_imbalance(levels)
-    }
-
-    /// Updates the last known quote and returns true if it changed.
-    pub fn update_last_quote(&mut self) -> bool {
-        let current = self.best_quote();
-        let changed = current != *self.last_quote;
-        self.last_quote = Arc::new(current);
-        changed
-    }
-
-    /// Returns a reference to the last known quote.
-    #[must_use]
-    pub fn last_quote(&self) -> &Quote {
-        &self.last_quote
-    }
-
-    /// Returns an Arc reference to the last known quote.
-    #[must_use]
-    pub fn last_quote_arc(&self) -> Arc<Quote> {
-        Arc::clone(&self.last_quote)
     }
 
     /// Returns depth at a specific price level on the bid side.
@@ -1767,6 +1878,122 @@ mod tests {
         assert_eq!(quote.ask_price(), Some(101));
         assert_eq!(quote.ask_size(), 5);
         assert!(quote.is_two_sided());
+        assert!(book.has_both_sides());
+    }
+
+    #[test]
+    fn test_best_quote_sums_best_level_only() {
+        // best_quote's size must aggregate all orders resting at the single
+        // best level (and not deeper levels), using total_depth_at_levels(1).
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        // Two orders at the best bid (100), one deeper bid (99).
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add bid");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 7)
+            .expect("add bid");
+        book.add_limit_order(OrderId::new(), Side::Buy, 99, 100)
+            .expect("add deep bid");
+        // Two orders at the best ask (101), one deeper ask (102).
+        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Sell, 101, 3)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Sell, 102, 100)
+            .expect("add deep ask");
+
+        let quote = book.best_quote();
+        assert_eq!(quote.bid_price(), Some(100));
+        assert_eq!(quote.bid_size(), 17); // 10 + 7, deeper 99 excluded
+        assert_eq!(quote.ask_price(), Some(101));
+        assert_eq!(quote.ask_size(), 8); // 5 + 3, deeper 102 excluded
+        assert!(quote.is_two_sided());
+        assert!(book.has_both_sides());
+    }
+
+    #[test]
+    fn test_best_quote_one_sided() {
+        // Bid-only book: ask side must be None/zero, not two-sided.
+        let bid_only = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        bid_only
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add bid");
+        let q = bid_only.best_quote();
+        assert_eq!(q.bid_price(), Some(100));
+        assert_eq!(q.bid_size(), 10);
+        assert_eq!(q.ask_price(), None);
+        assert_eq!(q.ask_size(), 0);
+        assert!(!q.is_two_sided());
+        assert!(!bid_only.has_both_sides());
+
+        // Ask-only book: bid side must be None/zero, not two-sided.
+        let ask_only = OptionOrderBook::new("BTC-20240329-50000-P", OptionStyle::Put);
+        ask_only
+            .add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .expect("add ask");
+        let q = ask_only.best_quote();
+        assert_eq!(q.bid_price(), None);
+        assert_eq!(q.bid_size(), 0);
+        assert_eq!(q.ask_price(), Some(105));
+        assert_eq!(q.ask_size(), 5);
+        assert!(!q.is_two_sided());
+        assert!(!ask_only.has_both_sides());
+
+        // Empty book: neither side, not two-sided.
+        let empty = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let q = empty.best_quote();
+        assert!(q.is_empty());
+        assert!(!q.is_two_sided());
+        assert!(!empty.has_both_sides());
+    }
+
+    #[test]
+    fn test_trade_capture_disarmed_by_default() {
+        // Default: capture is disarmed, so plain order methods do not populate
+        // last_trade_result even when a match occurs.
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(!book.is_trade_capture_armed());
+
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add ask");
+        // Crossing buy matches the resting ask.
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add crossing buy");
+        assert!(
+            book.last_trade_result().is_none(),
+            "disarmed capture must not record a trade"
+        );
+
+        // Arming makes the plain path populate the capture.
+        book.arm_trade_capture(true);
+        assert!(book.is_trade_capture_armed());
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 4)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 4)
+            .expect("add crossing buy");
+        assert!(
+            book.last_trade_result().is_some(),
+            "armed capture must record a trade"
+        );
+    }
+
+    #[test]
+    fn test_full_order_captures_regardless_of_arm_state() {
+        // The _full methods arm capture internally and restore the prior state,
+        // so they return a TradeResult even when the book is disarmed.
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(!book.is_trade_capture_armed());
+
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add ask");
+        let result = book
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .expect("full buy");
+        // The crossing buy fully consumed the resting ask.
+        assert_eq!(result.symbol, "BTC-20240329-50000-C");
+        assert_eq!(book.order_count(), 0);
+        // Arm state restored to disarmed after the _full call.
+        assert!(!book.is_trade_capture_armed());
     }
 
     #[test]
@@ -2062,23 +2289,6 @@ mod tests {
             Some(OrderStatus::Cancelled { .. })
         ));
         assert_eq!(book.terminal_order_summary().cancelled, 2);
-    }
-
-    #[test]
-    fn test_update_last_quote() {
-        let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
-            panic!("add order failed: {}", err);
-        }
-
-        let changed = book.update_last_quote();
-        assert!(changed);
-
-        let changed_again = book.update_last_quote();
-        assert!(!changed_again);
-
-        let _last = book.last_quote();
     }
 
     #[test]
@@ -3216,6 +3426,9 @@ mod tests {
     #[test]
     fn test_last_trade_result_populated_after_match() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Capture is disarmed by default; arm it so the plain order path records
+        // the trade into last_trade_result.
+        book.arm_trade_capture(true);
         if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
             panic!("add order failed: {}", err);
         }
@@ -3455,6 +3668,10 @@ mod tests {
                 ..BookConfig::default()
             },
         );
+
+        // Arm trade capture so the multiplexed internal capture listener (which
+        // is disarmed by default) records the trade alongside the NATS listener.
+        book.arm_trade_capture(true);
 
         // Rest a sell, then cross it with a marketable buy to force a trade.
         book.add_limit_order(OrderId::new(), Side::Sell, 100, 5)

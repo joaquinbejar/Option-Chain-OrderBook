@@ -3,7 +3,6 @@
 //! This module provides the [`Quote`] and [`QuoteUpdate`] types for representing
 //! two-sided markets (bid and ask).
 
-use orderbook_rs::OrderId;
 use serde::{Deserialize, Serialize};
 
 /// Represents a two-sided quote (bid and ask).
@@ -11,7 +10,10 @@ use serde::{Deserialize, Serialize};
 /// A quote captures the best bid and ask prices and sizes at a point in time.
 /// Prices are in smallest units (e.g., cents, satoshis) as `u64`.
 ///
-/// Note: Equality comparison excludes the `id` field, comparing only market data.
+/// Note: Equality comparison excludes `timestamp_ms`, comparing only market
+/// data (prices and sizes). The struct carries no synthetic identifier, so its
+/// serialized form is fully determined by its market data and timestamp — there
+/// is no per-construction clock/RNG cost and serialization is deterministic.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Quote {
     /// Best bid price (None if no bids).
@@ -24,8 +26,6 @@ pub struct Quote {
     ask_size: u64,
     /// Timestamp in milliseconds.
     timestamp_ms: u64,
-    /// Unique identifier for this quote.
-    id: OrderId,
 }
 
 impl Quote {
@@ -39,6 +39,7 @@ impl Quote {
     /// * `ask_size` - Size at best ask
     /// * `timestamp_ms` - Timestamp in milliseconds
     #[must_use]
+    #[inline]
     pub fn new(
         bid_price: Option<u128>,
         bid_size: u64,
@@ -52,12 +53,12 @@ impl Quote {
             ask_price,
             ask_size,
             timestamp_ms,
-            id: OrderId::new(),
         }
     }
 
     /// Creates an empty quote with no prices.
     #[must_use]
+    #[inline]
     pub fn empty(timestamp_ms: u64) -> Self {
         Self {
             bid_price: None,
@@ -65,60 +66,61 @@ impl Quote {
             ask_price: None,
             ask_size: 0,
             timestamp_ms,
-            id: OrderId::new(),
         }
-    }
-
-    /// Returns the unique identifier for this quote.
-    #[must_use]
-    pub const fn id(&self) -> OrderId {
-        self.id
     }
 
     /// Returns the best bid price.
     #[must_use]
+    #[inline]
     pub const fn bid_price(&self) -> Option<u128> {
         self.bid_price
     }
 
     /// Returns the size at best bid.
     #[must_use]
+    #[inline]
     pub const fn bid_size(&self) -> u64 {
         self.bid_size
     }
 
     /// Returns the best ask price.
     #[must_use]
+    #[inline]
     pub const fn ask_price(&self) -> Option<u128> {
         self.ask_price
     }
 
     /// Returns the size at best ask.
     #[must_use]
+    #[inline]
     pub const fn ask_size(&self) -> u64 {
         self.ask_size
     }
 
     /// Returns the timestamp in milliseconds.
     #[must_use]
+    #[inline]
     pub const fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
     }
 
     /// Returns true if the quote has both bid and ask.
     #[must_use]
+    #[inline]
     pub const fn is_two_sided(&self) -> bool {
         self.bid_price.is_some() && self.ask_price.is_some()
     }
 
     /// Returns true if the quote has no prices.
     #[must_use]
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.bid_price.is_none() && self.ask_price.is_none()
     }
 
     /// Returns the spread if both sides exist.
     #[must_use]
+    #[inline]
     pub fn spread(&self) -> Option<u128> {
         match (self.bid_price, self.ask_price) {
             (Some(bid), Some(ask)) if ask >= bid => Some(ask - bid),
@@ -128,6 +130,7 @@ impl Quote {
 
     /// Returns the mid price if both sides exist.
     #[must_use]
+    #[inline]
     pub fn mid_price(&self) -> Option<f64> {
         match (self.bid_price, self.ask_price) {
             (Some(bid), Some(ask)) => Some((bid as f64 + ask as f64) / 2.0),
@@ -137,6 +140,7 @@ impl Quote {
 
     /// Returns the spread in basis points relative to mid price.
     #[must_use]
+    #[inline]
     pub fn spread_bps(&self) -> Option<f64> {
         match (self.spread(), self.mid_price()) {
             (Some(spread), Some(mid)) if mid > 0.0 => Some(spread as f64 / mid * 10000.0),
@@ -146,8 +150,9 @@ impl Quote {
 }
 
 impl PartialEq for Quote {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Note: timestamp_ms and id are excluded from comparison
+        // Note: timestamp_ms is excluded from comparison
         // to detect only market data changes (prices and sizes)
         self.bid_price == other.bid_price
             && self.bid_size == other.bid_size
