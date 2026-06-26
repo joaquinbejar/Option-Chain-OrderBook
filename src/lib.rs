@@ -68,10 +68,13 @@
 //! type. Prefer the shorter crate-root path; the `orderbook::` path remains
 //! valid.
 //!
-//! The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`, and
-//! `Hash32` — are re-exported here from `orderbook_rs` / `pricelevel`, so
-//! consumers need **no direct `orderbook_rs` dependency** to use the hierarchy.
-//! (Price and quantity cross the leaf boundary as plain `u128` / `u64`.)
+//! The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`,
+//! `Hash32`, `Price`, `Quantity`, and `TimestampMs` — are re-exported here from
+//! `orderbook_rs` / `pricelevel`, so consumers need **no direct `orderbook_rs`
+//! / `pricelevel` dependency** to use the hierarchy. `Quote` exposes prices,
+//! sizes, and timestamps through `Price` / `Quantity` / `TimestampMs`; the leaf
+//! `add_limit_order*` submission path still takes plain `u128` / `u64` (that is
+//! what `orderbook_rs` accepts there).
 //!
 //! ## Core Components
 //!
@@ -238,7 +241,8 @@ pub use error::{Error, Result};
 // root, so each type is reachable both as `option_chain_orderbook::X` and as
 // `option_chain_orderbook::orderbook::X`. This includes the primary hierarchy
 // types, the side subsystems, and the boundary newtypes (`OrderId`, `OrderType`,
-// `Side`, `TimeInForce`, `Hash32`) re-exported from `orderbook_rs` / `pricelevel`.
+// `Side`, `TimeInForce`, `Hash32`, `Price`, `Quantity`, `TimestampMs`) re-exported
+// from `orderbook_rs` / `pricelevel`.
 pub use orderbook::{
     AggregatedGreeks, CancelReason, ChainMassCancelResult, CleanupResult, ContractSpecs,
     ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback, ExpirationManagerStats,
@@ -249,13 +253,13 @@ pub use orderbook::{
     InstrumentStatus, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
     MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MassCancelResult, MockPriceFeed,
     OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats, OptionOrderBook, OrderId,
-    OrderStateTracker, OrderStatus, OrderType, Position, PriceUpdate, PriceUpdateListener, Quote,
-    QuoteUpdate, RefreshResult, STPMode, SettlementType, Side, StaticPriceFeed, StrikeGenerator,
-    StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager, StrikeRangeConfig,
-    StrikeRangeConfigBuilder, SubscriptionId, SymbolIndex, SymbolRef, TerminalOrderSummary,
-    TimeInForce, TradeResult, UnderlyingMassCancelResult, UnderlyingOrderBook,
-    UnderlyingOrderBookManager, UnderlyingStats, ValidationConfig, VolSurface, calculate_tte_years,
-    wire_feed_to_calculator,
+    OrderStateTracker, OrderStatus, OrderType, Position, Price, PriceUpdate, PriceUpdateListener,
+    Quantity, Quote, QuoteUpdate, RefreshResult, STPMode, SettlementType, Side, StaticPriceFeed,
+    StrikeGenerator, StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager,
+    StrikeRangeConfig, StrikeRangeConfigBuilder, SubscriptionId, SymbolIndex, SymbolRef,
+    TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingMassCancelResult,
+    UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats, ValidationConfig, VolSurface,
+    calculate_tte_years, wire_feed_to_calculator,
 };
 
 #[cfg(feature = "nats")]

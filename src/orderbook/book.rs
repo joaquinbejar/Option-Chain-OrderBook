@@ -15,7 +15,7 @@ use orderbook_rs::{
     DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, OrderStateTracker,
     OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
 };
-use pricelevel::{Hash32, MatchResult, Quantity};
+use pricelevel::{Hash32, MatchResult, Price, Quantity, TimestampMs};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -1621,6 +1621,13 @@ impl OptionOrderBook {
     /// with `levels = 1`. It performs **no** full-book scan and **no** heap
     /// allocation. A one-sided book yields a one-sided [`Quote`] (the empty side
     /// has `None` price and zero size).
+    ///
+    /// This is the single boundary where the engine's raw `u128` prices and
+    /// `u64` sizes are wrapped into the pricelevel newtypes ([`Price`],
+    /// [`Quantity`], [`TimestampMs`]) that [`Quote`] exposes. Prices are 128-bit
+    /// (`u128`): a value above `2^53` is not exactly representable as an
+    /// IEEE-754 double, so any consumer deserializing the resulting [`Quote`]
+    /// JSON must parse prices with a 128-bit-aware parser, not as `f64`.
     #[must_use]
     #[inline]
     pub fn best_quote(&self) -> Quote {
@@ -1629,18 +1636,26 @@ impl OptionOrderBook {
         // serialized into a journal record or NATS payload. Do NOT let a `Quote`
         // (and hence this timestamp) feed a journaled/replayed path — thread an
         // injected clock instead if that ever changes.
-        let timestamp_ms = orderbook_rs::current_time_millis();
+        let timestamp_ms = TimestampMs::new(orderbook_rs::current_time_millis());
 
         // One ordered top-of-book read per populated side; `total_depth_at_levels`
-        // with `levels = 1` sums only the best level and never allocates.
+        // with `levels = 1` sums only the best level and never allocates. The
+        // raw `u128` / `u64` engine values are wrapped into the pricelevel
+        // newtypes exactly once, here at the leaf boundary.
         let (bid_price, bid_size) = match self.book.best_bid() {
-            Some(p) => (Some(p), self.book.total_depth_at_levels(1, Side::Buy)),
-            None => (None, 0),
+            Some(p) => (
+                Some(Price::new(p)),
+                Quantity::new(self.book.total_depth_at_levels(1, Side::Buy)),
+            ),
+            None => (None, Quantity::ZERO),
         };
 
         let (ask_price, ask_size) = match self.book.best_ask() {
-            Some(p) => (Some(p), self.book.total_depth_at_levels(1, Side::Sell)),
-            None => (None, 0),
+            Some(p) => (
+                Some(Price::new(p)),
+                Quantity::new(self.book.total_depth_at_levels(1, Side::Sell)),
+            ),
+            None => (None, Quantity::ZERO),
         };
 
         Quote::new(bid_price, bid_size, ask_price, ask_size, timestamp_ms)
@@ -1887,10 +1902,10 @@ mod tests {
 
         let quote = book.best_quote();
 
-        assert_eq!(quote.bid_price(), Some(100));
-        assert_eq!(quote.bid_size(), 10);
-        assert_eq!(quote.ask_price(), Some(101));
-        assert_eq!(quote.ask_size(), 5);
+        assert_eq!(quote.bid_price(), Some(Price::new(100)));
+        assert_eq!(quote.bid_size(), Quantity::new(10));
+        assert_eq!(quote.ask_price(), Some(Price::new(101)));
+        assert_eq!(quote.ask_size(), Quantity::new(5));
         assert!(quote.is_two_sided());
         assert!(book.has_both_sides());
     }
@@ -1917,10 +1932,10 @@ mod tests {
             .expect("add deep ask");
 
         let quote = book.best_quote();
-        assert_eq!(quote.bid_price(), Some(100));
-        assert_eq!(quote.bid_size(), 17); // 10 + 7, deeper 99 excluded
-        assert_eq!(quote.ask_price(), Some(101));
-        assert_eq!(quote.ask_size(), 8); // 5 + 3, deeper 102 excluded
+        assert_eq!(quote.bid_price(), Some(Price::new(100)));
+        assert_eq!(quote.bid_size(), Quantity::new(17)); // 10 + 7, deeper 99 excluded
+        assert_eq!(quote.ask_price(), Some(Price::new(101)));
+        assert_eq!(quote.ask_size(), Quantity::new(8)); // 5 + 3, deeper 102 excluded
         assert!(quote.is_two_sided());
         assert!(book.has_both_sides());
     }
@@ -1933,10 +1948,10 @@ mod tests {
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
             .expect("add bid");
         let q = bid_only.best_quote();
-        assert_eq!(q.bid_price(), Some(100));
-        assert_eq!(q.bid_size(), 10);
+        assert_eq!(q.bid_price(), Some(Price::new(100)));
+        assert_eq!(q.bid_size(), Quantity::new(10));
         assert_eq!(q.ask_price(), None);
-        assert_eq!(q.ask_size(), 0);
+        assert_eq!(q.ask_size(), Quantity::ZERO);
         assert!(!q.is_two_sided());
         assert!(!bid_only.has_both_sides());
 
@@ -1947,9 +1962,9 @@ mod tests {
             .expect("add ask");
         let q = ask_only.best_quote();
         assert_eq!(q.bid_price(), None);
-        assert_eq!(q.bid_size(), 0);
-        assert_eq!(q.ask_price(), Some(105));
-        assert_eq!(q.ask_size(), 5);
+        assert_eq!(q.bid_size(), Quantity::ZERO);
+        assert_eq!(q.ask_price(), Some(Price::new(105)));
+        assert_eq!(q.ask_size(), Quantity::new(5));
         assert!(!q.is_two_sided());
         assert!(!ask_only.has_both_sides());
 
