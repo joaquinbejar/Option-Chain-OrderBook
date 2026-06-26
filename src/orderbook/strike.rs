@@ -1512,6 +1512,42 @@ mod tests {
     }
 
     #[test]
+    fn test_strike_clear_transitions_both_legs_to_terminal() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        let call_id = OrderId::new();
+        let put_id = OrderId::new();
+        strike
+            .call()
+            .add_limit_order(call_id, Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(put_id, Side::Buy, 50, 5)
+            .expect("add put");
+        assert_eq!(strike.call().active_order_count(), 1);
+        assert_eq!(strike.put().active_order_count(), 1);
+
+        strike.clear();
+
+        // Both legs must reach zero active orders and transition their dropped
+        // orders to the terminal cancelled state through the shared Arc handles.
+        assert_eq!(strike.call().active_order_count(), 0);
+        assert_eq!(strike.put().active_order_count(), 0);
+        assert!(strike.is_empty());
+        assert!(matches!(
+            strike.call().get_order_status(call_id),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert!(matches!(
+            strike.put().get_order_status(put_id),
+            Some(OrderStatus::Cancelled { .. })
+        ));
+        assert_eq!(strike.call().terminal_order_summary().cancelled, 1);
+        assert_eq!(strike.put().terminal_order_summary().cancelled, 1);
+    }
+
+    #[test]
     fn test_strike_greeks() {
         use optionstratlib::greeks::Greek;
         use rust_decimal_macros::dec;
