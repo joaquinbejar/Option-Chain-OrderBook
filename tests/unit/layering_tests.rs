@@ -83,6 +83,11 @@ const PRICING_TYPES: &[&str] = &[
 /// types and the factory alias but does not import the `nats` module — is not
 /// tripped, while a stray `use super::nats::…` in `strike.rs` / `chain.rs` /
 /// `expiration.rs` / `underlying.rs` is.
+///
+/// The needles match as **substrings**, so `orderbook::nats` also rejects every
+/// fully-qualified form (`crate::orderbook::nats::…`, `self::orderbook::nats::…`,
+/// `use crate :: orderbook::nats`), and `super::nats` covers the relative form —
+/// there is no qualified import style that bypasses the guard.
 const FORBIDDEN_MODULE_IMPORTS: &[&str] = &["super::nats", "orderbook::nats"];
 
 /// Strips full-line comments (doc comments and `//` comments) from source so the
