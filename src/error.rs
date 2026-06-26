@@ -160,6 +160,26 @@ pub enum Error {
         status: InstrumentStatus,
     },
 
+    /// Error when an instrument status transition violates the enforced
+    /// lifecycle state machine.
+    ///
+    /// Returned by [`OptionOrderBook::set_status`](crate::orderbook::OptionOrderBook::set_status),
+    /// [`halt`](crate::orderbook::OptionOrderBook::halt),
+    /// [`resume`](crate::orderbook::OptionOrderBook::resume), and
+    /// [`expire`](crate::orderbook::OptionOrderBook::expire) when the requested
+    /// target status is not reachable from the current status (e.g. resuming an
+    /// [`Expired`](InstrumentStatus::Expired) book, or pulling a
+    /// [`Settling`](InstrumentStatus::Settling) book back to
+    /// [`Halted`](InstrumentStatus::Halted)). The legal edges are documented on
+    /// [`InstrumentStatus`]. The current status is left unchanged.
+    #[error("illegal status transition: {from} -> {to}")]
+    IllegalStatusTransition {
+        /// The current status the transition was attempted from.
+        from: InstrumentStatus,
+        /// The target status that was rejected.
+        to: InstrumentStatus,
+    },
+
     /// Error when serialization/deserialization fails.
     #[error("serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
@@ -385,6 +405,16 @@ impl Error {
         }
     }
 
+    /// Creates a new illegal status transition error.
+    ///
+    /// Returned when a requested instrument-status change is not a legal edge in
+    /// the enforced lifecycle state machine documented on [`InstrumentStatus`].
+    #[must_use]
+    #[cold]
+    pub fn illegal_status_transition(from: InstrumentStatus, to: InstrumentStatus) -> Self {
+        Self::IllegalStatusTransition { from, to }
+    }
+
     /// Creates a new decimal error.
     #[must_use]
     pub fn decimal(message: impl Into<String>) -> Self {
@@ -590,6 +620,23 @@ mod tests {
         assert!(msg.contains("BTC-20240329-50000-C"));
         assert!(msg.contains("Halted"));
         assert!(msg.contains("instrument not active"));
+    }
+
+    #[test]
+    fn test_illegal_status_transition_error() {
+        let err =
+            Error::illegal_status_transition(InstrumentStatus::Expired, InstrumentStatus::Active);
+        let msg = err.to_string();
+        assert!(msg.contains("illegal status transition"));
+        assert!(msg.contains("Expired"));
+        assert!(msg.contains("Active"));
+        assert!(matches!(
+            err,
+            Error::IllegalStatusTransition {
+                from: InstrumentStatus::Expired,
+                to: InstrumentStatus::Active,
+            }
+        ));
     }
 
     #[test]
