@@ -255,10 +255,10 @@ impl GreeksEngine {
     /// swallowed, so a single panicking listener can never permanently disable
     /// subscription.
     pub fn subscribe(&self, listener: GreeksUpdateListener) {
-        let mut listeners = self
-            .listeners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut listeners = self.listeners.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("greeks listeners lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         listeners.push(listener);
     }
 
@@ -286,8 +286,17 @@ impl GreeksEngine {
         style: OptionStyle,
         dividend_yield: f64,
     ) -> Result<Greek> {
-        // Validate inputs
+        // Validate inputs. These are cold rejection branches: the WARN only
+        // fires when an input is invalid and the Greek is skipped — the
+        // success path below emits nothing here.
         if spot <= 0.0 || strike <= 0.0 || tte_years <= 0.0 || iv <= 0.0 {
+            tracing::warn!(
+                spot,
+                strike,
+                tte_years,
+                iv,
+                "greeks input rejected: spot, strike, tte, and iv must be positive",
+            );
             return Err(Error::greeks(
                 "Invalid input: spot, strike, tte, and iv must be positive",
             ));
@@ -295,6 +304,10 @@ impl GreeksEngine {
         // The risk-free rate may legitimately be negative (negative-rate
         // regimes); only a non-finite value is invalid.
         if !risk_free_rate.is_finite() {
+            tracing::warn!(
+                risk_free_rate,
+                "greeks input rejected: risk_free_rate must be finite",
+            );
             return Err(Error::greeks(
                 "Invalid input: risk_free_rate must be finite",
             ));
@@ -302,6 +315,10 @@ impl GreeksEngine {
         // A true 0.0 dividend yield is the normal case for crypto options and
         // must be priced as 0.0 — only NaN/Inf or a negative value is invalid.
         if !dividend_yield.is_finite() || dividend_yield < 0.0 {
+            tracing::warn!(
+                dividend_yield,
+                "greeks input rejected: dividend_yield must be finite and non-negative",
+            );
             return Err(Error::greeks(
                 "Invalid input: dividend_yield must be finite and non-negative",
             ));
@@ -454,10 +471,10 @@ impl GreeksEngine {
     fn notify_listeners(&self, update: &GreeksUpdate) {
         // Snapshot under the lock, then drop the guard before invoking anyone.
         let listeners: Vec<GreeksUpdateListener> = {
-            let guard = self
-                .listeners
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = self.listeners.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!("greeks listeners lock poisoned; recovering");
+                poisoned.into_inner()
+            });
             guard.clone()
         };
 
@@ -483,6 +500,9 @@ impl GreeksEngine {
     ) {
         let now_ns = current_timestamp_ns();
         self.last_recalc_ns.store(now_ns, Ordering::Release);
+
+        // Cold path: the throttled recalc tick, not the per-quote read.
+        tracing::debug!(strike, trigger = %trigger, "greeks recalculated");
 
         let update = GreeksUpdate {
             strike,

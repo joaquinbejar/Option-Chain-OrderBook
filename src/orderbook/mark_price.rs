@@ -542,7 +542,12 @@ impl MarkPriceCalculator {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(final_mark),
+                Ok(_) => {
+                    // Cold path: the mutating tick. The pure read
+                    // `current_mark_price()` deliberately logs nothing.
+                    tracing::debug!(mark_price = final_mark, "mark price refreshed");
+                    return Some(final_mark);
+                }
                 Err(actual_prev) => {
                     // Another thread updated the mark price; retry with the
                     // latest value so dampening is applied correctly.

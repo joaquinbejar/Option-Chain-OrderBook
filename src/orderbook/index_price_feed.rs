@@ -170,6 +170,12 @@ impl IndexPriceFeed for MockPriceFeed {
             Ok(mut listeners) => listeners.push((id, listener)),
             Err(poisoned) => poisoned.into_inner().push((id, listener)),
         }
+        // Cold path: feed wiring, not the per-tick `set_price` notification.
+        tracing::info!(
+            subscription_id = id.0,
+            source = "mock",
+            "index feed subscribed"
+        );
         id
     }
 
@@ -180,7 +186,14 @@ impl IndexPriceFeed for MockPriceFeed {
         };
         let before = guard.len();
         guard.retain(|(sub_id, _)| *sub_id != id);
-        guard.len() < before
+        let removed = guard.len() < before;
+        tracing::info!(
+            subscription_id = id.0,
+            removed,
+            source = "mock",
+            "index feed unsubscribed",
+        );
+        removed
     }
 
     fn source(&self) -> &str {
@@ -321,7 +334,14 @@ pub fn wire_feed_to_calculator(
         calculator.update_index_price(update.price);
     });
 
-    feed.subscribe(listener)
+    let subscription_id = feed.subscribe(listener);
+    // Cold path: one-time wiring of a feed to a mark-price calculator.
+    tracing::info!(
+        subscription_id = subscription_id.0,
+        source = feed.source(),
+        "index feed wired to mark-price calculator",
+    );
+    subscription_id
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

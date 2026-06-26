@@ -211,9 +211,27 @@ impl ExpiryScheduler {
                 result.strikes_generated = result
                     .strikes_generated
                     .checked_add(strikes.len())
-                    .ok_or_else(|| Error::configuration("strikes_generated overflow"))?;
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            underlying = %underlying.underlying(),
+                            "strikes_generated overflow",
+                        );
+                        Error::configuration("strikes_generated overflow")
+                    })?;
 
                 result.created.push(date);
+
+                // Cold path: the scheduler generated the strike ladder for a
+                // newly-created expiration. The fundamental "expiration created"
+                // INFO is emitted by the expiration-manager insertion-winner
+                // (covering every creator); this records the scheduler's own
+                // strike-generation step. Never on the order-submission path.
+                tracing::info!(
+                    underlying = %underlying.underlying(),
+                    expiration = %date,
+                    strikes = strikes.len(),
+                    "strikes generated for expiration",
+                );
 
                 // Invoke callback if provided
                 if let Some(cb) = callback {
