@@ -946,7 +946,14 @@ impl SequencedUnderlyingOrderBook {
                                 .cancel_all()
                                 .map(|r| r.cancelled_count())
                                 .unwrap_or(0);
-                            call_count.saturating_add(put_count)
+                            match call_count.checked_add(put_count) {
+                                Some(total) => total,
+                                None => {
+                                    return OptionChainResult::Rejected {
+                                        reason: "mass-cancel total overflow".to_string(),
+                                    };
+                                }
+                            }
                         }
                         Err(e) => {
                             return OptionChainResult::Rejected {
@@ -975,7 +982,14 @@ impl SequencedUnderlyingOrderBook {
                                 .cancel_by_side(*side)
                                 .map(|r| r.cancelled_count())
                                 .unwrap_or(0);
-                            call_count.saturating_add(put_count)
+                            match call_count.checked_add(put_count) {
+                                Some(total) => total,
+                                None => {
+                                    return OptionChainResult::Rejected {
+                                        reason: "mass-cancel total overflow".to_string(),
+                                    };
+                                }
+                            }
                         }
                         Err(e) => {
                             return OptionChainResult::Rejected {
@@ -1004,7 +1018,14 @@ impl SequencedUnderlyingOrderBook {
                                 .cancel_by_user(*user_id)
                                 .map(|r| r.cancelled_count())
                                 .unwrap_or(0);
-                            call_count.saturating_add(put_count)
+                            match call_count.checked_add(put_count) {
+                                Some(total) => total,
+                                None => {
+                                    return OptionChainResult::Rejected {
+                                        reason: "mass-cancel total overflow".to_string(),
+                                    };
+                                }
+                            }
                         }
                         Err(e) => {
                             return OptionChainResult::Rejected {
@@ -1220,7 +1241,12 @@ impl SequencedUnderlyingOrderBook {
             // Results are discarded — see method doc for rationale.
             let _ = self.execute_command(&event.command);
 
-            let next = event.sequence_num.saturating_add(1);
+            // checked_add, not saturating_add: a sequence number at u64::MAX is
+            // a protocol-state corruption that must fail loudly, never silently
+            // stall the sequence.
+            let next = event.sequence_num.checked_add(1).ok_or_else(|| {
+                Error::journal_error("replay sequence number overflow at u64::MAX")
+            })?;
             if next > max_next {
                 max_next = next;
             }
@@ -1551,6 +1577,37 @@ mod tests {
 
         // Sequence should be advanced past the replayed range
         assert!(book.current_sequence() >= 3);
+    }
+
+    #[test]
+    fn test_replay_sequence_at_capacity_errors_not_caps() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+
+        // A journaled event at u64::MAX must make replay fail loudly via
+        // checked_add(1), not silently saturate the next sequence.
+        let event = OptionChainEvent {
+            sequence_num: u64::MAX,
+            timestamp_ns: 0,
+            command: OptionChainCommand::CancelOrder {
+                symbol: "BTC-20240329-50000-C".to_string(),
+                order_id: OrderId::new(),
+            },
+            result: OptionChainResult::BookNotFound {
+                symbol: "BTC-20240329-50000-C".to_string(),
+            },
+        };
+        journal.append(&event).expect("append");
+
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        let result = book.replay(0);
+        assert!(
+            result.is_err(),
+            "replay of a u64::MAX sequence must error, not cap"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("overflow"),
+            "expected a sequence-overflow error"
+        );
     }
 
     #[test]
