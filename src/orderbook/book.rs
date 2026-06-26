@@ -223,22 +223,24 @@ impl std::iter::Sum for TerminalOrderSummary {
     }
 }
 
-/// RAII guard that arms trade capture for a scope and restores the previous
-/// armed state on drop.
+/// RAII guard that holds a scoped trade-capture arm for its lifetime.
 ///
 /// Constructed by [`OptionOrderBook::arm_capture_scope`] so the `_full` order
 /// methods capture their own trade without leaving the book permanently armed.
+/// It increments a scope refcount on entry and decrements it on drop; capture is
+/// active while the refcount is non-zero (or the book is manually armed). Using a
+/// refcount rather than a save/restore boolean makes overlapping `_full` scopes
+/// on the same book compose correctly — no scope can clobber another's state or
+/// leave the book stuck armed.
 struct CaptureArmGuard<'a> {
-    /// The book's armed flag.
-    flag: &'a AtomicBool,
-    /// Armed state observed at scope entry, restored on drop.
-    previous: bool,
+    /// The book's scoped-arm refcount, decremented on drop.
+    scopes: &'a AtomicUsize,
 }
 
 impl Drop for CaptureArmGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.flag.store(self.previous, Ordering::Relaxed);
+        self.scopes.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -339,6 +341,12 @@ pub struct OptionOrderBook {
     /// trade; [`arm_trade_capture`](Self::arm_trade_capture) opts a book into
     /// continuous capture for [`last_trade_result`](Self::last_trade_result).
     trade_capture_armed: Arc<AtomicBool>,
+    /// Refcount of active `_full` capture scopes. Capture is also active while
+    /// this is non-zero, so overlapping `_full` calls on the same book compose
+    /// correctly (each scope increments on entry and decrements on drop) without
+    /// clobbering each other's armed state or the manual `trade_capture_armed`
+    /// flag.
+    trade_capture_scopes: Arc<AtomicUsize>,
     /// Cumulative terminal order counters maintained by the state listener.
     ///
     /// `None` when state tracking is disabled via `BookConfig`.
@@ -377,15 +385,19 @@ impl OptionOrderBook {
         }
 
         // Install trade-capture listener so `_full` methods can return TradeResult.
-        // The clone+lock is gated behind a cheap relaxed atomic so the common
-        // (non-`_full`, unarmed) match path pays only one atomic load and never
+        // The clone+lock is gated behind two cheap relaxed atomics — the manual
+        // `armed` flag and the `_full` scope refcount — so the common
+        // (non-`_full`, unarmed) match path pays only the atomic loads and never
         // clones the TradeResult or takes the lock.
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
         let armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let scopes: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let capture_clone = Arc::clone(&capture);
         let armed_clone = Arc::clone(&armed);
+        let scopes_clone = Arc::clone(&scopes);
         let capture_listener: TradeListener = Arc::new(move |tr: &TradeResult| {
-            if !armed_clone.load(Ordering::Relaxed) {
+            // Capture when manually armed OR inside at least one `_full` scope.
+            if !armed_clone.load(Ordering::Relaxed) && scopes_clone.load(Ordering::Relaxed) == 0 {
                 return;
             }
             let mut guard = capture_clone
@@ -445,6 +457,7 @@ impl OptionOrderBook {
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
             trade_capture_armed: armed,
+            trade_capture_scopes: scopes,
             terminal_counters,
         }
     }
@@ -1075,17 +1088,18 @@ impl OptionOrderBook {
     // ── Full order methods (return TradeResult) ─────────────────────────
 
     /// Arms trade capture for the lifetime of the returned guard, restoring the
-    /// previous armed state on drop.
+    /// scope refcount on drop.
     ///
     /// Used by the `_full` order methods so a trade is captured even when the
-    /// book is not under continuous capture. The guard restores (rather than
-    /// unconditionally disarming) so a `_full` call nested inside an armed scope
-    /// leaves capture armed afterwards.
+    /// book is not under continuous capture. Incrementing a refcount (rather than
+    /// saving/restoring a boolean) means overlapping `_full` scopes on the same
+    /// book compose correctly: capture stays active until the last scope exits,
+    /// and the manual [`arm_trade_capture`](Self::arm_trade_capture) flag is left
+    /// untouched.
     fn arm_capture_scope(&self) -> CaptureArmGuard<'_> {
-        let previous = self.trade_capture_armed.swap(true, Ordering::Relaxed);
+        self.trade_capture_scopes.fetch_add(1, Ordering::Relaxed);
         CaptureArmGuard {
-            flag: &self.trade_capture_armed,
-            previous,
+            scopes: &self.trade_capture_scopes,
         }
     }
 
@@ -1994,6 +2008,55 @@ mod tests {
         assert_eq!(book.order_count(), 0);
         // Arm state restored to disarmed after the _full call.
         assert!(!book.is_trade_capture_armed());
+    }
+
+    #[test]
+    fn test_capture_scopes_refcount_composes() {
+        // Overlapping `_full` scopes must compose via the refcount: capture stays
+        // active until the LAST scope exits, the manual flag is never touched, and
+        // the book is not left stuck-armed once all scopes drop.
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(!book.is_trade_capture_armed());
+
+        let outer = book.arm_capture_scope();
+        let inner = book.arm_capture_scope();
+        // Two scopes active: a plain matching order is captured.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("add crossing buy");
+        assert!(
+            book.last_trade_result().is_some(),
+            "capture active while a scope is held"
+        );
+
+        // Dropping one scope leaves capture active (refcount still 1); the manual
+        // flag was never set, so this is not a stuck-armed state.
+        drop(inner);
+        assert!(!book.is_trade_capture_armed());
+        book.clear_trade_capture();
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 3)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 3)
+            .expect("add crossing buy");
+        assert!(
+            book.last_trade_result().is_some(),
+            "capture still active with one scope remaining"
+        );
+
+        // Dropping the last scope returns to disarmed: a later plain match is not
+        // captured, and the manual flag remains false (no stuck-armed leak).
+        drop(outer);
+        assert!(!book.is_trade_capture_armed());
+        book.clear_trade_capture();
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 2)
+            .expect("add ask");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 2)
+            .expect("add crossing buy");
+        assert!(
+            book.last_trade_result().is_none(),
+            "capture disarmed once all scopes drop"
+        );
     }
 
     #[test]

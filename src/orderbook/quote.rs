@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Represents a two-sided quote (bid and ask).
 ///
 /// A quote captures the best bid and ask prices and sizes at a point in time.
-/// Prices are in smallest units (e.g., cents, satoshis) as `u64`.
+/// Prices are in smallest units (e.g., cents, satoshis) as `u128`
+/// (`Option<u128>`, `None` when that side is empty); sizes are `u64`.
 ///
 /// Note: Equality comparison excludes `timestamp_ms`, comparing only market
 /// data (prices and sizes). The struct carries no synthetic identifier, so its
