@@ -24,6 +24,41 @@ use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
 
+/// Builds the call and put contract symbols for a strike from a single source.
+///
+/// This is the one source of truth for the `{underlying}-{exp}-{strike}-{C|P}`
+/// contract-symbol layout. It centralizes BOTH the expiration-string derivation
+/// ([`format_expiration_yyyymmdd`] with an [`ExpirationDate`] `Display`
+/// fallback) and the symbol layout itself, so that every construction,
+/// registration, and deregistration site produces byte-identical symbols. A
+/// divergence between the register path
+/// ([`StrikeOrderBookManager::assign_instrument_ids`]) and the deregister path
+/// ([`StrikeOrderBookManager::remove`] /
+/// [`StrikeOrderBookManager::remove_if_empty`]) would silently leak
+/// [`SymbolIndex`] entries, so all sites route
+/// through here.
+///
+/// Returns `(call_symbol, put_symbol)`.
+///
+/// The output is intentionally byte-identical to the former inline `format!`
+/// calls: the separator (`-`), the `exp_str` derivation, and the `C`/`P`
+/// suffixes feed [`SymbolIndex`] keys and may
+/// appear in journal fixtures. Do not change the format without migrating
+/// existing symbols, lookups, and fixtures.
+#[must_use]
+#[inline]
+fn contract_symbols(
+    underlying: &str,
+    expiration: &ExpirationDate,
+    strike: u64,
+) -> (String, String) {
+    let exp_str = format_expiration_yyyymmdd(expiration).unwrap_or_else(|_| expiration.to_string());
+    (
+        format!("{underlying}-{exp_str}-{strike}-C"),
+        format!("{underlying}-{exp_str}-{strike}-P"),
+    )
+}
+
 /// Order book for a single strike price containing both call and put.
 ///
 /// This struct manages the call/put pair at a specific strike price.
@@ -74,12 +109,7 @@ impl StrikeOrderBook {
     pub fn new(underlying: impl Into<String>, expiration: ExpirationDate, strike: u64) -> Self {
         let underlying = underlying.into();
 
-        // Format expiration as YYYYMMDD, fallback to Display if formatting fails
-        let exp_str =
-            format_expiration_yyyymmdd(&expiration).unwrap_or_else(|_| expiration.to_string());
-
-        let call_symbol = format!("{}-{}-{}-C", underlying, exp_str, strike);
-        let put_symbol = format!("{}-{}-{}-P", underlying, exp_str, strike);
+        let (call_symbol, put_symbol) = contract_symbols(&underlying, &expiration, strike);
 
         Self {
             underlying,
@@ -113,11 +143,7 @@ impl StrikeOrderBook {
     ) -> Self {
         let underlying = underlying.into();
 
-        let exp_str =
-            format_expiration_yyyymmdd(&expiration).unwrap_or_else(|_| expiration.to_string());
-
-        let call_symbol = format!("{}-{}-{}-C", underlying, exp_str, strike);
-        let put_symbol = format!("{}-{}-{}-P", underlying, exp_str, strike);
+        let (call_symbol, put_symbol) = contract_symbols(&underlying, &expiration, strike);
 
         Self {
             underlying,
@@ -652,7 +678,7 @@ impl StrikeMassCancelResult {
     ///
     /// # Description
     ///
-    /// Counts how many leaf [`OptionOrderBook`](super::book::OptionOrderBook)s
+    /// Counts how many leaf [`OptionOrderBook`]s
     /// (call/put contract books) recorded at least one cancelled order. This is
     /// the leaf base case of `books_affected`: every higher level
     /// (chain / expiration / underlying / global) drills down and sums these, so
@@ -1056,10 +1082,8 @@ impl StrikeOrderBookManager {
     /// IDs are assigned later by [`assign_instrument_ids`](Self::assign_instrument_ids)
     /// only after confirming the book won the insertion race.
     fn create_strike_book_without_ids(&self, strike: u64) -> Arc<StrikeOrderBook> {
-        let exp_str = format_expiration_yyyymmdd(&self.expiration)
-            .unwrap_or_else(|_| self.expiration.to_string());
-        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+        let (call_symbol, put_symbol) =
+            contract_symbols(&self.underlying, &self.expiration, strike);
 
         let base_config = BookConfig {
             validation: self.validation_config.get(),
@@ -1161,10 +1185,8 @@ impl StrikeOrderBookManager {
         strike: u64,
         factory: &ContractNatsListenerFactory,
     ) -> Arc<StrikeOrderBook> {
-        let exp_str = format_expiration_yyyymmdd(&self.expiration)
-            .unwrap_or_else(|_| self.expiration.to_string());
-        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+        let (call_symbol, put_symbol) =
+            contract_symbols(&self.underlying, &self.expiration, strike);
 
         let call = Arc::new(OptionOrderBook::new_with_config(
             &call_symbol,
@@ -1213,10 +1235,8 @@ impl StrikeOrderBookManager {
     /// never fails), so symbol lookups stay functional even when the registry
     /// is full.
     fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) -> Result<()> {
-        let exp_str = format_expiration_yyyymmdd(&self.expiration)
-            .unwrap_or_else(|_| self.expiration.to_string());
-        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+        let (call_symbol, put_symbol) =
+            contract_symbols(&self.underlying, &self.expiration, strike);
 
         // Symbol-index registration is independent of numeric ID allocation and
         // never fails; run it first so symbol lookups stay functional even if
@@ -1305,10 +1325,8 @@ impl StrikeOrderBookManager {
     pub fn remove(&self, strike: u64) -> bool {
         let removed = self.strikes.remove(&strike).is_some();
         if removed && let Some(idx) = &self.symbol_index {
-            let exp_str = format_expiration_yyyymmdd(&self.expiration)
-                .unwrap_or_else(|_| self.expiration.to_string());
-            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            let (call_symbol, put_symbol) =
+                contract_symbols(&self.underlying, &self.expiration, strike);
             idx.deregister(&call_symbol);
             idx.deregister(&put_symbol);
         }
@@ -1351,10 +1369,8 @@ impl StrikeOrderBookManager {
         // Perform the removal
         let removed = self.strikes.remove(&strike).is_some();
         if removed && let Some(idx) = &self.symbol_index {
-            let exp_str = format_expiration_yyyymmdd(&self.expiration)
-                .unwrap_or_else(|_| self.expiration.to_string());
-            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            let (call_symbol, put_symbol) =
+                contract_symbols(&self.underlying, &self.expiration, strike);
             idx.deregister(&call_symbol);
             idx.deregister(&put_symbol);
         }
@@ -1394,7 +1410,30 @@ impl StrikeOrderBookManager {
         (strikes, orders)
     }
 
-    /// Returns the ATM (at-the-money) strike closest to the given spot price.
+    /// Returns the ATM (at-the-money) strike: the strike nearest to the
+    /// supplied spot price.
+    ///
+    /// # Selection rule
+    ///
+    /// ATM is the strike with the smallest absolute distance to `spot`. The
+    /// distance is computed with [`u64::abs_diff`], which is exact for every
+    /// `u64` strike and spot — there is no `i64` cast, so a strike above
+    /// `i64::MAX` never sign-flips its distance and is never mis-selected as
+    /// nearest. On a tie — a spot exactly between two strikes — the **lower
+    /// strike wins**: the scan is `min_by_key` over the ascending strike
+    /// [`SkipMap`], and `min_by_key` keeps the first minimum, which under
+    /// ascending iteration is the lower strike. The result is therefore
+    /// deterministic.
+    ///
+    /// This rule — nearest strike, lower-on-tie — is the single source of truth
+    /// for ATM selection. ATM is defined per expiration (each expiration owns its
+    /// strike ladder): the chain-level
+    /// [`OptionChainOrderBook::atm_strike`](super::chain::OptionChainOrderBook::atm_strike)
+    /// and expiration-level
+    /// [`ExpirationOrderBook::atm_strike`](super::expiration::ExpirationOrderBook::atm_strike)
+    /// accessors delegate straight down to this method, so they inherit the same
+    /// nearest/lower-on-tie semantics. There is no single underlying-level ATM —
+    /// it would be ambiguous across an underlying's many expirations.
     ///
     /// # Errors
     ///
@@ -1403,7 +1442,7 @@ impl StrikeOrderBookManager {
         self.strikes
             .iter()
             .map(|e| *e.key())
-            .min_by_key(|&k| (k as i64 - spot as i64).unsigned_abs())
+            .min_by_key(|&k| k.abs_diff(spot))
             .ok_or_else(|| Error::no_data("no strikes available"))
     }
 }
@@ -1624,6 +1663,47 @@ mod tests {
     fn test_strike_manager_atm_empty() {
         let manager = StrikeOrderBookManager::new("BTC", test_expiration());
         assert!(manager.atm_strike(50000).is_err());
+    }
+
+    #[test]
+    fn test_atm_strike_tie_breaks_to_lower() {
+        // A spot exactly between two strikes is equidistant from both. The ATM
+        // tie-break must be deterministic and resolve to the LOWER strike: the
+        // scan is `min_by_key` over the ascending strike SkipMap, which keeps
+        // the first minimum (the lower strike).
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+        drop(manager.get_or_create(100));
+        drop(manager.get_or_create(200));
+
+        // 150 is exactly 50 away from both 100 and 200.
+        let atm = match manager.atm_strike(150) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm, 100, "an exact tie must resolve to the lower strike");
+    }
+
+    #[test]
+    fn test_atm_strike_huge_strike_no_sign_flip() {
+        // Regression for the overflow-safe distance metric. With the old
+        // `(k as i64 - spot as i64).unsigned_abs()` a strike above `i64::MAX`
+        // sign-flips: `u64::MAX as i64` is `-1`, so for spot 0 the old metric
+        // reported a distance of 1 for `u64::MAX` and would have wrongly
+        // selected it as the nearest strike. `u64::abs_diff` is exact for all
+        // `u64` inputs, so the genuinely-nearest strike (100, distance 100) is
+        // selected over `u64::MAX` (distance ~u64::MAX).
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+        drop(manager.get_or_create(100));
+        drop(manager.get_or_create(u64::MAX));
+
+        let atm = match manager.atm_strike(0) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(
+            atm, 100,
+            "abs_diff must pick the truly-nearest strike, not the sign-flipped huge one",
+        );
     }
 
     #[test]
