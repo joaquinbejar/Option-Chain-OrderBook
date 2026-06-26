@@ -865,11 +865,24 @@ impl OptionOrderBook {
     ///
     /// # Returns
     ///
-    /// `Ok(true)` if the order was found and cancelled, `Ok(false)` if not found.
+    /// `Ok(true)` if the order was found and cancelled, `Ok(false)` if no order
+    /// with that ID was resting on the book.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::orderbook`](crate::Error::orderbook) if the underlying
+    /// engine reports a real cancellation failure (distinct from a benign
+    /// not-found).
     pub fn cancel_order(&self, order_id: OrderId) -> Result<bool> {
+        // orderbook_rs::cancel_order returns Ok(Some(_)) when an order was
+        // cancelled, Ok(None) when no such order was resting, and Err(_) on a
+        // genuine engine failure. Map each distinctly: a not-found must report
+        // `false` (not a false success), and a real error must surface (not be
+        // swallowed as a benign not-found).
         match self.book.cancel_order(order_id) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(crate::Error::orderbook(e.to_string())),
         }
     }
 
@@ -1568,6 +1581,37 @@ mod tests {
         };
         assert!(cancelled);
         assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_order_not_found_returns_false() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        // Cancelling an order that was never added must report `false`, not a
+        // false `true`. (Regression: the wrapper used to map every Ok(_) to
+        // Ok(true), so a no-op cancel falsely reported success.)
+        match book.cancel_order(OrderId::new()) {
+            Ok(found) => assert!(!found, "cancel of a non-existent order must be false"),
+            Err(err) => panic!("cancel of a non-existent order must not error: {}", err),
+        }
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_order_already_cancelled_returns_false() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        let order_id = OrderId::new();
+        book.add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order should succeed");
+        assert!(book.cancel_order(order_id).expect("first cancel"));
+        // A second cancel of the same id is a no-op: not found, so `false`.
+        assert!(
+            !book
+                .cancel_order(order_id)
+                .expect("second cancel must not error"),
+            "second cancel of the same order must be false"
+        );
     }
 
     #[test]
