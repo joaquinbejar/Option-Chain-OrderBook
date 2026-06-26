@@ -1,9 +1,17 @@
-//! Index price feed abstraction module.
+//! Index price feed implementations and mark-price wiring.
 //!
-//! This module provides a trait-based abstraction for external price sources
-//! (Chainlink, exchange feeds, etc.) that the [`MarkPriceCalculator`] consumes.
-//! This decouples the mark price calculation from the specific price source
-//! implementation.
+//! This pricing-subsystem module provides the concrete price sources
+//! ([`MockPriceFeed`], [`StaticPriceFeed`]) and the
+//! [`wire_feed_to_calculator`] helper that feeds an external price source
+//! (Chainlink, exchange feeds, etc.) into the [`MarkPriceCalculator`],
+//! decoupling mark price calculation from the specific source implementation.
+//!
+//! The [`IndexPriceFeed`] trait itself — together with [`PriceUpdate`],
+//! [`PriceUpdateListener`], and [`SubscriptionId`] — lives in the neutral,
+//! dependency-light [`index_feed`](super::index_feed) module so the core
+//! order-book hierarchy can hold an `Arc<dyn IndexPriceFeed>` without depending
+//! on this pricing subsystem. This module depends downward on that trait and
+//! implements it.
 //!
 //! ## Overview
 //!
@@ -41,93 +49,11 @@
 //! assert_eq!(calculator.index_price(), 50000);
 //! ```
 
+use super::index_feed::{IndexPriceFeed, PriceUpdate, PriceUpdateListener, SubscriptionId};
 use super::mark_price::MarkPriceCalculator;
 use crate::utils::nanos_since_epoch;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// A price update from an external source.
-///
-/// Carries the price value, a nanosecond-precision timestamp for
-/// observability, and the identifier of the source that produced it.
-///
-/// ## Fields
-///
-/// - `price`: Price in smallest units (e.g., satoshis, cents)
-/// - `timestamp_ns`: Timestamp in nanoseconds since Unix epoch
-/// - `source`: Human-readable source identifier (e.g., `"chainlink"`, `"binance"`)
-#[derive(Debug, Clone)]
-pub struct PriceUpdate {
-    /// Price in smallest units (e.g., satoshis, cents).
-    pub price: u64,
-    /// Timestamp in nanoseconds since Unix epoch.
-    pub timestamp_ns: u64,
-    /// Identifier of the price source.
-    pub source: String,
-}
-
-/// Opaque handle returned by [`IndexPriceFeed::subscribe`].
-///
-/// Pass this to [`IndexPriceFeed::unsubscribe`] to remove the listener.
-/// Each id is unique within a single feed instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubscriptionId(u64);
-
-/// Callback invoked when a new price update is available.
-///
-/// Receives a shared reference to the [`PriceUpdate`] to avoid cloning
-/// when multiple listeners are registered.
-///
-/// # Panics
-///
-/// Listener implementations **must not panic**. If a listener panics during
-/// notification, subsequent listeners in the subscription list will not be
-/// called. Callers are responsible for ensuring their callbacks are
-/// panic-free.
-pub type PriceUpdateListener = Arc<dyn Fn(&PriceUpdate) + Send + Sync>;
-
-/// Trait for external index price sources.
-///
-/// Implementations provide a latest-price query and a pub/sub model
-/// for real-time updates. The trait is object-safe so it can be stored
-/// as `Arc<dyn IndexPriceFeed>`.
-///
-/// ## Thread Safety
-///
-/// All methods must be safe to call from any thread. Implementations
-/// should use interior mutability (atomics, `Mutex`, etc.) as needed.
-///
-/// ## Example
-///
-/// ```
-/// use option_chain_orderbook::orderbook::{IndexPriceFeed, MockPriceFeed};
-///
-/// let feed = MockPriceFeed::new();
-/// assert!(feed.latest_price().is_none()); // no price set yet
-/// assert_eq!(feed.source(), "mock");
-/// ```
-pub trait IndexPriceFeed: Send + Sync {
-    /// Returns the most recent price update, or `None` if no price
-    /// has been published yet.
-    fn latest_price(&self) -> Option<PriceUpdate>;
-
-    /// Registers a listener that will be called on every subsequent
-    /// price update.
-    ///
-    /// Returns a [`SubscriptionId`] that can be passed to
-    /// [`unsubscribe`](Self::unsubscribe) to remove the listener.
-    fn subscribe(&self, listener: PriceUpdateListener) -> SubscriptionId;
-
-    /// Removes a previously registered listener.
-    ///
-    /// Returns `true` if the listener was found and removed, `false`
-    /// if the id was not present (e.g., already unsubscribed).
-    fn unsubscribe(&self, id: SubscriptionId) -> bool;
-
-    /// Returns a human-readable identifier for this price source
-    /// (e.g., `"chainlink"`, `"binance"`, `"mock"`).
-    fn source(&self) -> &str;
-}
 
 // ─── MockPriceFeed ───────────────────────────────────────────────────────────
 
@@ -406,44 +332,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
-
-    // ── PriceUpdate ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_price_update_creation() {
-        let update = PriceUpdate {
-            price: 50000,
-            timestamp_ns: 1_000_000_000,
-            source: "test".to_string(),
-        };
-        assert_eq!(update.price, 50000);
-        assert_eq!(update.timestamp_ns, 1_000_000_000);
-        assert_eq!(update.source, "test");
-    }
-
-    #[test]
-    fn test_price_update_clone() {
-        let update = PriceUpdate {
-            price: 42000,
-            timestamp_ns: 999,
-            source: "clone_test".to_string(),
-        };
-        let cloned = update.clone();
-        assert_eq!(cloned.price, 42000);
-        assert_eq!(cloned.source, "clone_test");
-    }
-
-    #[test]
-    fn test_price_update_debug() {
-        let update = PriceUpdate {
-            price: 100,
-            timestamp_ns: 0,
-            source: "dbg".to_string(),
-        };
-        let debug = format!("{:?}", update);
-        assert!(debug.contains("PriceUpdate"));
-        assert!(debug.contains("100"));
-    }
 
     // ── MockPriceFeed ────────────────────────────────────────────────────
 
@@ -778,15 +666,6 @@ mod tests {
         let feed = StaticPriceFeed::new(100, "static");
         let id = feed.subscribe(Arc::new(|_: &PriceUpdate| {}));
         assert!(!feed.unsubscribe(id));
-    }
-
-    #[test]
-    fn test_subscription_id_equality() {
-        let a = SubscriptionId(1);
-        let b = SubscriptionId(1);
-        let c = SubscriptionId(2);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
     }
 
     // ── nanos_since_epoch ────────────────────────────────────────────────
