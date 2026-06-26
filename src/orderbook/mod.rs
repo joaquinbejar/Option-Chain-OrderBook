@@ -142,4 +142,4 @@ pub use orderbook_rs::{
     CancelReason, FeeSchedule, MassCancelResult, OrderId, OrderStateTracker, OrderStatus,
     OrderType, STPMode, Side, TimeInForce, TradeResult,
 };
-pub use pricelevel::Hash32;
+pub use pricelevel::{Hash32, Price, Quantity, TimestampMs};

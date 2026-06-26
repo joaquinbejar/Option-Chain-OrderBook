@@ -82,10 +82,13 @@ Every public item is available at the crate root **and** under
 type. Prefer the shorter crate-root path; the `orderbook::` path remains
 valid.
 
-The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`, and
-`Hash32` — are re-exported here from `orderbook_rs` / `pricelevel`, so
-consumers need **no direct `orderbook_rs` dependency** to use the hierarchy.
-(Price and quantity cross the leaf boundary as plain `u128` / `u64`.)
+The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`,
+`Hash32`, `Price`, `Quantity`, and `TimestampMs` — are re-exported here from
+`orderbook_rs` / `pricelevel`, so consumers need **no direct `orderbook_rs`
+/ `pricelevel` dependency** to use the hierarchy. `Quote` exposes prices,
+sizes, and timestamps through `Price` / `Quantity` / `TimestampMs`; the leaf
+`add_limit_order*` submission path still takes plain `u128` / `u64` (that is
+what `orderbook_rs` accepts there).
 
 ### Core Components
 
