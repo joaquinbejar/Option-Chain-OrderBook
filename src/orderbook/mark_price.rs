@@ -41,9 +41,22 @@
 //! calculator.update_mid_price(50100);
 //! calculator.update_last_trade_price(50050);
 //!
-//! let mark = calculator.mark_price();
+//! // Advance the mark one dampening step for this update cycle...
+//! let mark = calculator.advance_mark();
 //! assert!(mark.is_some());
+//! // ...then read it back any number of times without advancing dampening.
+//! assert_eq!(calculator.current_mark_price(), mark);
 //! ```
+//!
+//! ## Read vs. tick
+//!
+//! Computing the mark is a *mutating* step: each call to
+//! [`MarkPriceCalculator::advance_mark`] moves the stored mark one dampening
+//! step toward the raw weighted average and commits it. Call it **exactly once
+//! per update cycle**. To merely observe the last committed mark — for
+//! monitoring, display, or P&L snapshots — use the pure
+//! [`MarkPriceCalculator::current_mark_price`], which never advances dampening
+//! and is idempotent for static inputs.
 
 use crate::error::{Error, Result};
 use rust_decimal::Decimal;
@@ -316,7 +329,9 @@ impl MarkPriceConfigBuilder {
 /// All price updates and reads use atomic operations, making this safe for
 /// concurrent access from multiple threads without external synchronization.
 /// The dampening logic uses a compare-and-swap loop to guarantee the
-/// dampening invariant holds even under concurrent `mark_price()` calls.
+/// dampening invariant holds even under concurrent [`advance_mark`] calls.
+///
+/// [`advance_mark`]: MarkPriceCalculator::advance_mark
 ///
 /// Note that the three input prices (index, mid, last trade) are loaded
 /// individually — they do not form an atomic snapshot. Under rapid concurrent
@@ -343,10 +358,12 @@ impl MarkPriceConfigBuilder {
 /// calculator.update_mid_price(50100);
 /// calculator.update_last_trade_price(50050);
 ///
-/// // Get mark price
-/// if let Some(mark) = calculator.mark_price() {
+/// // Advance the mark once for this update cycle.
+/// if let Some(mark) = calculator.advance_mark() {
 ///     println!("Mark price: {}", mark);
 /// }
+/// // Subsequent observations do not advance dampening.
+/// let _ = calculator.current_mark_price();
 /// ```
 pub struct MarkPriceCalculator {
     /// Configuration for weights and dampening.
@@ -445,22 +462,63 @@ impl MarkPriceCalculator {
         self.last_trade_price.load(Ordering::Acquire)
     }
 
-    /// Returns the last computed mark price (before dampening on current call).
+    /// Returns the last committed mark price as a raw integer (`0` if unset).
+    ///
+    /// This is the same stored value exposed by
+    /// [`current_mark_price`](Self::current_mark_price), but as a bare `u64`
+    /// where `0` means "no mark committed yet" instead of `None`. Reading it
+    /// never advances dampening.
     #[must_use]
     #[inline]
     pub fn last_mark_price(&self) -> u64 {
         self.last_mark_price.load(Ordering::Acquire)
     }
 
-    /// Computes the mark price.
+    /// Returns the last committed mark price **without** advancing dampening.
     ///
-    /// Returns the weighted average of available prices, clamped by the
-    /// dampening factor to limit how much the price can change per update.
+    /// This is a pure accessor: it loads the stored mark and returns it
+    /// unchanged. It performs no weighted-average computation and no
+    /// compare-and-swap, so calling it repeatedly with static inputs is
+    /// idempotent — the value never walks toward the raw weighted average.
+    ///
+    /// Use this for monitoring, display, and P&L snapshots. To move the mark
+    /// one dampening step for an update cycle, call
+    /// [`advance_mark`](Self::advance_mark) instead.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(price)` if a mark has been committed by a prior
+    ///   [`advance_mark`](Self::advance_mark) call
+    /// - `None` if no mark has been committed yet (or after [`reset`](Self::reset))
+    #[must_use]
+    #[inline]
+    pub fn current_mark_price(&self) -> Option<u64> {
+        match self.last_mark_price.load(Ordering::Acquire) {
+            0 => None,
+            committed => Some(committed),
+        }
+    }
+
+    /// Advances the mark price by exactly one dampening step and commits it.
+    ///
+    /// This is the **mutating tick**: it computes the raw weighted average of
+    /// the current inputs, clamps the change to the dampening band relative to
+    /// the last committed mark, then stores and returns the new value. Each
+    /// call advances the mark at most one dampening step toward the raw
+    /// weighted average.
+    ///
+    /// # Per-tick contract
+    ///
+    /// Call this **exactly once per update cycle**. Because every call commits
+    /// a new value, calling it repeatedly with static inputs will walk the mark
+    /// toward the raw weighted average one dampening step per call. To merely
+    /// observe the committed mark without advancing, use the pure
+    /// [`current_mark_price`](Self::current_mark_price).
     ///
     /// # Returns
     ///
     /// - `Some(price)` if at least one input price is non-zero
-    /// - `None` if all input prices are zero
+    /// - `None` if all input prices are zero (no mark is committed)
     ///
     /// # Algorithm
     ///
@@ -469,8 +527,63 @@ impl MarkPriceCalculator {
     /// 3. Re-normalize weights if some inputs are missing
     /// 4. Apply dampening via CAS loop: clamp change to ±ceil(prev × dampening_factor)
     /// 5. Store and return the new mark price
+    pub fn advance_mark(&self) -> Option<u64> {
+        let raw_mark = self.raw_weighted_average()?;
+
+        // Apply dampening using a CAS loop so concurrent updates always
+        // respect the dampening invariant relative to the latest stored value.
+        let mut prev_mark = self.last_mark_price.load(Ordering::Acquire);
+        loop {
+            let final_mark = self.dampen(prev_mark, raw_mark);
+
+            match self.last_mark_price.compare_exchange(
+                prev_mark,
+                final_mark,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(final_mark),
+                Err(actual_prev) => {
+                    // Another thread updated the mark price; retry with the
+                    // latest value so dampening is applied correctly.
+                    prev_mark = actual_prev;
+                }
+            }
+        }
+    }
+
+    /// Computes the mark price, advancing dampening one step (deprecated).
+    ///
+    /// This call **mutates on read**: each invocation commits a new dampened
+    /// value, so two consecutive calls with identical inputs return different
+    /// results. Prefer the explicit split:
+    ///
+    /// - [`current_mark_price`](Self::current_mark_price) to read the committed
+    ///   mark without advancing dampening, or
+    /// - [`advance_mark`](Self::advance_mark) to advance one dampening step per
+    ///   update cycle.
+    ///
+    /// Retained as a thin alias delegating to [`advance_mark`](Self::advance_mark)
+    /// to preserve the previous behavior for existing callers.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(price)` if at least one input price is non-zero
+    /// - `None` if all input prices are zero
+    #[deprecated(
+        since = "0.5.1",
+        note = "mark_price() mutates on read; use current_mark_price() to read or advance_mark() to tick"
+    )]
     #[must_use]
     pub fn mark_price(&self) -> Option<u64> {
+        self.advance_mark()
+    }
+
+    /// Computes the raw weighted average of the current inputs (no dampening).
+    ///
+    /// Returns `None` if all inputs are zero or the active weights sum to zero.
+    #[must_use]
+    fn raw_weighted_average(&self) -> Option<u64> {
         let index = self.index_price.load(Ordering::Acquire);
         let mid = self.mid_price.load(Ordering::Acquire);
         let last_trade = self.last_trade_price.load(Ordering::Acquire);
@@ -503,48 +616,37 @@ impl MarkPriceCalculator {
         }
 
         // Normalize if not all inputs are present
-        let raw_mark = if total_weight > Decimal::ZERO {
+        if total_weight > Decimal::ZERO {
             let avg = weighted_sum
                 .checked_div(total_weight)
                 .unwrap_or(Decimal::ZERO);
-            avg.to_u64().unwrap_or(0)
+            Some(avg.to_u64().unwrap_or(0))
         } else {
-            return None;
-        };
+            None
+        }
+    }
 
-        // Apply dampening using a CAS loop so concurrent updates always
-        // respect the dampening invariant relative to the latest stored value.
-        let mut prev_mark = self.last_mark_price.load(Ordering::Acquire);
-        loop {
-            let final_mark = if prev_mark > 0 {
-                let base_change =
-                    Decimal::from(prev_mark).saturating_mul(self.config.dampening_factor);
-                let ceil_change = base_change.ceil();
-                let mut max_change = ceil_change.to_u64().unwrap_or(0);
-                if max_change == 0 && raw_mark != prev_mark {
-                    max_change = 1;
-                }
-                let min_price = prev_mark.saturating_sub(max_change);
-                let max_price = prev_mark.saturating_add(max_change);
-                raw_mark.clamp(min_price, max_price)
-            } else {
-                // First calculation, no dampening
-                raw_mark
-            };
-
-            match self.last_mark_price.compare_exchange(
-                prev_mark,
-                final_mark,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(final_mark),
-                Err(actual_prev) => {
-                    // Another thread updated the mark price; retry with the
-                    // latest value so dampening is applied correctly.
-                    prev_mark = actual_prev;
-                }
+    /// Clamps `raw_mark` to the dampening band around `prev_mark`.
+    ///
+    /// With `prev_mark == 0` (no committed mark yet) the raw value is returned
+    /// unchanged. Otherwise the change is clamped to
+    /// ±ceil(`prev_mark` × `dampening_factor`), with a floor of 1 unit so a
+    /// non-zero target is never permanently stuck.
+    #[inline]
+    fn dampen(&self, prev_mark: u64, raw_mark: u64) -> u64 {
+        if prev_mark > 0 {
+            let base_change = Decimal::from(prev_mark).saturating_mul(self.config.dampening_factor);
+            let ceil_change = base_change.ceil();
+            let mut max_change = ceil_change.to_u64().unwrap_or(0);
+            if max_change == 0 && raw_mark != prev_mark {
+                max_change = 1;
             }
+            let min_price = prev_mark.saturating_sub(max_change);
+            let max_price = prev_mark.saturating_add(max_change);
+            raw_mark.clamp(min_price, max_price)
+        } else {
+            // First calculation, no dampening
+            raw_mark
         }
     }
 
@@ -720,7 +822,7 @@ mod tests {
     #[test]
     fn test_calculator_no_prices() {
         let calc = MarkPriceCalculator::with_default_config();
-        assert!(calc.mark_price().is_none());
+        assert!(calc.advance_mark().is_none());
     }
 
     #[test]
@@ -731,7 +833,7 @@ mod tests {
         calc.update_mid_price(50000);
         calc.update_last_trade_price(50000);
 
-        let mark = calc.mark_price();
+        let mark = calc.advance_mark();
         assert!(mark.is_some());
         // All same price, weighted average should equal the price
         assert_eq!(mark.unwrap(), 50000);
@@ -746,7 +848,7 @@ mod tests {
         calc.update_mid_price(200);
         calc.update_last_trade_price(300);
 
-        let mark = calc.mark_price().unwrap();
+        let mark = calc.advance_mark().unwrap();
         // Expected: 100*0.5 + 200*0.3 + 300*0.2 = 50 + 60 + 60 = 170
         assert_eq!(mark, 170);
     }
@@ -757,7 +859,7 @@ mod tests {
 
         calc.update_index_price(50000);
 
-        let mark = calc.mark_price();
+        let mark = calc.advance_mark();
         assert!(mark.is_some());
         // Only index present, should use full weight on index
         assert_eq!(mark.unwrap(), 50000);
@@ -776,7 +878,7 @@ mod tests {
         calc.update_mid_price(100);
         calc.update_last_trade_price(200);
 
-        let mark = calc.mark_price().unwrap();
+        let mark = calc.advance_mark().unwrap();
         // Normalize weights: mid=0.3/(0.3+0.3)=0.5, last=0.5
         // Expected: 100*0.5 + 200*0.5 = 150
         assert_eq!(mark, 150);
@@ -795,19 +897,19 @@ mod tests {
 
         // First update: no dampening
         calc.update_index_price(1000);
-        let mark1 = calc.mark_price().unwrap();
+        let mark1 = calc.advance_mark().unwrap();
         assert_eq!(mark1, 1000);
 
         // Second update: try to jump to 2000 (100% increase)
         // Should be clamped to 1000 + 10% = 1100
         calc.update_index_price(2000);
-        let mark2 = calc.mark_price().unwrap();
+        let mark2 = calc.advance_mark().unwrap();
         assert_eq!(mark2, 1100);
 
         // Third update: continue toward 2000
         // From 1100, max is 1100 + 110 = 1210
         calc.update_index_price(2000);
-        let mark3 = calc.mark_price().unwrap();
+        let mark3 = calc.advance_mark().unwrap();
         assert_eq!(mark3, 1210);
     }
 
@@ -824,13 +926,13 @@ mod tests {
 
         // First update
         calc.update_index_price(1000);
-        let mark1 = calc.mark_price().unwrap();
+        let mark1 = calc.advance_mark().unwrap();
         assert_eq!(mark1, 1000);
 
         // Try to drop to 500 (50% decrease)
         // Should be clamped to 1000 - 10% = 900
         calc.update_index_price(500);
-        let mark2 = calc.mark_price().unwrap();
+        let mark2 = calc.advance_mark().unwrap();
         assert_eq!(mark2, 900);
     }
 
@@ -847,15 +949,99 @@ mod tests {
 
         // First update: set initial mark to 5 (small price)
         calc.update_index_price(5);
-        let mark1 = calc.mark_price().unwrap();
+        let mark1 = calc.advance_mark().unwrap();
         assert_eq!(mark1, 5);
 
         // Second update: try to jump to 10
         // Without ceil fix, max_change = (5 * 0.001) as u64 = 0, mark stuck at 5
         // With ceil fix, max_change = ceil(0.005) = 1, so mark can move to 6
         calc.update_index_price(10);
-        let mark2 = calc.mark_price().unwrap();
+        let mark2 = calc.advance_mark().unwrap();
         assert_eq!(mark2, 6);
+    }
+
+    // ── Read-vs-tick split (issue #57) ───────────────────────────────────
+
+    fn dampening_calc() -> MarkPriceCalculator {
+        let config = MarkPriceConfig::builder()
+            .index_weight(1.0)
+            .mid_weight(0.0)
+            .last_trade_weight(0.0)
+            .dampening_factor(0.10) // 10% max change per tick
+            .build()
+            .unwrap();
+        MarkPriceCalculator::new(config)
+    }
+
+    #[test]
+    fn test_current_mark_price_before_tick_returns_none() {
+        let calc = MarkPriceCalculator::with_default_config();
+        calc.update_index_price(50000);
+        // Inputs are set but no tick has committed a mark yet.
+        assert!(calc.current_mark_price().is_none());
+
+        let _ = calc.advance_mark();
+        assert_eq!(calc.current_mark_price(), Some(50000));
+    }
+
+    #[test]
+    fn test_current_mark_price_static_inputs_returns_same_value() {
+        let calc = dampening_calc();
+
+        // Seed an initial committed mark.
+        calc.update_index_price(1000);
+        assert_eq!(calc.advance_mark(), Some(1000));
+
+        // Set a far target so a tick would walk the mark by one dampening step.
+        calc.update_index_price(2000);
+        assert_eq!(calc.advance_mark(), Some(1100));
+
+        // Pure reads must NOT advance dampening: repeated calls with static
+        // inputs are idempotent and never walk toward the raw 2000 target.
+        assert_eq!(calc.current_mark_price(), Some(1100));
+        assert_eq!(calc.current_mark_price(), Some(1100));
+        assert_eq!(calc.current_mark_price(), Some(1100));
+        // The committed value is unchanged by the reads.
+        assert_eq!(calc.last_mark_price(), 1100);
+    }
+
+    #[test]
+    fn test_advance_mark_advances_once_per_call() {
+        let calc = dampening_calc();
+
+        // First commit, no dampening.
+        calc.update_index_price(1000);
+        assert_eq!(calc.advance_mark(), Some(1000));
+
+        // Far target: each tick moves exactly one dampening step.
+        calc.update_index_price(2000);
+
+        // First tick: 1000 + 10% = 1100.
+        assert_eq!(calc.advance_mark(), Some(1100));
+
+        // A pure read between ticks must NOT add a step.
+        assert_eq!(calc.current_mark_price(), Some(1100));
+
+        // Second tick: 1100 + 10% = 1210. Two ticks → two steps; the
+        // intervening read did not contribute a step.
+        assert_eq!(calc.advance_mark(), Some(1210));
+        assert_eq!(calc.current_mark_price(), Some(1210));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_mark_price_still_advances() {
+        // The deprecated alias must preserve the original mutate-on-read
+        // behavior by delegating to advance_mark().
+        let calc = dampening_calc();
+
+        calc.update_index_price(1000);
+        assert_eq!(calc.mark_price(), Some(1000));
+
+        calc.update_index_price(2000);
+        // Still advances one dampening step per call, exactly like advance_mark.
+        assert_eq!(calc.mark_price(), Some(1100));
+        assert_eq!(calc.current_mark_price(), Some(1100));
     }
 
     #[test]
@@ -865,7 +1051,7 @@ mod tests {
         calc.update_index_price(50000);
         calc.update_mid_price(50100);
         calc.update_last_trade_price(50050);
-        let _ = calc.mark_price();
+        let _ = calc.advance_mark();
 
         calc.reset();
 
@@ -873,7 +1059,9 @@ mod tests {
         assert_eq!(calc.mid_price(), 0);
         assert_eq!(calc.last_trade_price(), 0);
         assert_eq!(calc.last_mark_price(), 0);
-        assert!(calc.mark_price().is_none());
+        // Pure read reflects the cleared committed mark.
+        assert!(calc.current_mark_price().is_none());
+        assert!(calc.advance_mark().is_none());
     }
 
     #[test]
@@ -902,7 +1090,7 @@ mod tests {
                     calc_clone.update_index_price(price);
                     calc_clone.update_mid_price(price);
                     calc_clone.update_last_trade_price(price);
-                    let _ = calc_clone.mark_price();
+                    let _ = calc_clone.advance_mark();
                 }
             }));
         }
@@ -912,7 +1100,7 @@ mod tests {
         }
 
         // Should not panic or corrupt data
-        let mark = calc.mark_price();
+        let mark = calc.advance_mark();
         assert!(mark.is_some());
     }
 
@@ -933,7 +1121,7 @@ mod tests {
         calc.update_mid_price(200);
         calc.update_last_trade_price(300);
 
-        let mark = calc.mark_price().unwrap();
+        let mark = calc.advance_mark().unwrap();
         // Expected: 100*0.34 + 200*0.33 + 300*0.33 = 34 + 66 + 99 = 199
         assert_eq!(mark, 199);
     }
@@ -952,7 +1140,7 @@ mod tests {
         calc.update_mid_price(5000); // Should be ignored due to 0 weight
         calc.update_last_trade_price(9000); // Should be ignored
 
-        let mark = calc.mark_price().unwrap();
+        let mark = calc.advance_mark().unwrap();
         assert_eq!(mark, 1000);
     }
 }
