@@ -27,8 +27,8 @@ use crate::orderbook::book::TerminalOrderSummary;
 use crate::orderbook::instrument_registry::InstrumentRegistry;
 use crate::orderbook::symbol_index::SymbolIndex;
 use crate::orderbook::underlying::UnderlyingOrderBook;
-use crate::utils::nanos_since_epoch;
-use optionstratlib::ExpirationDate;
+use crate::utils::{SymbolParser, nanos_since_epoch};
+use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
 use serde::{Deserialize, Serialize};
@@ -787,6 +787,13 @@ impl SequencedUnderlyingOrderBook {
     ) -> OptionChainResult {
         let book = match self.find_book_by_symbol(symbol) {
             Ok(book) => book,
+            // A cross-underlying command must be rejected with the typed reason,
+            // never silently routed or masked as a missing book.
+            Err(e @ Error::UnderlyingMismatch { .. }) => {
+                return OptionChainResult::Rejected {
+                    reason: e.to_string(),
+                };
+            }
             Err(_) => {
                 return OptionChainResult::BookNotFound {
                     symbol: symbol.to_string(),
@@ -806,6 +813,13 @@ impl SequencedUnderlyingOrderBook {
     fn execute_cancel_order(&self, symbol: &str, order_id: OrderId) -> OptionChainResult {
         let book = match self.find_book_by_symbol(symbol) {
             Ok(book) => book,
+            // A cross-underlying command must be rejected with the typed reason,
+            // never silently routed or masked as a missing book.
+            Err(e @ Error::UnderlyingMismatch { .. }) => {
+                return OptionChainResult::Rejected {
+                    reason: e.to_string(),
+                };
+            }
             Err(_) => {
                 return OptionChainResult::BookNotFound {
                     symbol: symbol.to_string(),
@@ -1038,63 +1052,44 @@ impl SequencedUnderlyingOrderBook {
     }
 
     /// Finds an option book by symbol.
+    ///
+    /// The symbol grammar is parsed by [`SymbolParser`], the single source of
+    /// truth, so the derived expiration instant (and therefore the
+    /// `ExpirationKey` used to look up the chain) matches whatever created the
+    /// chain. The parsed underlying is validated against this book's underlying
+    /// — a mismatch is rejected with [`Error::UnderlyingMismatch`] rather than
+    /// silently routing the order into the wrong book.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSymbol`] for a malformed symbol,
+    /// [`Error::UnderlyingMismatch`] when the symbol's underlying differs from
+    /// this book's, or a not-found error when the expiration or strike does not
+    /// exist in this book.
     fn find_book_by_symbol(
         &self,
         symbol: &str,
     ) -> Result<Arc<crate::orderbook::OptionOrderBook>, Error> {
-        // Fallback: parse symbol and navigate
-        let parts: Vec<&str> = symbol.split('-').collect();
-        if parts.len() != 4 {
-            return Err(Error::invalid_symbol(
+        let parsed = SymbolParser::parse(symbol)?;
+
+        let expected = self.inner.underlying();
+        if parsed.underlying() != expected {
+            return Err(Error::underlying_mismatch(
                 symbol,
-                "expected format: UNDERLYING-YYYYMMDD-STRIKE-C|P",
+                parsed.underlying(),
+                expected,
             ));
         }
 
-        let expiry_str = parts[1];
-        let strike_str = parts[2];
-        let option_type = parts[3];
+        let exp_book = self.inner.get_expiration(parsed.expiration())?;
+        let strike_book = exp_book.get_strike(parsed.strike())?;
 
-        // Parse expiration date
-        let expiry = Self::parse_expiration(expiry_str)?;
-
-        // Parse strike
-        let strike: u64 = strike_str.parse().map_err(|_| {
-            Error::invalid_symbol(symbol, format!("invalid strike: {}", strike_str))
-        })?;
-
-        let exp_book = self.inner.get_expiration(&expiry)?;
-        let strike_book = exp_book.get_strike(strike)?;
-
-        let book = match option_type.to_uppercase().as_str() {
-            "C" => strike_book.call_arc(),
-            "P" => strike_book.put_arc(),
-            _ => {
-                return Err(Error::invalid_symbol(
-                    symbol,
-                    format!("expected C or P, got {}", option_type),
-                ));
-            }
+        let book = match parsed.option_style() {
+            OptionStyle::Call => strike_book.call_arc(),
+            OptionStyle::Put => strike_book.put_arc(),
         };
 
         Ok(book)
-    }
-
-    /// Parses an expiration date string (YYYYMMDD format).
-    fn parse_expiration(s: &str) -> Result<ExpirationDate, Error> {
-        use chrono::{NaiveDate, TimeZone, Utc};
-
-        let date = NaiveDate::parse_from_str(s, "%Y%m%d")
-            .map_err(|_| Error::invalid_symbol(s, "expected YYYYMMDD format"))?;
-
-        // Construct a concrete expiration DateTime at midnight UTC on the given date,
-        // to match the representation used elsewhere in the codebase.
-        let naive_dt = date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| Error::invalid_symbol(s, "invalid expiration date"))?;
-        let datetime_utc = Utc.from_utc_datetime(&naive_dt);
-
-        Ok(ExpirationDate::DateTime(datetime_utc))
     }
 
     /// Replays events from the journal starting at `from_sequence`.
@@ -1491,11 +1486,10 @@ mod tests {
     /// Builds a `SequencedUnderlyingOrderBook` with a real expiration, strike,
     /// and resting orders so that command execution paths are exercisable.
     fn make_book_with_orders() -> (SequencedUnderlyingOrderBook, ExpirationDate, String) {
-        use chrono::{NaiveDate, TimeZone, Utc};
-
-        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
-        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
-        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+        // Build the chain via the canonical parser so its `ExpirationKey`
+        // matches what `find_book_by_symbol` derives when routing the symbol.
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
 
         let underlying = UnderlyingOrderBook::new("BTC");
         let exp_book = underlying.get_or_create_expiration(expiry);
@@ -1521,11 +1515,8 @@ mod tests {
     }
 
     fn make_book_with_user_orders() -> (SequencedUnderlyingOrderBook, ExpirationDate) {
-        use chrono::{NaiveDate, TimeZone, Utc};
-
-        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
-        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
-        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
 
         let user_a = Hash32::from([1u8; 32]);
 
@@ -1921,12 +1912,9 @@ mod tests {
 
     #[test]
     fn test_mass_cancel_book_by_user() {
-        use chrono::{NaiveDate, TimeZone, Utc};
-
         let user_a = Hash32::from([1u8; 32]);
-        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
-        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
-        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
 
         let underlying = UnderlyingOrderBook::new("BTC");
         let exp_book = underlying.get_or_create_expiration(expiry);
@@ -1988,7 +1976,7 @@ mod tests {
         assert!(receipt.result.is_error());
     }
 
-    // ── parse_expiration ─────────────────────────────────────────────────
+    // ── symbol expiration parsing (delegated to SymbolParser) ─────────────
 
     #[test]
     fn test_parse_expiration_invalid() {
@@ -1998,6 +1986,73 @@ mod tests {
             .submit_add_order("BTC-NOTADATE-50000-C", OrderId::new(), Side::Buy, 100, 10)
             .expect("submit");
         assert!(receipt.result.is_error());
+    }
+
+    // ── underlying-mismatch routing (cross-book safety) ───────────────────
+
+    #[test]
+    fn test_find_book_by_symbol_cross_underlying_rejected_with_typed_error() {
+        // BTC book already holds 20240329 / 50000 — the same expiry+strike the
+        // ETH symbol names. Before consolidation the underlying was never
+        // checked, so this would have silently routed into the BTC book.
+        let (book, _, _) = make_book_with_orders();
+
+        // `Arc<OptionOrderBook>` is not `Debug`, so match instead of `expect_err`.
+        match book.find_book_by_symbol("ETH-20240329-50000-C") {
+            Err(Error::UnderlyingMismatch { .. }) => {}
+            Err(other) => panic!("expected UnderlyingMismatch, got {other:?}"),
+            Ok(_) => panic!("expected UnderlyingMismatch, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_submit_add_order_cross_underlying_rejected() {
+        let (book, _, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order("ETH-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(reason.contains("underlying mismatch"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    // ── chain created via SymbolParser resolves a sequencer-routed order ──
+
+    #[test]
+    fn test_sequencer_resolves_chain_created_via_symbol_parser_same_yyyymmdd() {
+        let symbol = "BTC-20240329-50000-C";
+
+        // Create the chain straight from the canonical parser output.
+        let parsed = SymbolParser::parse(symbol).expect("parse");
+        let underlying = UnderlyingOrderBook::new("BTC");
+        let exp_book = underlying.get_or_create_expiration(*parsed.expiration());
+        let strike = exp_book.get_or_create_strike(parsed.strike());
+        let created_call = strike.call_arc();
+        drop(strike);
+        drop(exp_book);
+
+        let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
+
+        // The sequencer must route the same YYYYMMDD symbol to that exact book.
+        let receipt = book
+            .submit_add_order(symbol, OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        assert!(
+            receipt.result.is_success(),
+            "routed order must resolve: {:?}",
+            receipt.result
+        );
+
+        // Identical resolution: same leaf `Arc`, which can only happen if the
+        // derived `ExpirationKey` matched the one used to create the chain.
+        let resolved = book
+            .find_book_by_symbol(symbol)
+            .expect("symbol must resolve");
+        assert!(Arc::ptr_eq(&resolved, &created_call));
     }
 
     // ── put book path ────────────────────────────────────────────────────
@@ -2059,8 +2114,6 @@ mod tests {
 
     #[test]
     fn test_sequenced_book_registry_populated_after_add_order() {
-        use chrono::{NaiveDate, TimeZone, Utc};
-
         let registry = Arc::new(InstrumentRegistry::new());
         let symbol_index = Arc::new(SymbolIndex::new());
 
@@ -2073,10 +2126,10 @@ mod tests {
         assert!(registry.is_empty());
         assert!(symbol_index.is_empty());
 
-        // Create the hierarchy — this registers instruments in the registry
-        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
-        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
-        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+        // Create the hierarchy via the canonical parser so the chain key matches
+        // what the routed symbol resolves to.
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
 
         let exp_book = underlying.get_or_create_expiration(expiry);
         let strike = exp_book.get_or_create_strike(50000);
