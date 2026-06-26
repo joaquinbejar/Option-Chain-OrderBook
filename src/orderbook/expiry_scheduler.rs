@@ -280,20 +280,20 @@ impl ExpiryScheduler {
             .expiry_cycle_config()
             .ok_or_else(|| Error::configuration("expiry cycle config not set on underlying"))?;
 
-        // Get strike range configs - require exactly one to avoid nondeterministic selection
+        // Get strike range configs - require exactly one to avoid
+        // nondeterministic selection. Drain the iterator in a single pass so
+        // the "exactly one" check and the extraction share the same probe: no
+        // separate `.len()` + `.expect()` that could panic if they disagreed.
         let strike_configs = underlying.strike_range_configs();
-        let strike_config = match strike_configs.len() {
-            0 => {
+        let mut values = strike_configs.values();
+        let strike_config = match (values.next(), values.next()) {
+            (None, _) => {
                 return Err(Error::configuration(
                     "no strike range configs set on underlying",
                 ));
             }
-            1 => strike_configs
-                .values()
-                .next()
-                .cloned()
-                .expect("len == 1 but no value"),
-            _ => {
+            (Some(config), None) => config.clone(),
+            (Some(_), Some(_)) => {
                 return Err(Error::configuration(
                     "multiple strike range configs set; refresh_from_underlying requires exactly one",
                 ));
@@ -317,8 +317,13 @@ impl ExpiryScheduler {
 mod tests {
     use super::*;
     use crate::orderbook::{CycleRule, ExpiryType};
+    use chrono::NaiveTime;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn time(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).expect("valid test time")
+    }
 
     fn default_strike_config() -> StrikeRangeConfig {
         StrikeRangeConfig::builder()
@@ -336,8 +341,8 @@ mod tests {
                 cycle_type: ExpiryType::Daily,
                 count: 2,
             }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         }
     }
 
@@ -490,8 +495,8 @@ mod tests {
         let book = UnderlyingOrderBook::new("BTC");
         let expiry_config = ExpiryCycleConfig {
             cycles: vec![],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         };
         let strike_config = default_strike_config();
 
