@@ -48,12 +48,30 @@ pub enum Error {
         message: String,
     },
 
-    /// Error when an order book operation fails.
+    /// Error when an order book operation fails, carrying a manual string
+    /// message.
+    ///
+    /// Used for failures that originate in this crate (e.g. validation
+    /// strings) rather than the upstream matching engine. For typed failures
+    /// propagated from `orderbook_rs`, use [`OrderBookEngine`](Self::OrderBookEngine)
+    /// instead, which preserves the source chain.
     #[error("order book error: {message}")]
     OrderBookError {
         /// Description of the order book error.
         message: String,
     },
+
+    /// Error propagated from the upstream `orderbook_rs` matching engine.
+    ///
+    /// Wraps [`orderbook_rs::prelude::OrderBookError`] via `#[from]` so the
+    /// typed upstream error and its source chain are preserved: callers can
+    /// reach the underlying reason through [`std::error::Error::source`] and
+    /// downcast to the concrete `OrderBookError` to match on the rejection
+    /// (duplicate order id, self-trade prevented, risk breach, etc.). The
+    /// upstream type is `#[non_exhaustive]`, so it can only be obtained by
+    /// triggering a real engine failure, never constructed directly.
+    #[error("order-book engine error: {0}")]
+    OrderBookEngine(#[from] orderbook_rs::prelude::OrderBookError),
 
     /// Error when pricing calculation fails.
     #[error("pricing error: {message}")]

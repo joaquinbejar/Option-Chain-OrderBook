@@ -684,8 +684,7 @@ impl OptionOrderBook {
     ) -> Result<()> {
         self.check_active()?;
         self.book
-            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
         Ok(())
     }
 
@@ -713,8 +712,7 @@ impl OptionOrderBook {
     ) -> Result<()> {
         self.check_active()?;
         self.book
-            .add_limit_order(order_id, price, quantity, side, tif, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order(order_id, price, quantity, side, tif, None)?;
         Ok(())
     }
 
@@ -735,7 +733,7 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (e.g., `MissingUserId` when STP is enabled and `user_id` is zero).
     pub fn add_limit_order_with_user(
         &self,
@@ -746,17 +744,15 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<()> {
         self.check_active()?;
-        self.book
-            .add_limit_order_with_user(
-                order_id,
-                price,
-                quantity,
-                side,
-                TimeInForce::Gtc,
-                user_id,
-                None,
-            )
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        self.book.add_limit_order_with_user(
+            order_id,
+            price,
+            quantity,
+            side,
+            TimeInForce::Gtc,
+            user_id,
+            None,
+        )?;
         Ok(())
     }
 
@@ -777,7 +773,7 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_tif_and_user(
         &self,
         order_id: OrderId,
@@ -789,8 +785,7 @@ impl OptionOrderBook {
     ) -> Result<()> {
         self.check_active()?;
         self.book
-            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
         Ok(())
     }
 
@@ -845,8 +840,7 @@ impl OptionOrderBook {
         self.check_active()?;
         self.clear_trade_capture();
         self.book
-            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
         Ok(self.extract_trade_result(order_id, quantity))
     }
 
@@ -856,7 +850,7 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_tif_full(
         &self,
         order_id: OrderId,
@@ -868,8 +862,7 @@ impl OptionOrderBook {
         self.check_active()?;
         self.clear_trade_capture();
         self.book
-            .add_limit_order(order_id, price, quantity, side, tif, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order(order_id, price, quantity, side, tif, None)?;
         Ok(self.extract_trade_result(order_id, quantity))
     }
 
@@ -879,7 +872,7 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_user_full(
         &self,
         order_id: OrderId,
@@ -890,17 +883,15 @@ impl OptionOrderBook {
     ) -> Result<TradeResult> {
         self.check_active()?;
         self.clear_trade_capture();
-        self.book
-            .add_limit_order_with_user(
-                order_id,
-                price,
-                quantity,
-                side,
-                TimeInForce::Gtc,
-                user_id,
-                None,
-            )
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        self.book.add_limit_order_with_user(
+            order_id,
+            price,
+            quantity,
+            side,
+            TimeInForce::Gtc,
+            user_id,
+            None,
+        )?;
         Ok(self.extract_trade_result(order_id, quantity))
     }
 
@@ -911,7 +902,7 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_tif_and_user_full(
         &self,
         order_id: OrderId,
@@ -924,8 +915,7 @@ impl OptionOrderBook {
         self.check_active()?;
         self.clear_trade_capture();
         self.book
-            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)
-            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
         Ok(self.extract_trade_result(order_id, quantity))
     }
 
@@ -942,9 +932,9 @@ impl OptionOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::orderbook`](crate::Error::orderbook) if the underlying
-    /// engine reports a real cancellation failure (distinct from a benign
-    /// not-found).
+    /// Returns [`OrderBookEngine`](crate::Error::OrderBookEngine) if the
+    /// underlying engine reports a real cancellation failure (distinct from a
+    /// benign not-found).
     pub fn cancel_order(&self, order_id: OrderId) -> Result<bool> {
         // orderbook_rs::cancel_order returns Ok(Some(_)) when an order was
         // cancelled, Ok(None) when no such order was resting, and Err(_) on a
@@ -954,7 +944,7 @@ impl OptionOrderBook {
         match self.book.cancel_order(order_id) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
-            Err(e) => Err(crate::Error::orderbook(e.to_string())),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1523,6 +1513,44 @@ mod tests {
         assert_eq!(book.order_count(), 2);
         assert_eq!(book.bid_level_count(), 1);
         assert_eq!(book.ask_level_count(), 1);
+    }
+
+    #[test]
+    fn test_orderbook_engine_error_preserves_source_chain() {
+        use orderbook_rs::prelude::OrderBookError;
+        use std::error::Error as _;
+
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        // Admit a resting order, then submit a second order reusing the same
+        // OrderId. orderbook_rs rejects the duplicate id with a typed
+        // OrderBookError::DuplicateOrderId; the wrapper must propagate it as
+        // Error::OrderBookEngine with the upstream source chain intact (rather
+        // than flattening it to a string and dropping the typed cause).
+        let order_id = OrderId::new();
+        book.add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("first add should succeed");
+
+        let err = book
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect_err("duplicate order id must be rejected");
+
+        // The wrapper maps the upstream failure to the typed engine variant.
+        assert!(
+            matches!(err, crate::Error::OrderBookEngine(_)),
+            "expected OrderBookEngine variant, got: {err:?}"
+        );
+
+        // The typed upstream error is reachable via std::error::Error::source()
+        // and downcasts back to the concrete orderbook_rs error.
+        let source = err.source().expect("source chain must be preserved");
+        let downcast = source
+            .downcast_ref::<OrderBookError>()
+            .expect("source must downcast to orderbook_rs OrderBookError");
+        assert!(
+            matches!(downcast, OrderBookError::DuplicateOrderId { .. }),
+            "expected DuplicateOrderId from the engine, got: {downcast:?}"
+        );
     }
 
     #[test]
