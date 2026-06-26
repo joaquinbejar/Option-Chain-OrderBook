@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
+#[cfg(feature = "nats")]
+use super::book::{ContractNatsListenerFactory, SharedNatsFactory};
 
 /// Order book for a single expiration date.
 ///
@@ -233,6 +235,17 @@ impl ExpirationOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.chain.fee_schedule()
+    }
+
+    /// Propagates the per-contract NATS listener factory down to this
+    /// expiration's chain (and onward to its strike manager).
+    ///
+    /// Delegates to [`OptionChainOrderBook::set_nats_factory`]. Existing books
+    /// are not affected.
+    #[cfg(feature = "nats")]
+    #[inline]
+    pub(crate) fn set_nats_factory(&self, factory: Option<ContractNatsListenerFactory>) {
+        self.chain.set_nats_factory(factory);
     }
 
     /// Cancels all resting orders across the expiration's option chain.
@@ -552,6 +565,11 @@ pub struct ExpirationOrderBookManager {
     stp_mode: SharedSTPMode,
     /// Fee schedule propagated to newly created expiration books.
     fee_schedule: SharedFeeSchedule,
+    /// Per-contract NATS listener factory propagated to newly created
+    /// expiration books (and onward to their strikes). `None` (the default)
+    /// reproduces the non-NATS path exactly.
+    #[cfg(feature = "nats")]
+    nats_factory: SharedNatsFactory,
 }
 
 impl ExpirationOrderBookManager {
@@ -571,6 +589,8 @@ impl ExpirationOrderBookManager {
             symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -598,6 +618,8 @@ impl ExpirationOrderBookManager {
             symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -623,6 +645,8 @@ impl ExpirationOrderBookManager {
             symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -693,6 +717,18 @@ impl ExpirationOrderBookManager {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
+    }
+
+    /// Stores the per-contract NATS listener factory propagated from the top of
+    /// the hierarchy and forwarded to every future expiration book.
+    ///
+    /// Existing expiration books are not affected; only books created by a
+    /// later [`get_or_create`](Self::get_or_create) carry the factory down to
+    /// their strikes. Mirrors [`set_fee_schedule`](Self::set_fee_schedule)
+    /// propagation.
+    #[cfg(feature = "nats")]
+    pub(crate) fn set_nats_factory(&self, factory: Option<ContractNatsListenerFactory>) {
+        self.nats_factory.set(factory);
     }
 
     /// Returns the underlying asset symbol.
@@ -793,6 +829,15 @@ impl ExpirationOrderBookManager {
         }
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
+        }
+        // Propagate the per-contract NATS factory down to the fresh chain/strike
+        // manager BEFORE publishing, so the configured-before-visible invariant
+        // holds: any later strike created under this expiration installs its
+        // publishers. Done only when a factory is configured to keep the
+        // no-factory path identical.
+        #[cfg(feature = "nats")]
+        if let Some(factory) = self.nats_factory.get() {
+            fresh.set_nats_factory(Some(factory));
         }
         // Keep a handle to the locally built book so we can identify whether it
         // won the race after the atomic publish.

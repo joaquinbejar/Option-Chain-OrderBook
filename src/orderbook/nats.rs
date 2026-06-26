@@ -47,7 +47,10 @@
 //! # }
 //! ```
 
-use super::book::{BookConfig, OptionOrderBook, PreparedNatsListeners};
+use super::book::{
+    BookConfig, ContractNatsListenerFactory, OptionOrderBook, PreparedNatsListeners,
+};
+use super::underlying::UnderlyingOrderBookManager;
 use crate::error::Error;
 use crate::utils::SymbolParser;
 use optionstratlib::OptionStyle;
@@ -562,6 +565,111 @@ pub fn build_option_order_book_with_nats(
     ))
 }
 
+/// Builds the per-contract NATS listener factory backing
+/// [`build_underlying_manager_with_nats`].
+///
+/// The returned factory, when invoked by the hierarchy with a contract symbol,
+/// derives that contract's hierarchical trade/book subjects via
+/// [`OptionChainSubjectBuilder`], constructs the trade and book-change
+/// publishers, and converts them into their `orderbook_rs`-native listeners for
+/// the hierarchy to install pre-`Arc`. The publisher handles are intentionally
+/// dropped, leaving each publisher owned by its background batch task and its
+/// listener closure; teardown is therefore drop-driven (see
+/// [`build_underlying_manager_with_nats`]).
+///
+/// A symbol that cannot be turned into a valid subject yields `None` (logged at
+/// `ERROR`), so the contract book is still created — just without publishers —
+/// rather than failing book creation.
+#[must_use]
+fn make_contract_nats_factory(config: OptionChainNatsConfig) -> ContractNatsListenerFactory {
+    Arc::new(move |symbol: &str| {
+        let subject = match OptionChainSubjectBuilder::from_symbol(symbol) {
+            Ok(subject) => subject,
+            Err(err) => {
+                tracing::error!(
+                    symbol,
+                    error = %err,
+                    "nats: cannot derive subject for lazily-created contract; \
+                     publishers not attached"
+                );
+                return None;
+            }
+        };
+        let trade_subject = subject.trade_subject(config.subject_prefix());
+        let book_subject = subject.book_subject(config.subject_prefix());
+
+        // Build the trade publisher and convert it into its listener callback.
+        let trade_publisher = NatsTradePublisher::new(
+            config.jetstream().clone(),
+            trade_subject,
+            config.runtime().clone(),
+        );
+        let (_trade_handle, trade_listener) = trade_publisher.into_listener();
+
+        // Build the book-change publisher and convert it into its listener.
+        let book_change_publisher = NatsBookChangePublisher::new(
+            config.jetstream().clone(),
+            symbol.to_string(),
+            book_subject,
+            config.runtime().clone(),
+        );
+        let (_book_handle, book_listener) = book_change_publisher.into_listener();
+
+        tracing::debug!(
+            symbol,
+            prefix = %config.subject_prefix(),
+            "nats publishers attached to lazily-created contract book"
+        );
+
+        Some(PreparedNatsListeners {
+            trade_listener,
+            book_listener,
+        })
+    })
+}
+
+/// Builds an [`UnderlyingOrderBookManager`] that attaches per-contract NATS
+/// publishers to **every** contract book the hierarchy lazily creates.
+///
+/// Unlike [`build_option_order_book_with_nats`], which wires a single standalone
+/// [`OptionOrderBook`], this wires the whole hierarchy: each call/put book
+/// created on demand via `get_or_create_*` installs its own trade and
+/// book-change publishers — bound to that contract's hierarchical subjects —
+/// *before* the inner book is wrapped in `Arc`. The wiring rides an
+/// `orderbook_rs`-native listener factory threaded down to the leaf, so the core
+/// hierarchy never imports this module.
+///
+/// # Subject Format
+///
+/// Each contract publishes to the same subjects as
+/// [`build_option_order_book_with_nats`]:
+///
+/// - Trades: `{prefix}.trades.{underlying}.{expiry}.{strike}.{type}`
+/// - Book changes: `{prefix}.book.{underlying}.{expiry}.{strike}.{type}`
+///
+/// # Shutdown
+///
+/// The publishers attached to lazily-created books are bound to their book's
+/// lifetime: dropping a contract book (strike/expiry cleanup, or dropping the
+/// manager) closes the publish channels, and each publisher's background batch
+/// task drains and exits deterministically. For standalone books that need
+/// explicit publish metrics or an awaitable async shutdown, use
+/// [`build_option_order_book_with_nats`], which returns [`NatsPublisherHandles`].
+#[must_use = "the returned manager owns the hierarchy whose contract books \
+              publish to NATS; dropping it tears the publishers down"]
+pub fn build_underlying_manager_with_nats(
+    config: OptionChainNatsConfig,
+) -> UnderlyingOrderBookManager {
+    let prefix = config.subject_prefix().to_string();
+    let factory = make_contract_nats_factory(config);
+    let manager = UnderlyingOrderBookManager::with_nats_factory(factory);
+    tracing::info!(
+        prefix = %prefix,
+        "underlying order book manager wired with per-contract nats publishers"
+    );
+    manager
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -812,6 +920,95 @@ mod tests {
     fn test_validate_subject_prefix_multi_token_ok() {
         // A dotted prefix is allowed: it simply prepends extra subject levels.
         assert!(validate_subject_prefix("exchange.optionchain").is_ok());
+    }
+
+    /// End-to-end (offline) check that a contract book created purely through
+    /// the lazy hierarchy (`get_or_create_*`) has its per-contract publishers
+    /// installed and that a matched trade reaches them on the configured
+    /// per-contract subject.
+    ///
+    /// Mirrors the leaf `nats` seam test in `book.rs` (#58): the factory installs
+    /// *capturable stand-in* listeners that derive the real per-contract subject
+    /// via [`OptionChainSubjectBuilder`] — the same derivation the production
+    /// factory uses — so no live NATS server is required. This exercises the
+    /// full factory threading: root manager → underlying → expiration → chain →
+    /// strike → leaf `OptionOrderBook`.
+    #[test]
+    fn test_lazily_created_contract_book_publishes_to_per_contract_subject() {
+        use optionstratlib::ExpirationDate;
+        use optionstratlib::prelude::pos_or_panic;
+        use orderbook_rs::{
+            OrderId, PriceLevelChangedEvent, PriceLevelChangedListener, Side, TradeListener,
+            TradeResult,
+        };
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let prefix = "optionchain";
+
+        // symbol -> (derived trade subject, trade-listener fire count).
+        type Captured = HashMap<String, (String, Arc<AtomicU64>)>;
+        let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // Stand-in factory: derives the same per-contract subject the production
+        // factory would, and installs a capturing trade listener — exactly the
+        // book.rs #58 seam, but reached through the lazy hierarchy.
+        let captured_factory = Arc::clone(&captured);
+        let prefix_owned = prefix.to_string();
+        let factory: ContractNatsListenerFactory = Arc::new(move |symbol: &str| {
+            let subject = OptionChainSubjectBuilder::from_symbol(symbol).ok()?;
+            let trade_subject = subject.trade_subject(&prefix_owned);
+            let count = Arc::new(AtomicU64::new(0));
+            captured_factory
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(symbol.to_string(), (trade_subject, Arc::clone(&count)));
+            let count_c = Arc::clone(&count);
+            let trade_listener: TradeListener = Arc::new(move |_tr: &TradeResult| {
+                count_c.fetch_add(1, Ordering::Relaxed);
+            });
+            let book_listener: PriceLevelChangedListener =
+                Arc::new(|_ev: PriceLevelChangedEvent| {});
+            Some(PreparedNatsListeners {
+                trade_listener,
+                book_listener,
+            })
+        });
+
+        let manager = UnderlyingOrderBookManager::with_nats_factory(factory);
+
+        // Create a contract book lazily through every hierarchy level.
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
+        let strike = exp.get_or_create_strike(50_000);
+        let call = strike.call();
+        let call_symbol = call.symbol().to_string();
+
+        // The expected subject is derived from the actual lazily-built symbol,
+        // so the assertion is independent of today's date.
+        let expected_subject = OptionChainSubjectBuilder::from_symbol(&call_symbol)
+            .expect("lazily-built call symbol must parse")
+            .trade_subject(prefix);
+
+        // Rest a sell, then cross it with a marketable buy to force a trade.
+        call.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
+            .expect("rest sell");
+        call.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("cross buy");
+
+        let guard = captured.lock().unwrap_or_else(|p| p.into_inner());
+        let (subject, count) = guard
+            .get(&call_symbol)
+            .expect("publishers must be wired into the lazily-created call book");
+        assert_eq!(
+            subject, &expected_subject,
+            "lazily-created call book must publish to its per-contract subject"
+        );
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "a matched trade on a get_or_create_* strike must reach its per-contract publisher"
+        );
     }
 
     // `OptionChainNatsConfig::try_new` delegates its prefix validation entirely

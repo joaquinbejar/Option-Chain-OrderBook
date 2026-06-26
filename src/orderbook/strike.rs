@@ -4,6 +4,8 @@
 //! for managing call/put pairs at a specific strike price.
 
 use super::book::{BookConfig, OptionOrderBook};
+#[cfg(feature = "nats")]
+use super::book::{ContractNatsListenerFactory, PreparedNatsListeners, SharedNatsFactory};
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
@@ -735,6 +737,12 @@ pub struct StrikeOrderBookManager {
     stp_mode: SharedSTPMode,
     /// Fee schedule applied to newly created option books.
     fee_schedule: SharedFeeSchedule,
+    /// Per-contract NATS listener factory propagated from the top of the
+    /// hierarchy. When present, each lazily created call/put book installs its
+    /// own publishers pre-`Arc` in the [`get_or_create`](Self::get_or_create)
+    /// winner path. `None` (the default) reproduces the non-NATS path exactly.
+    #[cfg(feature = "nats")]
+    nats_factory: SharedNatsFactory,
 }
 
 impl StrikeOrderBookManager {
@@ -756,6 +764,8 @@ impl StrikeOrderBookManager {
             symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -785,6 +795,8 @@ impl StrikeOrderBookManager {
             symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -813,6 +825,8 @@ impl StrikeOrderBookManager {
             symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -893,6 +907,19 @@ impl StrikeOrderBookManager {
         self.fee_schedule.get()
     }
 
+    /// Stores the per-contract NATS listener factory propagated from the top of
+    /// the hierarchy.
+    ///
+    /// Existing strike books are not affected; only call/put books created by a
+    /// later [`get_or_create`](Self::get_or_create) install publishers from this
+    /// factory. Mirrors [`set_fee_schedule`](Self::set_fee_schedule) /
+    /// [`set_stp_mode`](Self::set_stp_mode) propagation, so the factory rides
+    /// the same `&self` setter path instead of widening any constructor.
+    #[cfg(feature = "nats")]
+    pub(crate) fn set_nats_factory(&self, factory: Option<ContractNatsListenerFactory>) {
+        self.nats_factory.set(factory);
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -959,6 +986,18 @@ impl StrikeOrderBookManager {
     pub fn get_or_create(&self, strike: u64) -> Arc<StrikeOrderBook> {
         if let Some(entry) = self.strikes.get(&strike) {
             return Arc::clone(entry.value());
+        }
+
+        // When a per-contract NATS listener factory is configured, the call/put
+        // publishers must be installed pre-`Arc` (the `orderbook_rs` listener
+        // setters take `&mut self`), which means they have to be built into the
+        // candidate book *before* it is published. To keep that build — and the
+        // background publish task each publisher spawns — gated to the winner,
+        // the NATS path elects the winner with `get_or_insert_with`. The
+        // non-NATS path below is left byte-for-byte unchanged.
+        #[cfg(feature = "nats")]
+        if let Some(factory) = self.nats_factory.get() {
+            return self.get_or_create_with_nats(strike, factory);
         }
 
         // Build the call/put pair WITHOUT allocating instrument IDs or touching
@@ -1030,6 +1069,109 @@ impl StrikeOrderBookManager {
             call,
             put,
         ))
+    }
+
+    /// NATS-aware variant of [`get_or_create`](Self::get_or_create).
+    ///
+    /// Elects the build winner with
+    /// [`SkipMap::get_or_insert_with`](crossbeam_skiplist::SkipMap::get_or_insert_with)
+    /// so the publisher-wired call/put pair — and the background publish task
+    /// each publisher spawns — is built lazily and, in the common (uncontended)
+    /// case, exactly once: by the thread whose book is actually inserted. The
+    /// one-time global side effects (instrument-ID allocation, symbol-index
+    /// registration) are gated to that same winner via [`Arc::ptr_eq`], exactly
+    /// as the non-NATS path gates them.
+    ///
+    /// Under genuine concurrent contention for the *same* strike a losing
+    /// thread's closure may build a publisher-wired pair that loses the insert
+    /// and is dropped; it is never published into the hierarchy, never receives
+    /// an order, and its publish tasks terminate deterministically when the
+    /// dropped book closes their channels. The single book that ends up in the
+    /// map is wired exactly once, with no double-install.
+    #[cfg(feature = "nats")]
+    fn get_or_create_with_nats(
+        &self,
+        strike: u64,
+        factory: ContractNatsListenerFactory,
+    ) -> Arc<StrikeOrderBook> {
+        // Track the handle our own closure built (if it ran at all) so we can
+        // detect whether *we* are the winning inserter after the atomic publish.
+        let mut built: Option<Arc<StrikeOrderBook>> = None;
+        let entry = self.strikes.get_or_insert_with(strike, || {
+            let book = self.create_strike_book_with_nats(strike, &factory);
+            built = Some(Arc::clone(&book));
+            book
+        });
+        let winner = Arc::clone(entry.value());
+
+        // Run the one-time global side effects only when our closure built the
+        // inserted book. If the closure did not run (`built` is `None`, key was
+        // already present) or our candidate lost the race, another caller is the
+        // winner and owns these side effects.
+        if let Some(candidate) = &built
+            && Arc::ptr_eq(candidate, &winner)
+            && let Err(err) = self.assign_instrument_ids(&winner, strike)
+        {
+            tracing::error!(
+                underlying = %self.underlying,
+                strike,
+                error = %err,
+                "instrument-id exhaustion: registry full; strike books left with instrument_id 0",
+            );
+        }
+        winner
+    }
+
+    /// Builds a [`StrikeOrderBook`] whose call/put books carry NATS publishers
+    /// produced by `factory`, installed pre-`Arc` via [`BookConfig`].
+    ///
+    /// Mirrors [`create_strike_book_without_ids`](Self::create_strike_book_without_ids)
+    /// (same validation / STP / fee configuration, no instrument-ID allocation)
+    /// and additionally invokes the factory with each leg's symbol. A factory
+    /// returning `None` for a symbol yields a book without publishers — identical
+    /// to the non-NATS path for that leg.
+    #[cfg(feature = "nats")]
+    fn create_strike_book_with_nats(
+        &self,
+        strike: u64,
+        factory: &ContractNatsListenerFactory,
+    ) -> Arc<StrikeOrderBook> {
+        let exp_str = format_expiration_yyyymmdd(&self.expiration)
+            .unwrap_or_else(|_| self.expiration.to_string());
+        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+
+        let call = Arc::new(OptionOrderBook::new_with_config(
+            &call_symbol,
+            OptionStyle::Call,
+            self.book_config_with_listeners(factory(&call_symbol)),
+        ));
+        let put = Arc::new(OptionOrderBook::new_with_config(
+            &put_symbol,
+            OptionStyle::Put,
+            self.book_config_with_listeners(factory(&put_symbol)),
+        ));
+
+        Arc::new(StrikeOrderBook::from_books(
+            &self.underlying,
+            self.expiration,
+            strike,
+            call,
+            put,
+        ))
+    }
+
+    /// Builds a [`BookConfig`] carrying this manager's validation / STP / fee
+    /// settings plus the supplied pre-built NATS listeners.
+    #[cfg(feature = "nats")]
+    fn book_config_with_listeners(&self, listeners: Option<PreparedNatsListeners>) -> BookConfig {
+        BookConfig {
+            validation: self.validation_config.get(),
+            stp_mode: self.stp_mode.get(),
+            fee_schedule: self.fee_schedule.get(),
+            nats_listeners: listeners,
+            ..BookConfig::default()
+        }
     }
 
     /// Assigns unique instrument IDs and registers the call/put books in the

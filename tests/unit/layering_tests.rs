@@ -75,6 +75,21 @@ const PRICING_TYPES: &[&str] = &[
     "MarkPriceConfig",
 ];
 
+/// Eventing-layer module-import paths a guarded core / shared file must never
+/// use. The hierarchy receives any NATS wiring as an `orderbook_rs`-native
+/// listener factory threaded through the leaf (`book.rs`), never by importing
+/// the crate's `nats` module (issue #102). These needles are *path-scoped*
+/// (`module::`), so `book.rs` — which legitimately defines the `Nats*` listener
+/// types and the factory alias but does not import the `nats` module — is not
+/// tripped, while a stray `use super::nats::…` in `strike.rs` / `chain.rs` /
+/// `expiration.rs` / `underlying.rs` is.
+///
+/// The needles match as **substrings**, so `orderbook::nats` also rejects every
+/// fully-qualified form (`crate::orderbook::nats::…`, `self::orderbook::nats::…`,
+/// `use crate :: orderbook::nats`), and `super::nats` covers the relative form —
+/// there is no qualified import style that bypasses the guard.
+const FORBIDDEN_MODULE_IMPORTS: &[&str] = &["super::nats", "orderbook::nats"];
+
 /// Strips full-line comments (doc comments and `//` comments) from source so the
 /// structural check only inspects actual code. Documentation legitimately
 /// references the pricing modules by name (e.g. to explain the layering), so it
@@ -165,6 +180,17 @@ fn core_hierarchy_does_not_import_pricing_subsystem() {
                 "layering inversion: core-hierarchy / shared-service file `{rel}` \
                  references pricing symbol `{needle}`. The pricing subsystem reads \
                  the hierarchy, not the reverse (see issue #89).",
+            );
+        }
+
+        for needle in FORBIDDEN_MODULE_IMPORTS {
+            assert!(
+                !code.contains(needle),
+                "layering inversion: core-hierarchy / shared-service file `{rel}` \
+                 imports the eventing `nats` module via `{needle}`. NATS wiring must \
+                 reach the hierarchy as an orderbook_rs-native listener factory \
+                 threaded through `book.rs`, never by importing the `nats` module \
+                 (see issue #102).",
             );
         }
     }
