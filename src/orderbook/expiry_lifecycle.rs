@@ -266,9 +266,8 @@ impl ExpiryLifecycleManager {
         let expirations: Vec<(ExpirationDate, Option<InstrumentStatus>)> = underlying
             .expirations()
             .iter()
-            .map(|entry| {
-                let exp = *entry.value().expiration();
-                let status = chain_status(entry.value().chain());
+            .map(|(exp, book)| {
+                let status = chain_status(book.chain());
                 (exp, status)
             })
             .collect();
@@ -1098,12 +1097,13 @@ mod tests {
 
     // ── test_multiple_expirations_different_stages ────────────────────────
 
-    // FIXME: This test is broken due to optionstratlib's ExpirationDate::DateTime
-    // having a buggy Ord implementation that compares only day-of-month, causing
-    // different dates (e.g., 2026-03-15 vs 2026-01-15) to compare as Equal.
-    // See: https://github.com/joaquinbejar/OptionStratLib/issues/XXX
+    // Regression oracle for issue #50. `optionstratlib`'s `ExpirationDate` has a
+    // wall-clock-relative `Ord`/`Eq` that collides distinct `DateTime`
+    // expirations (every past instant collapses to zero days) into a single
+    // `SkipMap` slot. The manager now keys on the internal `ExpirationKey`
+    // (deterministic, absolute), so the three distinct expirations below stay
+    // distinct through their full lifecycle.
     #[test]
-    #[ignore = "blocked by optionstratlib ExpirationDate::DateTime Ord bug"]
     fn test_multiple_expirations_different_stages() {
         let exp_active = fixed_expiration(2026, 6, 15);
         let exp_settling = fixed_expiration(2026, 3, 15);

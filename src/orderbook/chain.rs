@@ -4,6 +4,7 @@
 //! for managing all strikes within a single expiration.
 
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::expiration_key::ExpirationKey;
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
@@ -759,8 +760,14 @@ impl ChainMassCancelResult {
 ///
 /// Uses `SkipMap` for thread-safe concurrent access.
 pub struct OptionChainOrderBookManager {
-    /// Option chains indexed by expiration.
-    chains: SkipMap<ExpirationDate, Arc<OptionChainOrderBook>>,
+    /// Option chains indexed by a deterministic [`ExpirationKey`].
+    ///
+    /// Keyed on [`ExpirationKey`] rather than [`ExpirationDate`] directly
+    /// because the latter's `Ord`/`Eq` is wall-clock-relative and collides
+    /// distinct expirations (see [`ExpirationKey`] docs). Each stored
+    /// [`OptionChainOrderBook`] retains its original [`ExpirationDate`], so the
+    /// public API still hands back `ExpirationDate` values.
+    chains: SkipMap<ExpirationKey, Arc<OptionChainOrderBook>>,
     /// The underlying asset symbol.
     underlying: String,
     /// Validation config applied to newly created chains.
@@ -912,7 +919,8 @@ impl OptionChainOrderBookManager {
     /// If a validation config has been set via [`set_validation`](Self::set_validation),
     /// newly created chains will have that config propagated to their strike manager.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<OptionChainOrderBook> {
-        if let Some(entry) = self.chains.get(&expiration) {
+        let key = ExpirationKey::from(&expiration);
+        if let Some(entry) = self.chains.get(&key) {
             return Arc::clone(entry.value());
         }
         let chain = if let Some(ref reg) = self.registry {
@@ -937,7 +945,7 @@ impl OptionChainOrderBookManager {
         if let Some(schedule) = self.fee_schedule.get() {
             chain.set_fee_schedule(schedule);
         }
-        self.chains.insert(expiration, Arc::clone(&chain));
+        self.chains.insert(key, Arc::clone(&chain));
         chain
     }
 
@@ -948,7 +956,7 @@ impl OptionChainOrderBookManager {
     /// Returns `Error::ExpirationNotFound` if the expiration does not exist.
     pub fn get(&self, expiration: &ExpirationDate) -> Result<Arc<OptionChainOrderBook>> {
         self.chains
-            .get(expiration)
+            .get(&ExpirationKey::from(expiration))
             .map(|e| Arc::clone(e.value()))
             .ok_or_else(|| Error::expiration_not_found(expiration.to_string()))
     }
@@ -956,21 +964,28 @@ impl OptionChainOrderBookManager {
     /// Returns true if an option chain exists for the expiration.
     #[must_use]
     pub fn contains(&self, expiration: &ExpirationDate) -> bool {
-        self.chains.contains_key(expiration)
+        self.chains.contains_key(&ExpirationKey::from(expiration))
     }
 
-    /// Returns an iterator over all chains.
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<
-        Item = crossbeam_skiplist::map::Entry<'_, ExpirationDate, Arc<OptionChainOrderBook>>,
-    > {
-        self.chains.iter()
+    /// Returns an iterator over all chains, ordered by expiration.
+    ///
+    /// Yields `(ExpirationDate, Arc<OptionChainOrderBook>)` tuples in ascending
+    /// order. Ordering is driven by an internal deterministic expiration key
+    /// (clock-independent and collision-free, unlike `ExpirationDate`'s own
+    /// `Ord`), so the traversal order is stable and replay-safe. The
+    /// `ExpirationDate` is the original value stored in each chain; the internal
+    /// key is never exposed.
+    pub fn iter(&self) -> impl Iterator<Item = (ExpirationDate, Arc<OptionChainOrderBook>)> + '_ {
+        self.chains
+            .iter()
+            .map(|e| (*e.value().expiration(), Arc::clone(e.value())))
     }
 
     /// Removes an option chain.
     pub fn remove(&self, expiration: &ExpirationDate) -> bool {
-        self.chains.remove(expiration).is_some()
+        self.chains
+            .remove(&ExpirationKey::from(expiration))
+            .is_some()
     }
 
     /// Returns the total order count across all chains.
@@ -1083,6 +1098,66 @@ mod tests {
         drop(manager.get_or_create(ExpirationDate::Days(pos_or_panic!(90.0))));
 
         assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_option_chain_manager_get_or_create_returns_same_handle() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        let exp = test_expiration();
+
+        let first = manager.get_or_create(exp);
+        let second = manager.get_or_create(exp);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_option_chain_manager_same_day_of_month_distinct_months_both_retrievable() {
+        use chrono::{TimeZone, Utc};
+
+        // Regression for issue #50: two `DateTime` expirations sharing a
+        // day-of-month across different months must not collide into one
+        // `SkipMap` slot.
+        let jan = match Utc.with_ymd_and_hms(2026, 1, 15, 8, 0, 0) {
+            chrono::offset::LocalResult::Single(dt) => ExpirationDate::DateTime(dt),
+            _ => panic!("invalid jan fixture"),
+        };
+        let feb = match Utc.with_ymd_and_hms(2026, 2, 15, 8, 0, 0) {
+            chrono::offset::LocalResult::Single(dt) => ExpirationDate::DateTime(dt),
+            _ => panic!("invalid feb fixture"),
+        };
+
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        let jan_chain = manager.get_or_create(jan);
+        jan_chain.get_or_create_strike(50000);
+
+        let feb_chain = manager.get_or_create(feb);
+        feb_chain.get_or_create_strike(50000);
+        feb_chain.get_or_create_strike(51000);
+
+        assert_eq!(manager.len(), 2);
+        assert!(manager.contains(&jan));
+        assert!(manager.contains(&feb));
+
+        let jan_got = match manager.get(&jan) {
+            Ok(chain) => chain,
+            Err(err) => panic!("jan not found: {}", err),
+        };
+        let feb_got = match manager.get(&feb) {
+            Ok(chain) => chain,
+            Err(err) => panic!("feb not found: {}", err),
+        };
+        assert_eq!(jan_got.strike_count(), 1);
+        assert_eq!(feb_got.strike_count(), 2);
+        assert_eq!(*jan_got.expiration(), jan);
+        assert_eq!(*feb_got.expiration(), feb);
+
+        assert!(manager.remove(&jan));
+        assert_eq!(manager.len(), 1);
+        assert!(!manager.contains(&jan));
+        assert!(manager.contains(&feb));
     }
 
     #[test]

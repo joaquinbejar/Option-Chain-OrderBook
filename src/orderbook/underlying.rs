@@ -588,9 +588,9 @@ impl UnderlyingOrderBook {
     pub fn cancel_all(&self) -> Result<UnderlyingMassCancelResult> {
         let mut per_child = Vec::new();
 
-        for entry in self.expirations.iter() {
-            let expiration_key = entry.key().to_string();
-            let result = entry.value().cancel_all()?;
+        for (expiration, book) in self.expirations.iter() {
+            let expiration_key = expiration.to_string();
+            let result = book.cancel_all()?;
             per_child.push((expiration_key, result));
         }
 
@@ -633,9 +633,9 @@ impl UnderlyingOrderBook {
     pub fn cancel_by_side(&self, side: Side) -> Result<UnderlyingMassCancelResult> {
         let mut per_child = Vec::new();
 
-        for entry in self.expirations.iter() {
-            let expiration_key = entry.key().to_string();
-            let result = entry.value().cancel_by_side(side)?;
+        for (expiration, book) in self.expirations.iter() {
+            let expiration_key = expiration.to_string();
+            let result = book.cancel_by_side(side)?;
             per_child.push((expiration_key, result));
         }
 
@@ -680,9 +680,9 @@ impl UnderlyingOrderBook {
     pub fn cancel_by_user(&self, user_id: Hash32) -> Result<UnderlyingMassCancelResult> {
         let mut per_child = Vec::new();
 
-        for entry in self.expirations.iter() {
-            let expiration_key = entry.key().to_string();
-            let result = entry.value().cancel_by_user(user_id)?;
+        for (expiration, book) in self.expirations.iter() {
+            let expiration_key = expiration.to_string();
+            let result = book.cancel_by_user(user_id)?;
             per_child.push((expiration_key, result));
         }
 
@@ -711,8 +711,8 @@ impl UnderlyingOrderBook {
     /// None.
     #[must_use]
     pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
-        for entry in self.expirations.iter() {
-            if let Some(result) = entry.value().find_order(order_id) {
+        for (_, book) in self.expirations.iter() {
+            if let Some(result) = book.find_order(order_id) {
                 return Some(result);
             }
         }
@@ -740,7 +740,7 @@ impl UnderlyingOrderBook {
     pub fn total_active_orders(&self) -> usize {
         self.expirations
             .iter()
-            .map(|entry| entry.value().total_active_orders())
+            .map(|(_, book)| book.total_active_orders())
             .sum()
     }
 
@@ -764,7 +764,7 @@ impl UnderlyingOrderBook {
     pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
         self.expirations
             .iter()
-            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .map(|(_, book)| book.purge_terminal_states(older_than))
             .sum()
     }
 
@@ -790,7 +790,7 @@ impl UnderlyingOrderBook {
     pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
         self.expirations
             .iter()
-            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .flat_map(|(_, book)| book.orders_by_user(user_id))
             .collect()
     }
 
@@ -816,7 +816,7 @@ impl UnderlyingOrderBook {
     pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
         self.expirations
             .iter()
-            .map(|entry| entry.value().terminal_order_summary())
+            .map(|(_, book)| book.terminal_order_summary())
             .sum()
     }
 
@@ -858,8 +858,8 @@ impl UnderlyingOrderBook {
         config: &super::nats::OptionChainNatsConfig,
     ) -> crate::Result<usize> {
         let mut total_connected = 0usize;
-        for entry in self.expirations.iter() {
-            let connected = entry.value().connect_nats(config)?;
+        for (_, book) in self.expirations.iter() {
+            let connected = book.connect_nats(config)?;
             total_connected = total_connected.saturating_add(connected);
         }
         Ok(total_connected)
