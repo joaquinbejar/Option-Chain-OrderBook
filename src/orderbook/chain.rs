@@ -918,12 +918,27 @@ impl OptionChainOrderBookManager {
     ///
     /// If a validation config has been set via [`set_validation`](Self::set_validation),
     /// newly created chains will have that config propagated to their strike manager.
+    ///
+    /// # Concurrency
+    ///
+    /// This is atomic and idempotent. The fresh chain is fully configured before
+    /// it is published, and publishing uses [`SkipMap::get_or_insert`], which
+    /// inserts only when the key is absent and never evicts an existing entry.
+    /// The first inserter wins and is never orphaned; concurrent losers receive
+    /// the winning handle and drop their fresh chain. Building and configuring a
+    /// chain has no global side effects (instrument IDs and symbol-index entries
+    /// are only allocated lazily at strike creation), so a dropped loser leaks
+    /// nothing.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<OptionChainOrderBook> {
         let key = ExpirationKey::from(&expiration);
         if let Some(entry) = self.chains.get(&key) {
             return Arc::clone(entry.value());
         }
-        let chain = if let Some(ref reg) = self.registry {
+        // Build and fully configure the fresh chain BEFORE publishing it, so the
+        // winning chain is configured-before-visible. Configuration only mutates
+        // the fresh object (no global side effects), so a race loser's chain is
+        // dropped harmlessly.
+        let fresh = if let Some(ref reg) = self.registry {
             Arc::new(OptionChainOrderBook::new_with_registry(
                 &self.underlying,
                 expiration,
@@ -933,20 +948,21 @@ impl OptionChainOrderBookManager {
             Arc::new(OptionChainOrderBook::new(&self.underlying, expiration))
         };
         if let Some(ref config) = self.validation_config.get() {
-            chain.set_validation(config.clone());
+            fresh.set_validation(config.clone());
         }
         if let Some(ref specs) = self.contract_specs.get() {
-            chain.set_specs(specs.clone());
+            fresh.set_specs(specs.clone());
         }
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
-            chain.set_stp_mode(stp);
+            fresh.set_stp_mode(stp);
         }
         if let Some(schedule) = self.fee_schedule.get() {
-            chain.set_fee_schedule(schedule);
+            fresh.set_fee_schedule(schedule);
         }
-        self.chains.insert(key, Arc::clone(&chain));
-        chain
+        // Atomic, idempotent publish: first inserter wins and is never evicted.
+        let entry = self.chains.get_or_insert(key, fresh);
+        Arc::clone(entry.value())
     }
 
     /// Gets an option chain by expiration.
@@ -1109,6 +1125,42 @@ mod tests {
         let second = manager.get_or_create(exp);
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_option_chain_manager_get_or_create_concurrent_returns_same_handle() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Race N threads to create the SAME chain via a barrier for lockstep.
+        // With `get_or_insert` the first inserter wins and is never evicted, so
+        // every thread must observe one identical handle and the map must hold
+        // exactly one entry (no orphan, no split-brain).
+        const N: usize = 16;
+        let manager = Arc::new(OptionChainOrderBookManager::new("BTC"));
+        let barrier = Arc::new(Barrier::new(N));
+        let exp = test_expiration();
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                manager.get_or_create(exp)
+            }));
+        }
+
+        let chains: Vec<Arc<OptionChainOrderBook>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        let first = chains.first().expect("no chains returned");
+        for chain in &chains {
+            assert!(Arc::ptr_eq(first, chain));
+        }
         assert_eq!(manager.len(), 1);
     }
 

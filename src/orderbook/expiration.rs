@@ -743,12 +743,27 @@ impl ExpirationOrderBookManager {
     ///
     /// If a validation config has been set via [`set_validation`](Self::set_validation),
     /// newly created expiration books will have that config propagated to their chain.
+    ///
+    /// # Concurrency
+    ///
+    /// This is atomic and idempotent. The fresh expiration book is fully
+    /// configured before it is published, and publishing uses
+    /// [`SkipMap::get_or_insert`], which inserts only when the key is absent and
+    /// never evicts an existing entry. The first inserter wins and is never
+    /// orphaned; concurrent losers receive the winning handle and drop their
+    /// fresh book. Building and configuring the book has no global side effects
+    /// (instrument IDs and symbol-index entries are only allocated lazily at
+    /// strike creation), so a dropped loser leaks nothing.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<ExpirationOrderBook> {
         let key = ExpirationKey::from(&expiration);
         if let Some(entry) = self.expirations.get(&key) {
             return Arc::clone(entry.value());
         }
-        let book = match (&self.registry, &self.symbol_index) {
+        // Build and fully configure the fresh book BEFORE publishing it, so the
+        // winning book is configured-before-visible. Configuration only mutates
+        // the fresh object (no global side effects), so a race loser's book is
+        // dropped harmlessly.
+        let fresh = match (&self.registry, &self.symbol_index) {
             (Some(reg), Some(idx)) => Arc::new(ExpirationOrderBook::new_with_registry_and_index(
                 &self.underlying,
                 expiration,
@@ -763,20 +778,21 @@ impl ExpirationOrderBookManager {
             _ => Arc::new(ExpirationOrderBook::new(&self.underlying, expiration)),
         };
         if let Some(ref config) = self.validation_config.get() {
-            book.set_validation(config.clone());
+            fresh.set_validation(config.clone());
         }
         if let Some(ref specs) = self.contract_specs.get() {
-            book.chain().set_specs(specs.clone());
+            fresh.chain().set_specs(specs.clone());
         }
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
-            book.set_stp_mode(stp);
+            fresh.set_stp_mode(stp);
         }
         if let Some(schedule) = self.fee_schedule.get() {
-            book.set_fee_schedule(schedule);
+            fresh.set_fee_schedule(schedule);
         }
-        self.expirations.insert(key, Arc::clone(&book));
-        book
+        // Atomic, idempotent publish: first inserter wins and is never evicted.
+        let entry = self.expirations.get_or_insert(key, fresh);
+        Arc::clone(entry.value())
     }
 
     /// Gets an expiration order book.
@@ -1148,6 +1164,42 @@ mod tests {
         let second = manager.get_or_create(exp);
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_expiration_manager_get_or_create_concurrent_returns_same_handle() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Race N threads to create the SAME expiration via a barrier for
+        // lockstep. With `get_or_insert` the first inserter wins and is never
+        // evicted, so every thread must observe one identical handle and the
+        // map must hold exactly one entry (no orphan, no split-brain).
+        const N: usize = 16;
+        let manager = Arc::new(ExpirationOrderBookManager::new("BTC"));
+        let barrier = Arc::new(Barrier::new(N));
+        let exp = test_expiration();
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                manager.get_or_create(exp)
+            }));
+        }
+
+        let books: Vec<Arc<ExpirationOrderBook>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        let first = books.first().expect("no books returned");
+        for book in &books {
+            assert!(Arc::ptr_eq(first, book));
+        }
         assert_eq!(manager.len(), 1);
     }
 
