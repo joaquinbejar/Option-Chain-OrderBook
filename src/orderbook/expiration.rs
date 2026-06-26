@@ -802,7 +802,8 @@ impl ExpirationOrderBookManager {
     /// Identical guarantees to [`get_or_create`](Self::get_or_create): atomic,
     /// idempotent, lock-free. The winner is detected via
     /// [`Arc::ptr_eq`] against the locally built handle, so the `inserted` flag
-    /// is derived purely from the atomic insert result with no extra map probe.
+    /// is derived purely from the atomic insert result — no follow-up map probe
+    /// after `get_or_insert` (the up-front `get` fast-path still applies).
     #[must_use]
     pub fn get_or_create_inserted(
         &self,
