@@ -277,6 +277,20 @@ impl GreeksEngine {
     /// # Returns
     ///
     /// Calculated Greeks or an error if calculation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GreeksError`] when an input fails validation or the
+    /// underlying `optionstratlib` calculation fails. Specifically:
+    ///
+    /// - `spot`, `strike`, `tte_years`, or `iv` is non-positive (`<= 0.0`);
+    /// - `risk_free_rate` is non-finite (`NaN` or `±∞`) — a negative rate is
+    ///   permitted to support negative-rate regimes;
+    /// - `dividend_yield` is non-finite or negative (a true `0.0` is valid);
+    /// - any validated value cannot be converted to a `Positive` or to a
+    ///   `Decimal` risk-free rate; or
+    /// - any individual Greek (delta, gamma, theta, vega, rho, vanna, vomma,
+    ///   veta, charm, color) fails to compute in `optionstratlib`.
     pub fn calculate_greeks(
         spot: f64,
         strike: f64,
@@ -420,6 +434,17 @@ impl GreeksEngine {
     /// # Returns
     ///
     /// Tuple of (call_greeks, put_greeks) or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GreeksError`] if either the call or the put leg fails
+    /// to compute. Each leg delegates to [`calculate_greeks`](Self::calculate_greeks),
+    /// so the same input-validation conditions apply: non-positive `spot`,
+    /// `strike`, `tte_years`, `call_iv`, or `put_iv`; non-finite `risk_free_rate`;
+    /// non-finite or negative `dividend_yield`; a failed `Positive`/`Decimal`
+    /// conversion; or a failure inside an individual `optionstratlib` Greek.
+    /// The call leg is evaluated first, so its error short-circuits before the
+    /// put leg is computed.
     pub fn calculate_strike_greeks(
         spot: f64,
         strike: f64,
