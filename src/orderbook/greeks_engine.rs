@@ -37,7 +37,6 @@ use optionstratlib::model::types::{OptionStyle, OptionType, Side};
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, Options};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -293,14 +292,32 @@ impl GreeksEngine {
                 "Invalid input: spot, strike, tte, and iv must be positive",
             ));
         }
+        // The risk-free rate may legitimately be negative (negative-rate
+        // regimes); only a non-finite value is invalid.
+        if !risk_free_rate.is_finite() {
+            return Err(Error::greeks(
+                "Invalid input: risk_free_rate must be finite",
+            ));
+        }
+        // A true 0.0 dividend yield is the normal case for crypto options and
+        // must be priced as 0.0 — only NaN/Inf or a negative value is invalid.
+        if !dividend_yield.is_finite() || dividend_yield < 0.0 {
+            return Err(Error::greeks(
+                "Invalid input: dividend_yield must be finite and non-negative",
+            ));
+        }
 
         // Create Positive values, handling potential failures
         let spot_pos = Positive::new(spot).map_err(|_| Error::greeks("Invalid spot price"))?;
         let strike_pos =
             Positive::new(strike).map_err(|_| Error::greeks("Invalid strike price"))?;
         let iv_pos = Positive::new(iv).map_err(|_| Error::greeks("Invalid implied volatility"))?;
-        let div_yield = Positive::new(dividend_yield.max(0.0001))
-            .map_err(|_| Error::greeks("Invalid dividend yield"))?;
+        // No clamp: a 0.0 dividend yield is valid (Positive::new(0.0) succeeds —
+        // the `positive` crate's non-zero feature is not enabled). Clamping to
+        // 0.0001 would inject a systematic bias into every Greek for the common
+        // crypto-options case of a true zero dividend.
+        let div_yield =
+            Positive::new(dividend_yield).map_err(|_| Error::greeks("Invalid dividend yield"))?;
         let tte_pos =
             Positive::new(tte_years).map_err(|_| Error::greeks("Invalid time to expiry"))?;
 
@@ -318,8 +335,11 @@ impl GreeksEngine {
             implied_volatility: iv_pos,
             quantity: Positive::ONE,
             underlying_price: spot_pos,
-            // Graceful fallback: use 5% if the f64 → Decimal conversion fails.
-            risk_free_rate: Decimal::try_from(risk_free_rate).unwrap_or(dec!(0.05)),
+            // The rate is already guaranteed finite above; surface any
+            // remaining conversion failure as a typed error rather than
+            // silently returning plausible-but-wrong 5% risk numbers.
+            risk_free_rate: Decimal::try_from(risk_free_rate)
+                .map_err(|_| Error::greeks("Invalid risk-free rate"))?,
             option_style: style,
             dividend_yield: div_yield,
             exotic_params: None,
@@ -570,6 +590,7 @@ pub fn calculate_tte_years(expiration: &optionstratlib::ExpirationDate) -> f64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -692,6 +713,54 @@ mod tests {
             "Delta was {}",
             delta_f64
         );
+    }
+
+    #[test]
+    fn test_calculate_greeks_zero_dividend_accepted() {
+        // A true 0.0 dividend yield is the normal crypto-options case and must
+        // be priced as 0.0 (no clamp to 0.0001 injecting bias).
+        let result =
+            GreeksEngine::calculate_greeks(100.0, 100.0, 0.25, 0.05, 0.20, OptionStyle::Call, 0.0);
+        assert!(
+            result.is_ok(),
+            "0.0 dividend must be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_calculate_greeks_nonfinite_rate_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = GreeksEngine::calculate_greeks(
+                100.0,
+                100.0,
+                0.25,
+                bad,
+                0.20,
+                OptionStyle::Call,
+                0.01,
+            );
+            assert!(result.is_err(), "non-finite rate {bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_calculate_greeks_invalid_dividend_rejected() {
+        for bad in [-0.01, f64::NAN, f64::INFINITY] {
+            let result = GreeksEngine::calculate_greeks(
+                100.0,
+                100.0,
+                0.25,
+                0.05,
+                0.20,
+                OptionStyle::Call,
+                bad,
+            );
+            assert!(
+                result.is_err(),
+                "negative/non-finite dividend {bad} must be rejected"
+            );
+        }
     }
 
     #[test]
