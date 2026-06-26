@@ -195,7 +195,10 @@ impl StrikeGenerator {
             let end = (start + max_strikes).min(strikes.len());
             let start = end.saturating_sub(max_strikes);
 
-            strikes = strikes[start..end].to_vec();
+            strikes = strikes
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .unwrap_or_default();
         }
 
         // Expand symmetrically if below min_strikes
@@ -356,6 +359,7 @@ impl StrikeGenerator {
     /// - `spot` is zero
     /// - `buffer_multiplier` is not finite or less than 1.0
     /// - `config` validation fails
+    /// - computing the keep-range overflows `u64` (`spot * range_pct_bps * buffer_bps`)
     ///
     /// # Examples
     ///
@@ -409,11 +413,14 @@ impl StrikeGenerator {
         let range_pct_bps = f64_to_u64_bps(range_pct, "range_pct")?;
         let buffer_bps = f64_to_u64_bps(buffer_multiplier, "buffer_multiplier")?;
 
-        // Compute: spot * range_pct_bps * buffer_bps / 10000 / 10000
-        // To avoid overflow, divide in stages
+        // Compute: spot * range_pct_bps * buffer_bps / 10000 / 10000.
+        // Mirror generate_strikes: surface overflow as a typed error rather than
+        // saturating to a huge wrong keep-range (which would feed a silently-wrong
+        // CleanupResult into the sequencer / NATS).
         let range = spot
-            .saturating_mul(range_pct_bps)
-            .saturating_mul(buffer_bps)
+            .checked_mul(range_pct_bps)
+            .and_then(|v| v.checked_mul(buffer_bps))
+            .ok_or_else(|| Error::configuration("overflow computing cleanup range"))?
             / 10000
             / 10000;
 
@@ -971,6 +978,22 @@ mod tests {
         let result = StrikeGenerator::cleanup_empty_strikes(&chain, 0, &config, 1.5);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("positive"));
+    }
+
+    #[test]
+    fn test_cleanup_range_overflow_returns_error() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        // A spot near u64::MAX overflows spot * range_pct_bps * buffer_bps; the
+        // keep-range must surface a typed configuration error, not saturate to a
+        // huge wrong value that feeds a silently-wrong CleanupResult.
+        let result = StrikeGenerator::cleanup_empty_strikes(&chain, u64::MAX, &config, 1.5);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("overflow"),
+            "expected an overflow error"
+        );
     }
 
     #[test]
