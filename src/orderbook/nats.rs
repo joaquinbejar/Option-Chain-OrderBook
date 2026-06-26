@@ -19,7 +19,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! option-chain-orderbook = { version = "0.4", features = ["nats"] }
+//! option-chain-orderbook = { version = "0.7", features = ["nats"] }
 //! ```
 //!
 //! # Example
@@ -35,7 +35,8 @@
 //! let jetstream = async_nats::jetstream::new(client);
 //! let handle = tokio::runtime::Handle::current();
 //!
-//! let config = OptionChainNatsConfig::new(jetstream, "optionchain".to_string(), handle);
+//! // `try_new` rejects an empty prefix or one carrying a NATS wildcard.
+//! let config = OptionChainNatsConfig::try_new(jetstream, "optionchain", handle)?;
 //! // Build a contract order book with trade + book-change publishers attached
 //! // *before* the inner book is wrapped in `Arc` (the only valid install point).
 //! let (book, handles) =
@@ -52,6 +53,77 @@ use crate::utils::SymbolParser;
 use optionstratlib::OptionStyle;
 use orderbook_rs::prelude::{NatsBookChangePublisher, NatsTradePublisher};
 use std::sync::Arc;
+
+/// Reserved NATS subject characters that must never appear inside a single
+/// subject token: the level separator `.`, the single-token wildcard `*`, and
+/// the multi-token wildcard `>`. Allowing any of them inside a token would
+/// inject an extra subject level or a wildcard and silently break the
+/// level-scoped subscriptions the subject scheme is designed for.
+const RESERVED_SUBJECT_CHARS: [char; 3] = ['.', '*', '>'];
+
+/// Validates a single NATS subject token (one path component).
+///
+/// Rejects an empty token or one containing a [reserved subject
+/// character](RESERVED_SUBJECT_CHARS). This is the shared validation primitive
+/// behind [`OptionChainSubjectBuilder::from_symbol`],
+/// [`OptionChainSubjectBuilder::try_new`], and the prefix validation in
+/// [`OptionChainNatsConfig::try_new`], so every construction path enforces the
+/// exact same rule.
+///
+/// # Errors
+///
+/// Returns [`Error::NatsSubject`] naming `field` if `value` is empty or carries
+/// a reserved subject character.
+fn validate_subject_token(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::nats_subject(field, "must not be empty"));
+    }
+    if let Some(bad) = value.chars().find(|c| RESERVED_SUBJECT_CHARS.contains(c)) {
+        return Err(Error::nats_subject(
+            field,
+            format!("must not contain reserved NATS character '{bad}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a NATS subject prefix.
+///
+/// A prefix may itself span multiple dot-separated tokens (e.g.
+/// `"exchange.optionchain"`), so it is validated token-by-token: each token
+/// must be non-empty — rejecting an empty prefix and any leading, trailing, or
+/// doubled `.` — and free of the `*`/`>` wildcards.
+///
+/// # Errors
+///
+/// Returns [`Error::NatsSubject`] if the prefix is empty, has an empty token
+/// (leading/trailing/doubled `.`), or carries a `*`/`>` wildcard.
+fn validate_subject_prefix(prefix: &str) -> Result<(), Error> {
+    for token in prefix.split('.') {
+        validate_subject_token("prefix", token)?;
+    }
+    Ok(())
+}
+
+/// Normalizes a case-insensitive option-type string into an [`OptionStyle`].
+///
+/// Accepts `"C"`/`"c"`/`"Call"` (any case) as a call and `"P"`/`"p"`/`"Put"`
+/// (any case) as a put, so the derived subject token is always the canonical
+/// `C`/`P` regardless of how the caller spelled it.
+///
+/// # Errors
+///
+/// Returns [`Error::NatsSubject`] if `value` is not a recognized option type.
+fn parse_option_style(value: &str) -> Result<OptionStyle, Error> {
+    match value.to_ascii_lowercase().as_str() {
+        "c" | "call" => Ok(OptionStyle::Call),
+        "p" | "put" => Ok(OptionStyle::Put),
+        _ => Err(Error::nats_subject(
+            "option_type",
+            format!("expected one of C/Call/P/Put (case-insensitive), got '{value}'"),
+        )),
+    }
+}
 
 /// Configuration for connecting NATS publishers to the option chain hierarchy.
 ///
@@ -84,25 +156,33 @@ pub struct OptionChainNatsConfig {
 }
 
 impl OptionChainNatsConfig {
-    /// Creates a new NATS configuration for option chain event publishing.
+    /// Creates a new NATS configuration for option chain event publishing,
+    /// validating the subject prefix.
     ///
     /// # Arguments
     ///
     /// * `jetstream` - JetStream context obtained from an `async_nats` client
     /// * `subject_prefix` - prefix for all NATS subjects (e.g., `"optionchain"`)
     /// * `runtime` - handle to the Tokio runtime for spawning publish tasks
-    #[inline]
-    #[must_use]
-    pub fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NatsSubject`] if `subject_prefix` is empty, has an empty
+    /// token (a leading, trailing, or doubled `.`), or carries a `*`/`>`
+    /// wildcard — any of which would corrupt the subject scheme or inject a
+    /// wildcard into published subjects.
+    pub fn try_new(
         jetstream: async_nats::jetstream::Context,
-        subject_prefix: String,
+        subject_prefix: impl Into<String>,
         runtime: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let subject_prefix = subject_prefix.into();
+        validate_subject_prefix(&subject_prefix)?;
+        Ok(Self {
             jetstream,
             subject_prefix,
             runtime,
-        }
+        })
     }
 
     /// Returns a reference to the JetStream context.
@@ -152,8 +232,8 @@ pub struct OptionChainSubjectBuilder {
     expiry: String,
     /// Strike price as string (e.g., `"50000"`).
     strike: String,
-    /// Option type: `"C"` for call, `"P"` for put.
-    option_type: String,
+    /// Option style; the subject token is always derived as `C`/`P`.
+    option_type: OptionStyle,
 }
 
 impl OptionChainSubjectBuilder {
@@ -167,8 +247,10 @@ impl OptionChainSubjectBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the symbol does not match the expected format, or if
-    /// the (already grammar-valid) underlying contains a NATS subject-reserved
+    /// Returns [`Error::InvalidSymbol`](crate::error::Error::InvalidSymbol) if
+    /// the symbol does not match the expected grammar, or
+    /// [`Error::NatsSubject`](crate::error::Error::NatsSubject) if the
+    /// (already grammar-valid) underlying carries a reserved NATS subject
     /// character (`.`, `*`, `>`).
     ///
     /// # Example
@@ -186,60 +268,62 @@ impl OptionChainSubjectBuilder {
         // The `{underlying}-{expiry}-{strike}-{type}` grammar is owned by
         // `SymbolParser` (the single source of truth): 4 parts, an 8-digit
         // canonical date, a positive integer strike and a case-insensitive
-        // `C`/`P` type. NATS adds only subject-character escaping on top.
+        // `C`/`P` type. NATS adds only subject-character escaping on top, via
+        // the same `try_new` path so both constructors validate identically.
         let parsed = SymbolParser::parse(symbol)?;
-
-        // The underlying is the only free-form segment that can carry a NATS
-        // subject-reserved character; the expiry (digits) and strike (digits)
-        // are already constrained by `SymbolParser`.
-        let underlying = parsed.underlying();
-        if underlying.contains('.') || underlying.contains('*') || underlying.contains('>') {
-            return Err(Error::invalid_symbol(
-                symbol,
-                "underlying contains invalid NATS characters",
-            ));
-        }
-
-        let option_type = match parsed.option_style() {
-            OptionStyle::Call => "C",
-            OptionStyle::Put => "P",
-        };
-
-        Ok(Self {
-            underlying: underlying.to_string(),
-            expiry: parsed.expiration_str().to_string(),
-            strike: parsed.strike().to_string(),
-            option_type: option_type.to_string(),
-        })
+        Self::try_new(
+            parsed.underlying(),
+            parsed.expiration_str(),
+            parsed.strike().to_string(),
+            match parsed.option_style() {
+                OptionStyle::Call => "C",
+                OptionStyle::Put => "P",
+            },
+        )
     }
 
-    /// Creates a subject builder from explicit components.
+    /// Creates a subject builder from explicit components, validating each one.
+    ///
+    /// Every component is checked against the NATS subject grammar so no
+    /// construction path can inject an extra subject level or a wildcard. The
+    /// `option_type` is normalized case-insensitively into an [`OptionStyle`]
+    /// (identically to [`from_symbol`](Self::from_symbol)), so the emitted
+    /// subject token is always the canonical `C`/`P`.
     ///
     /// # Arguments
     ///
-    /// * `underlying` - Underlying asset symbol
+    /// * `underlying` - Underlying asset symbol (e.g. `"BTC"`)
     /// * `expiry` - Expiration date (YYYYMMDD format)
     /// * `strike` - Strike price
-    /// * `option_type` - `"C"` for call, `"P"` for put
-    #[must_use]
-    pub fn new(
+    /// * `option_type` - `C`/`Call` or `P`/`Put` (case-insensitive)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NatsSubject`](crate::error::Error::NatsSubject) if any
+    /// of `underlying`, `expiry`, or `strike` is empty or carries a reserved
+    /// NATS subject character (`.`, `*`, `>`), or if `option_type` is not a
+    /// recognized `C`/`Call`/`P`/`Put` value.
+    pub fn try_new(
         underlying: impl Into<String>,
         expiry: impl Into<String>,
         strike: impl Into<String>,
-        option_type: impl Into<String>,
-    ) -> Self {
-        let mut option_type_str = option_type.into();
-        // Normalize single-character option types to uppercase for consistency
-        if option_type_str.len() == 1 {
-            option_type_str.make_ascii_uppercase();
-        }
+        option_type: impl AsRef<str>,
+    ) -> Result<Self, Error> {
+        let underlying = underlying.into();
+        let expiry = expiry.into();
+        let strike = strike.into();
 
-        Self {
-            underlying: underlying.into(),
-            expiry: expiry.into(),
-            strike: strike.into(),
-            option_type: option_type_str,
-        }
+        validate_subject_token("underlying", &underlying)?;
+        validate_subject_token("expiry", &expiry)?;
+        validate_subject_token("strike", &strike)?;
+        let option_type = parse_option_style(option_type.as_ref())?;
+
+        Ok(Self {
+            underlying,
+            expiry,
+            strike,
+            option_type,
+        })
     }
 
     /// Returns the underlying asset symbol.
@@ -263,11 +347,21 @@ impl OptionChainSubjectBuilder {
         &self.strike
     }
 
-    /// Returns the option type (`"C"` or `"P"`).
+    /// Returns the option subject token (`"C"` for a call, `"P"` for a put).
     #[must_use]
     #[inline]
-    pub fn option_type(&self) -> &str {
-        &self.option_type
+    pub fn option_type(&self) -> &'static str {
+        match self.option_type {
+            OptionStyle::Call => "C",
+            OptionStyle::Put => "P",
+        }
+    }
+
+    /// Returns the option style (`OptionStyle::Call` or `OptionStyle::Put`).
+    #[must_use]
+    #[inline]
+    pub const fn option_style(&self) -> OptionStyle {
+        self.option_type
     }
 
     /// Builds a trade event subject.
@@ -277,7 +371,11 @@ impl OptionChainSubjectBuilder {
     pub fn trade_subject(&self, prefix: &str) -> String {
         format!(
             "{}.trades.{}.{}.{}.{}",
-            prefix, self.underlying, self.expiry, self.strike, self.option_type
+            prefix,
+            self.underlying,
+            self.expiry,
+            self.strike,
+            self.option_type()
         )
     }
 
@@ -288,7 +386,11 @@ impl OptionChainSubjectBuilder {
     pub fn book_subject(&self, prefix: &str) -> String {
         format!(
             "{}.book.{}.{}.{}.{}",
-            prefix, self.underlying, self.expiry, self.strike, self.option_type
+            prefix,
+            self.underlying,
+            self.expiry,
+            self.strike,
+            self.option_type()
         )
     }
 
@@ -401,7 +503,8 @@ impl std::fmt::Debug for NatsPublisherHandles {
 ///
 /// Returns [`Error::InvalidSymbol`](crate::error::Error::InvalidSymbol) if the
 /// symbol cannot be parsed into its `{underlying}-{expiry}-{strike}-{type}`
-/// components or carries a NATS subject-reserved character.
+/// components, or [`Error::NatsSubject`](crate::error::Error::NatsSubject) if a
+/// (grammar-valid) component carries a reserved NATS subject character.
 #[must_use = "the returned order book and publisher handles must be retained; \
               dropping them tears the publishers down"]
 pub fn build_option_order_book_with_nats(
@@ -543,7 +646,8 @@ mod tests {
 
     #[test]
     fn test_subjects_tuple() {
-        let builder = OptionChainSubjectBuilder::new("BTC", "20240329", "50000", "C");
+        let builder = OptionChainSubjectBuilder::try_new("BTC", "20240329", "50000", "C")
+            .expect("valid components");
         let (trade, book) = builder.subjects("oc");
         assert_eq!(trade, "oc.trades.BTC.20240329.50000.C");
         assert_eq!(book, "oc.book.BTC.20240329.50000.C");
@@ -580,4 +684,140 @@ mod tests {
         let result = OptionChainSubjectBuilder::from_symbol("BTC-2024>329-50000-C");
         assert!(result.is_err());
     }
+
+    // ── try_new component validation ─────────────────────────────────────
+
+    #[test]
+    fn test_subject_builder_try_new_dot_in_underlying_rejected() {
+        let result = OptionChainSubjectBuilder::try_new("BT.C", "20240329", "50000", "C");
+        assert!(matches!(result, Err(Error::NatsSubject { .. })));
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_wildcard_star_in_strike_rejected() {
+        let result = OptionChainSubjectBuilder::try_new("BTC", "20240329", "500*0", "C");
+        assert!(matches!(result, Err(Error::NatsSubject { .. })));
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_greater_than_in_expiry_rejected() {
+        let result = OptionChainSubjectBuilder::try_new("BTC", "2024>329", "50000", "C");
+        assert!(matches!(result, Err(Error::NatsSubject { .. })));
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_empty_underlying_rejected() {
+        let result = OptionChainSubjectBuilder::try_new("", "20240329", "50000", "C");
+        assert!(matches!(result, Err(Error::NatsSubject { .. })));
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_invalid_option_type_rejected() {
+        let result = OptionChainSubjectBuilder::try_new("BTC", "20240329", "50000", "X");
+        assert!(matches!(result, Err(Error::NatsSubject { .. })));
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_option_type_variants_serialize_to_token() {
+        for (input, expected) in [
+            ("Call", "C"),
+            ("c", "C"),
+            ("C", "C"),
+            ("P", "P"),
+            ("put", "P"),
+            ("Put", "P"),
+        ] {
+            let builder = OptionChainSubjectBuilder::try_new("BTC", "20240329", "50000", input)
+                .expect("valid option type");
+            assert_eq!(
+                builder.option_type(),
+                expected,
+                "option_type input {input:?} must serialize to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_valid_builds_documented_subject() {
+        let builder = OptionChainSubjectBuilder::try_new("BTC", "20240329", "50000", "call")
+            .expect("valid components");
+        assert_eq!(
+            builder.trade_subject("optionchain"),
+            "optionchain.trades.BTC.20240329.50000.C"
+        );
+        assert_eq!(
+            builder.book_subject("optionchain"),
+            "optionchain.book.BTC.20240329.50000.C"
+        );
+    }
+
+    #[test]
+    fn test_subject_builder_try_new_matches_from_symbol() {
+        let from_symbol =
+            OptionChainSubjectBuilder::from_symbol("ETH-20240628-3000-P").expect("from_symbol");
+        let try_new =
+            OptionChainSubjectBuilder::try_new("ETH", "20240628", "3000", "p").expect("try_new");
+        assert_eq!(from_symbol.trade_subject("oc"), try_new.trade_subject("oc"));
+        assert_eq!(from_symbol.option_style(), try_new.option_style());
+    }
+
+    // ── subject prefix validation (config constructor path) ──────────────
+
+    #[test]
+    fn test_validate_subject_prefix_empty_rejected() {
+        assert!(matches!(
+            validate_subject_prefix(""),
+            Err(Error::NatsSubject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_wildcard_star_rejected() {
+        assert!(matches!(
+            validate_subject_prefix("opt*ion"),
+            Err(Error::NatsSubject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_greater_than_rejected() {
+        assert!(matches!(
+            validate_subject_prefix("option>"),
+            Err(Error::NatsSubject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_trailing_dot_rejected() {
+        assert!(matches!(
+            validate_subject_prefix("optionchain."),
+            Err(Error::NatsSubject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_leading_dot_rejected() {
+        assert!(matches!(
+            validate_subject_prefix(".optionchain"),
+            Err(Error::NatsSubject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_simple_ok() {
+        assert!(validate_subject_prefix("optionchain").is_ok());
+    }
+
+    #[test]
+    fn test_validate_subject_prefix_multi_token_ok() {
+        // A dotted prefix is allowed: it simply prepends extra subject levels.
+        assert!(validate_subject_prefix("exchange.optionchain").is_ok());
+    }
+
+    // `OptionChainNatsConfig::try_new` delegates its prefix validation entirely
+    // to `validate_subject_prefix` (covered exhaustively above) before touching
+    // the JetStream context, so the constructor's reject/accept behavior cannot
+    // diverge from those cases. Exercising the constructor end-to-end needs a
+    // live NATS server (no offline `jetstream::Context` exists) and the
+    // `tokio/macros` runtime, neither of which is in the default test matrix.
 }
