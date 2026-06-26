@@ -197,6 +197,19 @@ pub enum Error {
         /// Description of the journal error.
         message: String,
     },
+
+    /// Error when a NATS subject component or prefix is structurally invalid:
+    /// empty, or carrying a reserved subject character (`.`, `*`, `>`) that
+    /// would inject an extra subject level or a wildcard and silently break
+    /// level-scoped subscriptions.
+    #[error("invalid nats subject {field}: {reason}")]
+    NatsSubject {
+        /// The subject field that failed validation (e.g. `"underlying"`,
+        /// `"prefix"`, `"option_type"`).
+        field: String,
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -389,6 +402,19 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// Creates a new invalid NATS subject error.
+    ///
+    /// `field` names the offending subject component (e.g. `"underlying"` or
+    /// `"prefix"`); `reason` describes why it was rejected.
+    #[must_use]
+    #[cold]
+    pub fn nats_subject(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::NatsSubject {
+            field: field.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -553,5 +579,14 @@ mod tests {
         assert!(msg.contains("ETH-20240329-3000-C"));
         assert!(msg.contains("ETH"));
         assert!(msg.contains("BTC"));
+    }
+
+    #[test]
+    fn test_nats_subject_error() {
+        let err = Error::nats_subject("underlying", "must not contain reserved character '*'");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid nats subject"));
+        assert!(msg.contains("underlying"));
+        assert!(msg.contains("reserved character"));
     }
 }
