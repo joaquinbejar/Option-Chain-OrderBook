@@ -777,6 +777,14 @@ impl SequencedUnderlyingOrderBook {
     }
 
     /// Executes an add order operation.
+    ///
+    /// Resolution goes through `find_or_create_book_by_symbol`,
+    /// which materializes the target expiration and strike from the parsed
+    /// symbol. This is the determinism-critical path: an `AddOrder` vivifies its
+    /// book the same way during live execution and during replay, so a journal
+    /// prefix rebuilds identical structural state in a fresh book. A malformed
+    /// symbol still yields [`OptionChainResult::BookNotFound`]; a cross-underlying
+    /// symbol is rejected before anything is created.
     fn execute_add_order(
         &self,
         symbol: &str,
@@ -785,15 +793,17 @@ impl SequencedUnderlyingOrderBook {
         price: u128,
         quantity: u64,
     ) -> OptionChainResult {
-        let book = match self.find_book_by_symbol(symbol) {
+        let book = match self.find_or_create_book_by_symbol(symbol) {
             Ok(book) => book,
             // A cross-underlying command must be rejected with the typed reason,
-            // never silently routed or masked as a missing book.
+            // never silently routed or masked as a missing book. The mismatch is
+            // checked before any expiration/strike is materialized.
             Err(e @ Error::UnderlyingMismatch { .. }) => {
                 return OptionChainResult::Rejected {
                     reason: e.to_string(),
                 };
             }
+            // A malformed symbol cannot name a book to create.
             Err(_) => {
                 return OptionChainResult::BookNotFound {
                     symbol: symbol.to_string(),
@@ -1092,17 +1102,102 @@ impl SequencedUnderlyingOrderBook {
         Ok(book)
     }
 
-    /// Replays events from the journal starting at `from_sequence`.
+    /// Resolves an option book by symbol, materializing the expiration and
+    /// strike if they do not already exist.
     ///
-    /// Each event's command is re-executed against the underlying order
-    /// book to rebuild state. The sequencer is then advanced past the
-    /// highest replayed sequence number so that new commands receive
-    /// non-conflicting ids.
+    /// This is the resolver used by the `AddOrder` path. It mirrors
+    /// [`find_book_by_symbol`](Self::find_book_by_symbol) but vivifies the
+    /// target book through the hierarchy's idempotent
+    /// [`get_or_create_expiration`](UnderlyingOrderBook::get_or_create_expiration)
+    /// / `get_or_create_strike` instead of the non-creating `get_*` lookups.
     ///
-    /// Re-execution results are intentionally discarded because replay
-    /// runs against an empty (or partially populated) book whose state
-    /// may differ from the original run. This method is a state-rebuild
-    /// tool, not a validation tool.
+    /// # Determinism
+    ///
+    /// The materialization is a pure function of the (deterministic) command
+    /// symbol — no wall-clock, RNG, or map-iteration order is consulted. Because
+    /// the same path runs during live execution and during replay, a journal
+    /// prefix rebuilds identical structural state in a fresh book. Created books
+    /// inherit the hierarchy's shared configuration (validation / contract specs
+    /// / STP mode / fee schedule), so a fresh book configured identically
+    /// rebuilds an identical leaf. Registry-assigned instrument ids are NOT
+    /// journaled and need not match across runs; the equality oracle is the
+    /// structural / order state (resting orders + top-of-book), not numeric ids.
+    ///
+    /// The parsed underlying is validated against this book's underlying BEFORE
+    /// any materialization — a mismatch is rejected and creates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSymbol`] for a malformed symbol or
+    /// [`Error::UnderlyingMismatch`] when the symbol's underlying differs from
+    /// this book's.
+    fn find_or_create_book_by_symbol(
+        &self,
+        symbol: &str,
+    ) -> Result<Arc<crate::orderbook::OptionOrderBook>, Error> {
+        let parsed = SymbolParser::parse(symbol)?;
+
+        let expected = self.inner.underlying();
+        if parsed.underlying() != expected {
+            return Err(Error::underlying_mismatch(
+                symbol,
+                parsed.underlying(),
+                expected,
+            ));
+        }
+
+        // Idempotent vivification: a second call with the same key returns the
+        // same handle, so replay re-executing the same AddOrder targets the
+        // exact leaf that live execution did.
+        let exp_book = self.inner.get_or_create_expiration(*parsed.expiration());
+        let strike_book = exp_book.get_or_create_strike(parsed.strike());
+
+        let book = match parsed.option_style() {
+            OptionStyle::Call => strike_book.call_arc(),
+            OptionStyle::Put => strike_book.put_arc(),
+        };
+
+        Ok(book)
+    }
+
+    /// Replays events from the journal starting at `from_sequence`, rebuilding
+    /// the hierarchy state deterministically.
+    ///
+    /// Each event's command is re-executed against the underlying order book.
+    /// Replay re-runs the `AddOrder` / `CancelOrder` / `MassCancel` stream
+    /// exactly as it was recorded: every `AddOrder` deterministically vivifies
+    /// its target expiration and strike from the parsed symbol via the atomic
+    /// `get_or_create_*` path (see
+    /// `find_or_create_book_by_symbol`),
+    /// so replaying a journal prefix into a freshly constructed book rebuilds
+    /// the same resting orders and the same top-of-book per contract. The
+    /// sequencer is then advanced past the highest replayed sequence number so
+    /// that new commands receive non-conflicting ids.
+    ///
+    /// # Equality oracle
+    ///
+    /// Replayed state equals live state on the same command prefix at the level
+    /// of *structural / order state* — the set of resting orders (carried by id
+    /// in each `AddOrder` command) and the top-of-book on each contract.
+    /// Registry-assigned instrument ids are allocated at strike creation and are
+    /// NOT journaled, so they are free to differ between the live run and a
+    /// replay; they are not part of the equality contract. For a fresh book to
+    /// rebuild identical structural state it must be configured identically
+    /// (validation / contract specs / STP mode / fee schedule), since those
+    /// shared settings are applied to books created during replay.
+    ///
+    /// Re-execution results are intentionally discarded: this method is a
+    /// state-rebuild tool, not a validation tool. The authoritative result of
+    /// each command is the one already recorded in the journal at live time.
+    ///
+    /// **Out-of-band state is not reconstructed.** Instrument-status transitions
+    /// (`halt` / `set_status`) and expiry-lifecycle actions are applied directly
+    /// to the hierarchy, not as journaled `OptionChainCommand`s, so replay does
+    /// not reproduce them: a strike vivified during replay defaults to
+    /// [`Active`](crate::orderbook::InstrumentStatus). Consequently an `AddOrder`
+    /// that the live run rejected because its strike had been halted will instead
+    /// rest during replay. Journaling status / lifecycle transitions as commands
+    /// is required to close this gap (tracked separately).
     ///
     /// Returns the number of events replayed.
     ///
@@ -1397,12 +1492,13 @@ mod tests {
 
         assert!(book.has_journal());
 
-        // Submit a command that will be rejected (no expiration exists)
+        // A valid AddOrder vivifies its expiration+strike (option (b)), so it
+        // succeeds even on a fresh book. The event is journaled regardless.
         let receipt = book
             .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
             .expect("submit");
 
-        assert!(receipt.result.is_error()); // book not found
+        assert!(receipt.result.is_success());
         assert_eq!(receipt.sequence_num, 0);
 
         // Event should be in the journal
@@ -1455,6 +1551,118 @@ mod tests {
 
         // Sequence should be advanced past the replayed range
         assert!(book.current_sequence() >= 3);
+    }
+
+    #[test]
+    fn test_replay_rebuilds_resting_orders_and_top_of_book_deterministically() {
+        // Probe the structural state of one contract: top-of-book on each side
+        // plus the count of resting orders. This — not the registry-assigned
+        // instrument ids — is the equality oracle for live-vs-replayed state.
+        fn probe(
+            book: &SequencedUnderlyingOrderBook,
+            symbol: &str,
+        ) -> (Option<u128>, Option<u128>, usize) {
+            let leaf = book
+                .find_book_by_symbol(symbol)
+                .expect("contract must resolve");
+            (leaf.best_bid(), leaf.best_ask(), leaf.order_count())
+        }
+
+        // Contracts across two expirations and three strikes, calls and puts.
+        let sym_50c = "BTC-20240329-50000-C";
+        let sym_50p = "BTC-20240329-50000-P";
+        let sym_55c = "BTC-20240329-55000-C";
+        let sym_60c = "BTC-20240628-60000-C";
+        let symbols = [sym_50c, sym_50p, sym_55c, sym_60c];
+
+        // Canonical expiration for the 55000 strike, used to scope a mass cancel.
+        let exp_0329 = *SymbolParser::parse(sym_55c)
+            .expect("parse 55c")
+            .expiration();
+
+        // ── Live run: build the journal via the full submit path ──
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let live = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        // Order ids are carried by the commands, so they replay identically.
+        let oid_50c_buy = OrderId::new();
+        let oid_50c_sell = OrderId::new();
+        let oid_50p_buy = OrderId::new();
+        let oid_55c_buy = OrderId::new();
+        let oid_60c_sell = OrderId::new();
+
+        live.submit_add_order(sym_50c, oid_50c_buy, Side::Buy, 100, 10)
+            .expect("add 50c buy");
+        live.submit_add_order(sym_50c, oid_50c_sell, Side::Sell, 110, 5)
+            .expect("add 50c sell");
+        live.submit_add_order(sym_50p, oid_50p_buy, Side::Buy, 50, 8)
+            .expect("add 50p buy");
+        live.submit_add_order(sym_55c, oid_55c_buy, Side::Buy, 120, 4)
+            .expect("add 55c buy");
+        live.submit_add_order(sym_60c, oid_60c_sell, Side::Sell, 200, 3)
+            .expect("add 60c sell");
+
+        // Cancel one resting order: 50c now rests bid-only.
+        live.submit_cancel_order(sym_50c, oid_50c_sell)
+            .expect("cancel 50c sell");
+
+        // Mass cancel the whole 55000 strike: 55c becomes empty.
+        live.submit_mass_cancel(
+            MassCancelScope::Strike {
+                expiration: exp_0329,
+                strike: 55000,
+            },
+            MassCancelType::All,
+        )
+        .expect("mass cancel 55000");
+
+        // Expected live structure after the stream:
+        //   50c: bid 100, no ask, 1 order   50p: bid 50, no ask, 1 order
+        //   55c: empty                       60c: no bid, ask 200, 1 order
+        assert_eq!(probe(&live, sym_50c), (Some(100), None, 1));
+        assert_eq!(probe(&live, sym_50p), (Some(50), None, 1));
+        assert_eq!(probe(&live, sym_55c), (None, None, 0));
+        assert_eq!(probe(&live, sym_60c), (None, Some(200), 1));
+        assert_eq!(live.expiration_count(), 2);
+        assert_eq!(live.total_order_count(), 3);
+
+        let event_count = journal.read_from(0).expect("read").len();
+
+        // ── Fresh book, configured identically (same constructor), replays ──
+        let replay_a = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        // The fresh book starts empty: replay must rebuild everything.
+        assert_eq!(replay_a.expiration_count(), 0);
+        assert_eq!(replay_a.total_order_count(), 0);
+
+        let replayed = replay_a.replay(0).expect("replay a");
+        assert_eq!(replayed, event_count);
+
+        // Per-contract structural state matches the live book exactly.
+        for sym in symbols {
+            assert_eq!(
+                probe(&live, sym),
+                probe(&replay_a, sym),
+                "replayed contract {sym} diverged from live"
+            );
+        }
+        // Structural completeness: same expirations and same total resting count.
+        assert_eq!(live.expiration_count(), replay_a.expiration_count());
+        assert_eq!(live.total_order_count(), replay_a.total_order_count());
+
+        // ── Determinism: a second fresh replay is byte-for-byte structural ──
+        let replay_b = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        let replayed_b = replay_b.replay(0).expect("replay b");
+        assert_eq!(replayed_b, event_count);
+
+        for sym in symbols {
+            assert_eq!(
+                probe(&replay_a, sym),
+                probe(&replay_b, sym),
+                "second replay diverged for contract {sym}"
+            );
+        }
+        assert_eq!(replay_a.expiration_count(), replay_b.expiration_count());
+        assert_eq!(replay_a.total_order_count(), replay_b.total_order_count());
     }
 
     #[test]
@@ -1629,19 +1837,42 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_add_order_book_not_found() {
+    fn test_submit_add_order_vivifies_missing_strike_returns_success() {
+        // Option (b): a valid AddOrder against a contract that has not yet been
+        // listed materializes its expiration+strike on the deterministic
+        // get_or_create_* path rather than rejecting with BookNotFound. This is
+        // the live semantic that makes replay rebuild AddOrder state.
         let book = SequencedUnderlyingOrderBook::new("BTC");
+        assert_eq!(book.expiration_count(), 0);
 
         let receipt = book
             .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
             .expect("submit");
+
+        assert!(receipt.result.is_success(), "got {:?}", receipt.result);
+        // The strike materialized and the resting order is present.
+        assert_eq!(book.expiration_count(), 1);
+        assert_eq!(book.total_order_count(), 1);
+    }
+
+    #[test]
+    fn test_submit_add_order_malformed_symbol_returns_book_not_found() {
+        // A symbol that cannot be parsed names no book to create, so AddOrder
+        // still yields BookNotFound (vivification is impossible without a key).
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_add_order("NOT-A-VALID-SYMBOL", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
         assert!(receipt.result.is_error());
         match &receipt.result {
             OptionChainResult::BookNotFound { symbol } => {
-                assert!(symbol.contains("BTC"));
+                assert!(symbol.contains("NOT-A-VALID-SYMBOL"));
             }
             other => panic!("expected BookNotFound, got {:?}", other),
         }
+        // Nothing was materialized for an unparseable symbol.
+        assert_eq!(book.expiration_count(), 0);
     }
 
     // ── Submit: cancel order ─────────────────────────────────────────────
