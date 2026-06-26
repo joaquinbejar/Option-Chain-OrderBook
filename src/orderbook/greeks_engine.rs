@@ -278,11 +278,17 @@ impl GreeksEngine {
     /// swallowed, so a single panicking listener can never permanently disable
     /// subscription.
     pub fn subscribe(&self, listener: GreeksUpdateListener) -> SubscriptionId {
-        let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut listeners = self.listeners.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("greeks listeners lock poisoned; recovering");
             poisoned.into_inner()
         });
+        // Allocate the id *under* the listeners lock so id order == push order:
+        // ids are handed out in the same sequence entries are appended, keeping
+        // the Vec ascending by id and the notification order in id (subscription)
+        // order even under concurrent `subscribe`. Allocating before the lock
+        // would let a lower-id thread push after a higher-id one, reordering the
+        // Vec and breaking the documented id-order delivery guarantee.
+        let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         listeners.push((id, listener));
         id
     }
