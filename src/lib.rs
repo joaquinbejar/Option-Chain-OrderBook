@@ -259,7 +259,7 @@ pub use orderbook::{
 #[cfg(feature = "nats")]
 pub use orderbook::{
     NatsPublisherHandles, OptionChainNatsConfig, OptionChainSubjectBuilder,
-    build_option_order_book_with_nats,
+    build_option_order_book_with_nats, build_underlying_manager_with_nats,
 };
 
 #[cfg(feature = "sequencer")]

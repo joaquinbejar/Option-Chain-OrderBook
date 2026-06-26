@@ -25,6 +25,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
+#[cfg(feature = "nats")]
+use super::book::{ContractNatsListenerFactory, SharedNatsFactory};
 
 /// Order book for a single underlying asset.
 ///
@@ -350,6 +352,18 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.expirations.fee_schedule()
+    }
+
+    /// Propagates the per-contract NATS listener factory down to this
+    /// underlying's expiration manager.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_nats_factory`]. Existing
+    /// books are not affected; only later-created expirations and strikes carry
+    /// the factory.
+    #[cfg(feature = "nats")]
+    #[inline]
+    pub(crate) fn set_nats_factory(&self, factory: Option<ContractNatsListenerFactory>) {
+        self.expirations.set_nats_factory(factory);
     }
 
     /// Sets the strike range configuration for a specific expiry type.
@@ -917,6 +931,12 @@ pub struct UnderlyingOrderBookManager {
     stp_mode: SharedSTPMode,
     /// Fee schedule propagated to newly created underlying books.
     fee_schedule: SharedFeeSchedule,
+    /// Per-contract NATS listener factory propagated to every underlying book
+    /// (and onward to its expirations and strikes). Configured via
+    /// [`with_nats_factory`](UnderlyingOrderBookManager::with_nats_factory);
+    /// `None` (the default) reproduces the non-NATS path exactly.
+    #[cfg(feature = "nats")]
+    nats_factory: SharedNatsFactory,
 }
 
 impl Default for UnderlyingOrderBookManager {
@@ -939,6 +959,8 @@ impl UnderlyingOrderBookManager {
             symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
     }
 
@@ -959,7 +981,30 @@ impl UnderlyingOrderBookManager {
             symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
+            #[cfg(feature = "nats")]
+            nats_factory: SharedNatsFactory::new(),
         }
+    }
+
+    /// Creates a new underlying order book manager wired with a per-contract
+    /// NATS listener factory.
+    ///
+    /// Every contract book the hierarchy lazily creates beneath this manager
+    /// installs its own NATS publishers (built by `factory` from the contract
+    /// symbol) *before* the inner book is wrapped in `Arc`. This is the
+    /// hierarchy-side entry point used by the `nats` module's
+    /// `build_underlying_manager_with_nats` builder; the factory is an
+    /// `orderbook_rs`-native [`ContractNatsListenerFactory`] so the core
+    /// hierarchy never imports the eventing `nats` module.
+    ///
+    /// Additive: [`new`](Self::new) / [`new_with_seed`](Self::new_with_seed)
+    /// behave exactly as before (no factory configured).
+    #[cfg(feature = "nats")]
+    #[must_use]
+    pub(crate) fn with_nats_factory(factory: ContractNatsListenerFactory) -> Self {
+        let manager = Self::new();
+        manager.nats_factory.set(Some(factory));
+        manager
     }
 
     /// Returns the number of underlyings.
@@ -1010,6 +1055,13 @@ impl UnderlyingOrderBookManager {
         }
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
+        }
+        // Propagate the per-contract NATS factory down the fresh subtree BEFORE
+        // publishing so it is configured-before-visible. Only when a factory is
+        // configured, keeping the no-factory path identical.
+        #[cfg(feature = "nats")]
+        if let Some(factory) = self.nats_factory.get() {
+            fresh.set_nats_factory(Some(factory));
         }
         // Atomic, idempotent publish: first inserter wins and is never evicted.
         let entry = self.underlyings.get_or_insert(underlying, fresh);

@@ -46,6 +46,82 @@ pub(crate) struct PreparedNatsListeners {
     pub book_listener: PriceLevelChangedListener,
 }
 
+/// Factory that builds the per-contract NATS publisher listeners for one option
+/// contract, given its symbol.
+///
+/// The hierarchy threads this factory down to the leaf so that every contract
+/// book it lazily creates installs its own publishers *before* the inner book
+/// is wrapped in `Arc` (the only valid install point — the `orderbook_rs`
+/// listener setters take `&mut self`). The factory is typed purely in terms of
+/// `orderbook_rs`-native listeners (via [`PreparedNatsListeners`]) so the core
+/// hierarchy never imports the eventing `nats` module: it only invokes this
+/// `book`-layer callback with each contract's symbol and installs whatever
+/// listeners come back. The dependency direction stays `nats` → hierarchy →
+/// `book`, never the reverse.
+///
+/// Returns `None` when no publishers should be attached for the given symbol
+/// (e.g. the symbol cannot be turned into a valid subject); the contract book
+/// is then built exactly as on the non-NATS path.
+///
+/// The concrete factory is constructed by the `nats` module's
+/// `build_underlying_manager_with_nats` builder (kept as a plain reference, not
+/// an intra-doc link, so the leaf carries no path into the eventing layer).
+#[cfg(feature = "nats")]
+pub(crate) type ContractNatsListenerFactory =
+    Arc<dyn Fn(&str) -> Option<PreparedNatsListeners> + Send + Sync>;
+
+/// Thread-safe holder for an optional [`ContractNatsListenerFactory`].
+///
+/// Mirrors [`SharedFeeSchedule`](super::fees::SharedFeeSchedule): hierarchy
+/// managers store the factory behind a lock so it can be propagated to children
+/// through `&self` setters — exactly like the STP mode and fee schedule —
+/// without threading it through every constructor signature (keeping the public
+/// constructor surface additive). The factory is an `Arc`, so [`get`](Self::get)
+/// is a cheap clone.
+#[cfg(feature = "nats")]
+#[derive(Default)]
+pub(crate) struct SharedNatsFactory {
+    /// The inner factory, protected by a read-write lock.
+    inner: std::sync::RwLock<Option<ContractNatsListenerFactory>>,
+}
+
+#[cfg(feature = "nats")]
+impl SharedNatsFactory {
+    /// Creates an empty holder (no factory configured).
+    #[must_use]
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores (or clears) the factory. Recovers from a poisoned lock so the
+    /// factory is always written.
+    pub(crate) fn set(&self, factory: Option<ContractNatsListenerFactory>) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = factory;
+    }
+
+    /// Returns a clone of the current factory, or `None` if none is configured.
+    #[must_use]
+    pub(crate) fn get(&self) -> Option<ContractNatsListenerFactory> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(feature = "nats")]
+impl std::fmt::Debug for SharedNatsFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedNatsFactory")
+            .field("configured", &self.get().is_some())
+            .finish()
+    }
+}
+
 /// Internal configuration for constructing an [`OptionOrderBook`].
 ///
 /// Consolidates all optional configuration (instrument ID, validation,

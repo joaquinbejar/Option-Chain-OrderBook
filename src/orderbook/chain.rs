@@ -19,6 +19,8 @@ use pricelevel::Hash32;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "nats")]
+use super::book::ContractNatsListenerFactory;
 use super::book::TerminalOrderSummary;
 
 /// Option chain order book for a single expiration.
@@ -240,6 +242,17 @@ impl OptionChainOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.strikes.fee_schedule()
+    }
+
+    /// Propagates the per-contract NATS listener factory down to the strike
+    /// manager so every strike created within this chain installs publishers.
+    ///
+    /// Delegates to [`StrikeOrderBookManager::set_nats_factory`]. Existing
+    /// strikes are not affected.
+    #[cfg(feature = "nats")]
+    #[inline]
+    pub(crate) fn set_nats_factory(&self, factory: Option<ContractNatsListenerFactory>) {
+        self.strikes.set_nats_factory(factory);
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.

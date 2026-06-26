@@ -123,7 +123,7 @@ pub use validation::ValidationConfig;
 #[cfg(feature = "nats")]
 pub use nats::{
     NatsPublisherHandles, OptionChainNatsConfig, OptionChainSubjectBuilder,
-    build_option_order_book_with_nats,
+    build_option_order_book_with_nats, build_underlying_manager_with_nats,
 };
 
 #[cfg(feature = "sequencer")]
