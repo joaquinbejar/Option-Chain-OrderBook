@@ -25,6 +25,7 @@
 use crate::error::Error;
 use crate::orderbook::book::TerminalOrderSummary;
 use crate::orderbook::instrument_registry::InstrumentRegistry;
+use crate::orderbook::instrument_status::InstrumentStatus;
 use crate::orderbook::symbol_index::SymbolIndex;
 use crate::orderbook::underlying::UnderlyingOrderBook;
 use crate::utils::{SymbolParser, nanos_since_epoch};
@@ -129,6 +130,27 @@ pub enum OptionChainCommand {
         /// Type of cancellation.
         cancel_type: MassCancelType,
     },
+    /// Transition an instrument's lifecycle status.
+    ///
+    /// Journaling status changes as commands (instead of applying `halt` /
+    /// `resume` / `set_status` out of band on the leaf book) is what lets replay
+    /// reconstruct halted / settling / expired instruments. Without this, a
+    /// strike the live run had halted would be vivified as a fresh
+    /// [`Active`](InstrumentStatus::Active) book during replay, so an order the
+    /// live run rejected would instead rest and diverge from live state.
+    ///
+    /// The transition is validated against the lifecycle state machine
+    /// ([`InstrumentStatus::can_transition`]) via the leaf book's
+    /// [`set_status`](crate::orderbook::OptionOrderBook::set_status); an illegal
+    /// edge is recorded as [`OptionChainResult::Rejected`]. Replay is
+    /// deterministic: the target status is carried in the command, and the book
+    /// is materialized as a pure function of the symbol.
+    SetInstrumentStatus {
+        /// Target option symbol (e.g., "BTC-20240329-50000-C").
+        symbol: String,
+        /// The lifecycle status to transition the instrument to.
+        status: InstrumentStatus,
+    },
 }
 
 /// Result of executing an option chain command.
@@ -156,6 +178,13 @@ pub enum OptionChainResult {
     MassCancelled {
         /// Number of cancelled orders.
         cancelled_count: usize,
+    },
+    /// An instrument's lifecycle status was changed.
+    StatusChanged {
+        /// The symbol whose status changed.
+        symbol: String,
+        /// The new lifecycle status.
+        status: InstrumentStatus,
     },
     /// The command was rejected.
     Rejected {
@@ -800,6 +829,40 @@ impl SequencedUnderlyingOrderBook {
         self.submit(command)
     }
 
+    /// Submits an instrument status-change command.
+    ///
+    /// The transition is journaled as an
+    /// [`OptionChainCommand::SetInstrumentStatus`] so replay reconstructs the
+    /// instrument's status instead of vivifying it as
+    /// [`Active`](InstrumentStatus::Active). The target book is resolved through
+    /// the same vivifying path as [`submit_add_order`](Self::submit_add_order)
+    /// (underlying-mismatch check, then materialize the expiration and strike),
+    /// and the transition is validated against the lifecycle state machine via
+    /// the leaf book's [`set_status`](crate::orderbook::OptionOrderBook::set_status).
+    ///
+    /// An illegal transition, a cross-underlying symbol, or a malformed symbol
+    /// all yield [`OptionChainResult::Rejected`].
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol
+    /// * `status` - The lifecycle status to transition the instrument to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit_set_instrument_status(
+        &self,
+        symbol: &str,
+        status: InstrumentStatus,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::SetInstrumentStatus {
+            symbol: symbol.to_string(),
+            status,
+        };
+        self.submit(command)
+    }
+
     // ── Command Execution ────────────────────────────────────────────────
 
     /// Executes a command against the underlying order book.
@@ -817,6 +880,9 @@ impl SequencedUnderlyingOrderBook {
             }
             OptionChainCommand::MassCancel { scope, cancel_type } => {
                 self.execute_mass_cancel(scope, cancel_type)
+            }
+            OptionChainCommand::SetInstrumentStatus { symbol, status } => {
+                self.execute_set_instrument_status(symbol, *status)
             }
         }
     }
@@ -858,6 +924,57 @@ impl SequencedUnderlyingOrderBook {
 
         match book.add_limit_order(order_id, side, price, quantity) {
             Ok(_) => OptionChainResult::OrderAdded { order_id },
+            Err(e) => OptionChainResult::Rejected {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Executes an instrument status-change operation.
+    ///
+    /// Resolution goes through `find_or_create_book_by_symbol`, the SAME
+    /// vivifying path as [`execute_add_order`](Self::execute_add_order), so the
+    /// target leaf is materialized identically during live execution and during
+    /// replay. The transition is then validated against the lifecycle state
+    /// machine via the leaf book's
+    /// [`set_status`](crate::orderbook::OptionOrderBook::set_status).
+    ///
+    /// # Determinism
+    ///
+    /// Fully deterministic: the target status is carried in the (deterministic)
+    /// command, and the book is materialized as a pure function of the symbol —
+    /// no wall-clock, RNG, or map-iteration order is consulted. Because the same
+    /// path runs live and on replay, replaying a journal prefix reconstructs the
+    /// same per-contract status. Consequently an `AddOrder` that the live run
+    /// rejected because its strike had been halted is rejected on replay too, so
+    /// replayed state matches live.
+    ///
+    /// An illegal transition, a cross-underlying symbol, or a malformed symbol
+    /// all yield [`OptionChainResult::Rejected`] with the typed reason.
+    fn execute_set_instrument_status(
+        &self,
+        symbol: &str,
+        status: InstrumentStatus,
+    ) -> OptionChainResult {
+        let book = match self.find_or_create_book_by_symbol(symbol) {
+            Ok(book) => book,
+            // A cross-underlying or malformed symbol cannot name a book to
+            // transition; both surface as a typed rejection rather than a
+            // silent no-op so the journal records why.
+            Err(e) => {
+                return OptionChainResult::Rejected {
+                    reason: e.to_string(),
+                };
+            }
+        };
+
+        match book.set_status(status) {
+            Ok(()) => OptionChainResult::StatusChanged {
+                symbol: symbol.to_string(),
+                status,
+            },
+            // Illegal lifecycle edge (e.g. reactivating an Expired book): the
+            // state machine left the status unchanged.
             Err(e) => OptionChainResult::Rejected {
                 reason: e.to_string(),
             },
@@ -1256,14 +1373,24 @@ impl SequencedUnderlyingOrderBook {
     /// state-rebuild tool, not a validation tool. The authoritative result of
     /// each command is the one already recorded in the journal at live time.
     ///
-    /// **Out-of-band state is not reconstructed.** Instrument-status transitions
-    /// (`halt` / `set_status`) and expiry-lifecycle actions are applied directly
-    /// to the hierarchy, not as journaled `OptionChainCommand`s, so replay does
-    /// not reproduce them: a strike vivified during replay defaults to
+    /// **Instrument-status transitions are reconstructed when journaled.** A
+    /// status change submitted as an
+    /// [`OptionChainCommand::SetInstrumentStatus`] (via
+    /// [`submit_set_instrument_status`](Self::submit_set_instrument_status)) is
+    /// part of the replayable stream: replay re-applies it through the leaf
+    /// book's [`set_status`](crate::orderbook::OptionOrderBook::set_status), so a
+    /// strike the live run halted / set to settling / expired replays into the
+    /// same status rather than defaulting to
     /// [`Active`](crate::orderbook::InstrumentStatus). Consequently an `AddOrder`
-    /// that the live run rejected because its strike had been halted will instead
-    /// rest during replay. Journaling status / lifecycle transitions as commands
-    /// is required to close this gap (tracked separately).
+    /// the live run rejected because its strike had been halted is rejected on
+    /// replay too, keeping replayed state equal to live.
+    ///
+    /// **Out-of-band status / lifecycle mutations are still not reconstructed.**
+    /// Status changes applied directly to the hierarchy — calling `halt` /
+    /// `resume` / `set_status` / `expire` on a leaf book outside the sequencer,
+    /// or the expiry-lifecycle manager advancing books on its own schedule — are
+    /// not journaled `OptionChainCommand`s, so replay does not reproduce them.
+    /// Route status changes through the sequencer to keep replay faithful.
     ///
     /// Returns the number of events replayed.
     ///
@@ -1657,17 +1784,24 @@ mod tests {
 
     #[test]
     fn test_replay_rebuilds_resting_orders_and_top_of_book_deterministically() {
-        // Probe the structural state of one contract: top-of-book on each side
-        // plus the count of resting orders. This — not the registry-assigned
-        // instrument ids — is the equality oracle for live-vs-replayed state.
+        // Probe the structural state of one contract: top-of-book on each side,
+        // the count of resting orders, and the per-contract instrument status.
+        // This — not the registry-assigned instrument ids — is the equality
+        // oracle for live-vs-replayed state. Status is included so a journaled
+        // SetInstrumentStatus transition is part of the equality contract.
         fn probe(
             book: &SequencedUnderlyingOrderBook,
             symbol: &str,
-        ) -> (Option<u128>, Option<u128>, usize) {
+        ) -> (Option<u128>, Option<u128>, usize, InstrumentStatus) {
             let leaf = book
                 .find_book_by_symbol(symbol)
                 .expect("contract must resolve");
-            (leaf.best_bid(), leaf.best_ask(), leaf.order_count())
+            (
+                leaf.best_bid(),
+                leaf.best_ask(),
+                leaf.order_count(),
+                leaf.status(),
+            )
         }
 
         // Contracts across two expirations and three strikes, calls and puts.
@@ -1718,13 +1852,35 @@ mod tests {
         )
         .expect("mass cancel 55000");
 
+        // Halt the 50p contract AFTER its order rested. Halt does not cancel
+        // resting orders, so 50p keeps its bid but stops accepting new orders.
+        // This journaled status transition must be reconstructed on replay.
+        let status_receipt = live
+            .submit_set_instrument_status(sym_50p, InstrumentStatus::Halted)
+            .expect("halt 50p");
+        assert!(status_receipt.result.is_success(), "{status_receipt:?}");
+
         // Expected live structure after the stream:
-        //   50c: bid 100, no ask, 1 order   50p: bid 50, no ask, 1 order
-        //   55c: empty                       60c: no bid, ask 200, 1 order
-        assert_eq!(probe(&live, sym_50c), (Some(100), None, 1));
-        assert_eq!(probe(&live, sym_50p), (Some(50), None, 1));
-        assert_eq!(probe(&live, sym_55c), (None, None, 0));
-        assert_eq!(probe(&live, sym_60c), (None, Some(200), 1));
+        //   50c: bid 100, no ask, 1 order, Active
+        //   50p: bid 50,  no ask, 1 order, Halted
+        //   55c: empty, Active
+        //   60c: no bid, ask 200, 1 order, Active
+        assert_eq!(
+            probe(&live, sym_50c),
+            (Some(100), None, 1, InstrumentStatus::Active)
+        );
+        assert_eq!(
+            probe(&live, sym_50p),
+            (Some(50), None, 1, InstrumentStatus::Halted)
+        );
+        assert_eq!(
+            probe(&live, sym_55c),
+            (None, None, 0, InstrumentStatus::Active)
+        );
+        assert_eq!(
+            probe(&live, sym_60c),
+            (None, Some(200), 1, InstrumentStatus::Active)
+        );
         assert_eq!(live.expiration_count(), 2);
         assert_eq!(live.total_order_count(), 3);
 
@@ -1767,6 +1923,219 @@ mod tests {
         assert_eq!(replay_a.total_order_count(), replay_b.total_order_count());
     }
 
+    // ── Instrument-status transitions (issue #94) ──────────────────────────
+
+    #[test]
+    fn test_halt_then_add_order_replays_rejection() {
+        // The core #94 scenario: a strike halted by a journaled
+        // SetInstrumentStatus must replay Halted, so an AddOrder the live run
+        // rejected (InstrumentNotActive) is rejected on replay too — replayed
+        // state equals live instead of vivifying a fresh Active strike that
+        // accepts the order.
+        let sym = "BTC-20240329-50000-C";
+        let oid = OrderId::new();
+
+        // ── Live run ──
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let live = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        // Halt the strike: vivifies it (Active) then transitions Active -> Halted.
+        let halt = live
+            .submit_set_instrument_status(sym, InstrumentStatus::Halted)
+            .expect("submit halt");
+        match &halt.result {
+            OptionChainResult::StatusChanged { symbol, status } => {
+                assert_eq!(symbol, sym);
+                assert_eq!(*status, InstrumentStatus::Halted);
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+
+        // AddOrder against the halted strike: rejected with InstrumentNotActive.
+        let add = live
+            .submit_add_order(sym, oid, Side::Buy, 100, 10)
+            .expect("submit add");
+        match &add.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(
+                    reason.contains("instrument not active"),
+                    "expected InstrumentNotActive, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Live state: strike Halted, no resting order.
+        let live_leaf = live.find_book_by_symbol(sym).expect("resolve live");
+        assert_eq!(live_leaf.status(), InstrumentStatus::Halted);
+        assert_eq!(live_leaf.order_count(), 0);
+        assert_eq!(live.total_order_count(), 0);
+
+        // ── Replay into a fresh, identically configured book ──
+        let replay = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        assert_eq!(replay.total_order_count(), 0);
+        let replayed = replay.replay(0).expect("replay");
+        assert_eq!(replayed, 2, "two journaled events: halt + rejected add");
+
+        // Replay reconstructs Halted (NOT the default Active), so the AddOrder is
+        // rejected on replay too: no resting order, status matches live.
+        let replay_leaf = replay.find_book_by_symbol(sym).expect("resolve replay");
+        assert_eq!(replay_leaf.status(), InstrumentStatus::Halted);
+        assert_eq!(replay_leaf.order_count(), 0);
+
+        // Per-contract status + resting orders + total match live exactly.
+        assert_eq!(live_leaf.status(), replay_leaf.status());
+        assert_eq!(live_leaf.order_count(), replay_leaf.order_count());
+        assert_eq!(live.total_order_count(), replay.total_order_count());
+    }
+
+    #[test]
+    fn test_replay_reconstructs_instrument_status() {
+        // Replaying a journal that contains a sequence of status transitions
+        // reconstructs the final per-contract status deterministically.
+        let sym = "BTC-20240329-50000-C";
+        let oid = OrderId::new();
+
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let live = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        // Rest an order while Active, then walk the lifecycle: halt, resume,
+        // settle. None of these cancel the resting order.
+        live.submit_add_order(sym, oid, Side::Buy, 100, 10)
+            .expect("add");
+        live.submit_set_instrument_status(sym, InstrumentStatus::Halted)
+            .expect("halt");
+        live.submit_set_instrument_status(sym, InstrumentStatus::Active)
+            .expect("resume");
+        live.submit_set_instrument_status(sym, InstrumentStatus::Settling)
+            .expect("settle");
+
+        let live_leaf = live.find_book_by_symbol(sym).expect("resolve live");
+        assert_eq!(live_leaf.status(), InstrumentStatus::Settling);
+        assert_eq!(live_leaf.order_count(), 1);
+
+        // Fresh book replays the same status path to the same final status.
+        let replay = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        replay.replay(0).expect("replay");
+
+        let replay_leaf = replay.find_book_by_symbol(sym).expect("resolve replay");
+        assert_eq!(replay_leaf.status(), InstrumentStatus::Settling);
+        assert_eq!(replay_leaf.order_count(), 1);
+        assert_eq!(live_leaf.status(), replay_leaf.status());
+    }
+
+    #[test]
+    fn test_set_instrument_status_illegal_transition_rejected() {
+        // An illegal lifecycle edge is rejected and leaves the status unchanged.
+        let sym = "BTC-20240329-50000-C";
+
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        // Vivify Active, then expire (Active -> Expired is legal).
+        let expire = book
+            .submit_set_instrument_status(sym, InstrumentStatus::Expired)
+            .expect("submit expire");
+        assert!(expire.result.is_success(), "{:?}", expire.result);
+
+        // Expired is terminal: resuming it (Expired -> Active) is illegal.
+        let illegal = book
+            .submit_set_instrument_status(sym, InstrumentStatus::Active)
+            .expect("submit illegal");
+        match &illegal.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(
+                    reason.contains("illegal status transition"),
+                    "expected IllegalStatusTransition, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // The book remains Expired — the rejected transition was a no-op.
+        let leaf = book.find_book_by_symbol(sym).expect("resolve");
+        assert_eq!(leaf.status(), InstrumentStatus::Expired);
+
+        // Counters reflect one success (expire) and one reject (illegal resume).
+        assert_eq!(book.success_count(), 1);
+        assert_eq!(book.reject_count(), 1);
+    }
+
+    #[test]
+    fn test_set_instrument_status_cross_underlying_rejected() {
+        // A cross-underlying symbol is rejected by the underlying-mismatch check
+        // before any book is materialized.
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_set_instrument_status("ETH-20240329-50000-C", InstrumentStatus::Halted)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(reason.contains("underlying mismatch"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // Nothing was created for the foreign symbol.
+        assert_eq!(book.expiration_count(), 0);
+    }
+
+    #[test]
+    fn test_set_instrument_status_command_result_wire_shape() {
+        // The new variants inherit the journal container attrs: PascalCase
+        // variant tags, snake_case struct fields. The InstrumentStatus value is
+        // its own variant name ("Halted").
+        let command = OptionChainCommand::SetInstrumentStatus {
+            symbol: "BTC-20240329-50000-C".to_string(),
+            status: InstrumentStatus::Halted,
+        };
+        let cmd_json: serde_json::Value =
+            serde_json::to_value(&command).expect("serialize command");
+        let expected_cmd = serde_json::json!({
+            "SetInstrumentStatus": {
+                "symbol": "BTC-20240329-50000-C",
+                "status": "Halted"
+            }
+        });
+        assert_eq!(cmd_json, expected_cmd);
+
+        let result = OptionChainResult::StatusChanged {
+            symbol: "BTC-20240329-50000-C".to_string(),
+            status: InstrumentStatus::Settling,
+        };
+        let res_json: serde_json::Value = serde_json::to_value(&result).expect("serialize result");
+        let expected_res = serde_json::json!({
+            "StatusChanged": {
+                "symbol": "BTC-20240329-50000-C",
+                "status": "Settling"
+            }
+        });
+        assert_eq!(res_json, expected_res);
+
+        // StatusChanged is a success, not an error.
+        assert!(result.is_success());
+        assert!(!result.is_error());
+
+        // Round-trip both back through their typed forms.
+        let cmd_back: OptionChainCommand =
+            serde_json::from_value(cmd_json).expect("deserialize command");
+        assert!(matches!(
+            cmd_back,
+            OptionChainCommand::SetInstrumentStatus {
+                status: InstrumentStatus::Halted,
+                ..
+            }
+        ));
+        let res_back: OptionChainResult =
+            serde_json::from_value(res_json).expect("deserialize result");
+        assert!(matches!(
+            res_back,
+            OptionChainResult::StatusChanged {
+                status: InstrumentStatus::Settling,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn test_event_serialization_roundtrip() {
         let event = OptionChainEvent {
@@ -1795,7 +2164,15 @@ mod tests {
 
     /// Builds one representative `OptionChainEvent` per command variant and per
     /// result variant, using deterministic ids so the encoding is stable. This
-    /// is the fixture the round-trip and back-compat guards exercise.
+    /// drives the round-trip guard
+    /// ([`test_option_chain_event_roundtrip_all_variants`]).
+    ///
+    /// The first six events mirror the frozen `v0.5.0` back-compat fixture at
+    /// `tests/fixtures/journal_event_v0.5.0.json`. The trailing
+    /// `SetInstrumentStatus` / `StatusChanged` event was added after that fixture
+    /// was frozen: the variant is additive, so it is covered by the round-trip
+    /// guard here but is intentionally absent from the frozen fixture, which must
+    /// still decode unchanged.
     fn representative_journal_events() -> Vec<OptionChainEvent> {
         // `OrderId::sequential` / a fixed `Hash32` keep the wire encoding stable
         // (random ids would make the JSON non-reproducible).
@@ -1874,6 +2251,20 @@ mod tests {
                     cancel_type: MassCancelType::All,
                 },
                 result: OptionChainResult::MassCancelled { cancelled_count: 0 },
+            },
+            // SetInstrumentStatus + StatusChanged (added after the v0.5.0 fixture
+            // was frozen; covered here but intentionally absent from the fixture).
+            OptionChainEvent {
+                sequence_num: 7,
+                timestamp_ns: 1_700_000_000_000_000_006,
+                command: OptionChainCommand::SetInstrumentStatus {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    status: InstrumentStatus::Halted,
+                },
+                result: OptionChainResult::StatusChanged {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    status: InstrumentStatus::Halted,
+                },
             },
         ]
     }
