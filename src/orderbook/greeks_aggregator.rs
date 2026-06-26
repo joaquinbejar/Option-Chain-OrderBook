@@ -325,14 +325,55 @@ impl GreeksAggregator {
     /// Returns the removed position if found, `None` otherwise.
     /// This is an O(1) operation.
     ///
+    /// # Account pruning policy
+    ///
+    /// When this removal empties the account's inner map (i.e. it was the
+    /// account's last position), the account key is pruned from the underlying
+    /// store so that repeated open/close cycles on a single-position account do
+    /// not leak permanent empty shells. Pruning never changes any aggregate: an
+    /// empty account contributes zero to [`aggregate_by_underlying`] /
+    /// [`aggregate_all`], so removing the shell only spares those calls from
+    /// iterating a dead entry.
+    ///
+    /// The prune uses [`DashMap::remove_if`] rather than a plain `remove`: it
+    /// re-checks `inner.is_empty()` while holding the shard lock, so if a
+    /// concurrent [`add_position`](Self::add_position) re-populated the account
+    /// between our emptiness observation and the prune, `is_empty()` is now
+    /// `false` and the account is correctly **kept**. A plain `remove` would
+    /// drop that concurrently-added position — a race this method must not
+    /// reintroduce.
+    ///
+    /// The mutable inner guard from `get_mut` is dropped before the
+    /// `remove_if` call (it re-enters the same `DashMap` shard), avoiding a
+    /// re-entrant shard deadlock.
+    ///
     /// # Arguments
     ///
     /// * `account` - Account identifier
     /// * `instrument_symbol` - Symbol of the instrument to remove
+    ///
+    /// [`aggregate_by_underlying`]: Self::aggregate_by_underlying
+    /// [`aggregate_all`]: Self::aggregate_all
     #[must_use]
     pub fn remove_position(&self, account: &str, instrument_symbol: &str) -> Option<Position> {
-        let mut entry = self.positions.get_mut(account)?;
-        entry.value_mut().remove(instrument_symbol)
+        // Scope the mutable guard so it is dropped before we re-enter the same
+        // `DashMap` shard via `remove_if` below.
+        let (removed, now_empty) = {
+            let mut entry = self.positions.get_mut(account)?;
+            let removed = entry.value_mut().remove(instrument_symbol);
+            let now_empty = entry.value().is_empty();
+            (removed, now_empty)
+        };
+
+        if now_empty {
+            // Atomically prune the account shell. `remove_if` re-checks
+            // emptiness under the shard lock, so a concurrent `add_position`
+            // that re-populated the account keeps it (is_empty() == false).
+            self.positions
+                .remove_if(account, |_, inner| inner.is_empty());
+        }
+
+        removed
     }
 
     /// Updates the Greeks for an existing position.
@@ -461,6 +502,11 @@ impl GreeksAggregator {
     }
 
     /// Returns the number of accounts with at least one position.
+    ///
+    /// Empty account shells are pruned eagerly by
+    /// [`remove_position`](Self::remove_position), so in normal operation no
+    /// empty entries exist. The non-empty filter is retained as defense in
+    /// depth and to keep the count correct regardless of store internals.
     #[must_use]
     pub fn account_count(&self) -> usize {
         self.positions
@@ -716,6 +762,105 @@ mod tests {
     fn test_remove_nonexistent_position() {
         let agg = GreeksAggregator::new();
         assert!(agg.remove_position("ghost", "BTC-C").is_none());
+    }
+
+    // ── Account-shell pruning (issue #82) ───────────────────────────────
+
+    #[test]
+    fn test_remove_last_position_prunes_account_shell() {
+        let agg = GreeksAggregator::new();
+        agg.add_position(
+            "solo",
+            Position::new("BTC-C", "BTC", 10, delta_only(Decimal::ONE)),
+        );
+        assert!(agg.positions.contains_key("solo"));
+        assert_eq!(agg.account_count(), 1);
+
+        let removed = agg.remove_position("solo", "BTC-C");
+        assert!(removed.is_some());
+
+        // (a) The account shell must be pruned, not left as an empty entry.
+        assert!(!agg.positions.contains_key("solo"));
+        assert_eq!(agg.account_count(), 0);
+
+        // (b) Aggregations skip the (now absent) account entirely — no
+        // contribution and no iteration over a dead entry.
+        assert_eq!(
+            agg.aggregate_by_underlying("BTC"),
+            AggregatedGreeks::default()
+        );
+        assert_eq!(agg.aggregate_all(), AggregatedGreeks::default());
+    }
+
+    #[test]
+    fn test_remove_non_last_position_keeps_account() {
+        let agg = GreeksAggregator::new();
+        agg.add_position(
+            "acc",
+            Position::new("BTC-C", "BTC", 10, delta_only(Decimal::ONE)),
+        );
+        agg.add_position(
+            "acc",
+            Position::new("ETH-C", "ETH", 5, delta_only(Decimal::ONE)),
+        );
+
+        // Removing one of two positions must NOT prune the account.
+        let _ = agg.remove_position("acc", "BTC-C");
+        assert!(agg.positions.contains_key("acc"));
+        assert_eq!(agg.account_count(), 1);
+        assert_eq!(agg.aggregate_by_account("acc").position_count, 1);
+    }
+
+    #[test]
+    fn test_repeated_open_close_does_not_leak_account_shells() {
+        let agg = GreeksAggregator::new();
+        // An account that repeatedly opens and closes its only position must
+        // not accumulate dead entries.
+        for _ in 0..100 {
+            agg.add_position(
+                "churner",
+                Position::new("BTC-C", "BTC", 1, delta_only(Decimal::ONE)),
+            );
+            let _ = agg.remove_position("churner", "BTC-C");
+        }
+        assert!(!agg.positions.contains_key("churner"));
+        assert_eq!(agg.account_count(), 0);
+        assert_eq!(agg.positions.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_if_keeps_concurrently_repopulated_account() {
+        // Deterministic single-thread reproduction of the add/remove race that
+        // `remove_if` must tolerate: the account is emptied, then re-populated
+        // before the prune runs. The prune must observe `is_empty() == false`
+        // and KEEP the account (a plain `remove` would drop the new position).
+        let agg = GreeksAggregator::new();
+        agg.add_position(
+            "acc",
+            Position::new("BTC-C", "BTC", 1, delta_only(Decimal::ONE)),
+        );
+
+        // Step 1: emulate "last position removed" — inner map becomes empty.
+        {
+            let mut entry = agg.positions.get_mut("acc").unwrap();
+            let _ = entry.value_mut().remove("BTC-C");
+        } // guard dropped
+
+        // Step 2: a concurrent add re-populates the account before the prune.
+        agg.add_position(
+            "acc",
+            Position::new("ETH-C", "ETH", 1, delta_only(Decimal::ONE)),
+        );
+
+        // Step 3: the prune that `remove_position` would have issued. Because
+        // the account is no longer empty, `remove_if` keeps it.
+        agg.positions.remove_if("acc", |_, inner| inner.is_empty());
+
+        assert!(agg.positions.contains_key("acc"));
+        assert_eq!(agg.account_count(), 1);
+        let result = agg.aggregate_by_account("acc");
+        assert_eq!(result.position_count, 1);
+        assert_eq!(result.delta, Decimal::ONE);
     }
 
     // ── Update position Greeks ──────────────────────────────────────────
