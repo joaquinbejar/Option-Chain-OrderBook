@@ -63,6 +63,8 @@ impl InstrumentInfo {
     }
 
     /// Returns the expiration date.
+    // No `#[must_use]`: the return type `ExpirationDate` is itself `#[must_use]`,
+    // so a function-level attribute would be a `clippy::double_must_use` error.
     #[inline]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
@@ -113,6 +115,20 @@ pub struct InstrumentRegistry {
     next_id: AtomicU32,
     /// Reverse index mapping instrument ID → instrument info.
     index: DashMap<u32, InstrumentInfo>,
+}
+
+impl std::fmt::Debug for InstrumentRegistry {
+    /// Diagnostic summary. Deliberately a lightweight, **deterministic** summary
+    /// (next id + entry count) rather than a `#[derive(Debug)]` over the inner
+    /// `DashMap`, whose `Debug` dumps entries in arbitrary shard order — a
+    /// determinism footgun if such output were ever folded into a hash or event.
+    /// Use [`iter`](Self::iter) for the full, id-ordered contents.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstrumentRegistry")
+            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .field("len", &self.index.len())
+            .finish()
+    }
 }
 
 impl InstrumentRegistry {
@@ -216,9 +232,15 @@ impl InstrumentRegistry {
 
     /// Returns a snapshot of all registered `(id, InstrumentInfo)` pairs.
     ///
+    /// Yields entries in ascending instrument-id order (deterministic).
+    /// Instrument IDs are unique, so the ordering is total and stable across
+    /// calls — this matters because the registry is exposed to external
+    /// sequencer/journal consumers, where an arbitrary `DashMap` shard order
+    /// would be a determinism footgun.
+    ///
     /// The returned `Vec` is a point-in-time snapshot — concurrent
     /// registrations that occur after the call begins may or may not
-    /// be included. The order of entries is arbitrary.
+    /// be included.
     ///
     /// # Examples
     ///
@@ -242,10 +264,15 @@ impl InstrumentRegistry {
     /// ```
     #[must_use]
     pub fn iter(&self) -> Vec<(u32, InstrumentInfo)> {
-        self.index
+        let mut entries: Vec<(u32, InstrumentInfo)> = self
+            .index
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect()
+            .collect();
+        // Ids are unique, so the key yields a total order: unstable sort is
+        // both deterministic and cheaper than a stable sort here.
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries
     }
 }
 
@@ -520,9 +547,9 @@ mod tests {
         let entries = registry.iter();
         assert_eq!(entries.len(), 5);
 
-        // Verify all IDs are present (order is arbitrary)
-        let mut ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
-        ids.sort();
+        // iter() guarantees ascending instrument-id order (deterministic), so
+        // the ids appear already sorted without any post-processing.
+        let ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
 
         // Verify info is correct for one entry
