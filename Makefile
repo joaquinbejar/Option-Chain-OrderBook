@@ -16,10 +16,10 @@ build:
 release:
 	cargo build --release
 
-# Run tests
+# Run tests (all features, so nats- and sequencer-gated code is covered)
 .PHONY: test
 test:
-	LOGLEVEL=WARN cargo test
+	LOGLEVEL=WARN cargo test --all-features
 
 # Format the code
 .PHONY: fmt
