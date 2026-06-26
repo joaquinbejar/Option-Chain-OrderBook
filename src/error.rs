@@ -4,14 +4,18 @@
 //! using `thiserror` for ergonomic error handling.
 
 use crate::orderbook::InstrumentStatus;
-use rust_decimal::Decimal;
 use thiserror::Error;
 
 /// Result type alias using the library's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Main error type for the Option-Chain-OrderBook library.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in a future
+/// release without it being a breaking change, so downstream `match`
+/// expressions over an `Error` value must include a wildcard (`_`) arm.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Error when an option contract is not found.
     #[error("option contract not found: {symbol}")]
@@ -87,53 +91,10 @@ pub enum Error {
         message: String,
     },
 
-    /// Error when inventory limits are exceeded.
-    #[error(
-        "inventory limit exceeded: {limit_type} limit of {limit} exceeded with value {current}"
-    )]
-    InventoryLimitExceeded {
-        /// Type of limit that was exceeded.
-        limit_type: String,
-        /// The configured limit value.
-        limit: Decimal,
-        /// The current value that exceeded the limit.
-        current: Decimal,
-    },
-
-    /// Error when risk limits are breached.
-    #[error("risk limit breached: {limit_type}")]
-    RiskLimitBreached {
-        /// Type of risk limit that was breached.
-        limit_type: String,
-    },
-
-    /// Error when hedging operation fails.
-    #[error("hedging error: {message}")]
-    HedgingError {
-        /// Description of the hedging error.
-        message: String,
-    },
-
     /// Error when quote generation fails.
     #[error("quoting error: {message}")]
     QuotingError {
         /// Description of the quoting error.
-        message: String,
-    },
-
-    /// Error when market data is invalid or missing.
-    #[error("market data error: {message}")]
-    MarketDataError {
-        /// Description of the market data error.
-        message: String,
-    },
-
-    /// Error when exchange adapter operation fails.
-    #[error("adapter error for {exchange}: {message}")]
-    AdapterError {
-        /// The exchange where the error occurred.
-        exchange: String,
-        /// Description of the adapter error.
         message: String,
     },
 
@@ -325,57 +286,10 @@ impl Error {
         }
     }
 
-    /// Creates a new inventory limit exceeded error.
-    #[must_use]
-    pub fn inventory_limit_exceeded(
-        limit_type: impl Into<String>,
-        limit: Decimal,
-        current: Decimal,
-    ) -> Self {
-        Self::InventoryLimitExceeded {
-            limit_type: limit_type.into(),
-            limit,
-            current,
-        }
-    }
-
-    /// Creates a new risk limit breached error.
-    #[must_use]
-    pub fn risk_limit_breached(limit_type: impl Into<String>) -> Self {
-        Self::RiskLimitBreached {
-            limit_type: limit_type.into(),
-        }
-    }
-
-    /// Creates a new hedging error.
-    #[must_use]
-    pub fn hedging(message: impl Into<String>) -> Self {
-        Self::HedgingError {
-            message: message.into(),
-        }
-    }
-
     /// Creates a new quoting error.
     #[must_use]
     pub fn quoting(message: impl Into<String>) -> Self {
         Self::QuotingError {
-            message: message.into(),
-        }
-    }
-
-    /// Creates a new market data error.
-    #[must_use]
-    pub fn market_data(message: impl Into<String>) -> Self {
-        Self::MarketDataError {
-            message: message.into(),
-        }
-    }
-
-    /// Creates a new adapter error.
-    #[must_use]
-    pub fn adapter(exchange: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::AdapterError {
-            exchange: exchange.into(),
             message: message.into(),
         }
     }
@@ -490,29 +404,11 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
 
     #[test]
     fn test_contract_not_found_error() {
         let err = Error::contract_not_found("BTC-20240329-50000-C");
         assert!(err.to_string().contains("BTC-20240329-50000-C"));
-    }
-
-    #[test]
-    fn test_inventory_limit_exceeded_error() {
-        let err = Error::inventory_limit_exceeded("delta", dec!(100000), dec!(150000));
-        let msg = err.to_string();
-        assert!(msg.contains("delta"));
-        assert!(msg.contains("100000"));
-        assert!(msg.contains("150000"));
-    }
-
-    #[test]
-    fn test_adapter_error() {
-        let err = Error::adapter("Deribit", "connection timeout");
-        let msg = err.to_string();
-        assert!(msg.contains("Deribit"));
-        assert!(msg.contains("connection timeout"));
     }
 
     #[test]
@@ -551,31 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_limit_breached_error() {
-        let err = Error::risk_limit_breached("max_delta");
-        let msg = err.to_string();
-        assert!(msg.contains("max_delta"));
-    }
-
-    #[test]
-    fn test_hedging_error() {
-        let err = Error::hedging("hedge order failed");
-        let msg = err.to_string();
-        assert!(msg.contains("hedge order failed"));
-    }
-
-    #[test]
     fn test_quoting_error() {
         let err = Error::quoting("spread too wide");
         let msg = err.to_string();
         assert!(msg.contains("spread too wide"));
-    }
-
-    #[test]
-    fn test_market_data_error() {
-        let err = Error::market_data("stale data");
-        let msg = err.to_string();
-        assert!(msg.contains("stale data"));
     }
 
     #[test]
