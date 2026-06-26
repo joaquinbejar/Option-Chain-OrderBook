@@ -75,13 +75,14 @@ impl<T: Default> Default for Shared<T> {
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Shared<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f.debug_struct("Shared").field("inner", &*guard).finish()
+        // Clone the value out (releasing the read lock) BEFORE formatting, so a
+        // `T::fmt` that re-enters this lock cannot deadlock and a slow format
+        // cannot block writers — matching the bespoke wrappers this replaced,
+        // which formatted a `get()` clone rather than holding the guard.
+        let value = self.get();
+        f.debug_struct("Shared").field("inner", &value).finish()
     }
 }
 
