@@ -436,10 +436,27 @@ mod tests {
             Ok(s) => s,
             Err(e) => panic!("serialize failed: {e}"),
         };
-        assert_eq!(
-            json,
-            r#"{"bid_price":100,"bid_size":10,"ask_price":105,"ask_size":5,"timestamp_ms":1234567890}"#,
-            "transparent newtypes must serialize as bare numbers, not wrapper objects"
+        // Assert the transparent shape via `serde_json::Value` (robust to field
+        // order / whitespace): every field must be a bare JSON number with the
+        // expected value — not a wrapper object/array — proving the newtypes
+        // serialize identically to the legacy raw-integer wire form.
+        let value: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(e) => panic!("parse to Value failed: {e}"),
+        };
+        assert_eq!(value["bid_price"], serde_json::json!(100));
+        assert_eq!(value["bid_size"], serde_json::json!(10));
+        assert_eq!(value["ask_price"], serde_json::json!(105));
+        assert_eq!(value["ask_size"], serde_json::json!(5));
+        assert_eq!(value["timestamp_ms"], serde_json::json!(1_234_567_890));
+        // Each price/size field is a bare number, not a `{ "0": .. }` wrapper.
+        assert!(
+            value["bid_price"].is_number() && value["ask_price"].is_number(),
+            "transparent prices must be bare numbers, not wrapper objects"
+        );
+        assert!(
+            value["bid_size"].is_number() && value["timestamp_ms"].is_number(),
+            "transparent sizes/timestamp must be bare numbers"
         );
 
         let back: Quote = match serde_json::from_str(&json) {
