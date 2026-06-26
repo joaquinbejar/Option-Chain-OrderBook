@@ -7,11 +7,10 @@ use super::contract_specs::ContractSpecs;
 use super::expiration::{
     ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager, SubtreeStats,
 };
-use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
-use super::fees::SharedFeeSchedule;
+use super::expiry_cycle::ExpiryCycleConfig;
 use super::index_feed::IndexPriceFeed;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
-use super::stp::SharedSTPMode;
+use super::shared::Shared;
 use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
@@ -54,7 +53,7 @@ pub struct UnderlyingOrderBook {
     /// Strike range configurations per expiry type.
     strike_range_configs: SharedStrikeRangeConfigs,
     /// Expiry cycle configuration for automatic expiration date generation.
-    expiry_cycle_config: SharedExpiryCycleConfig,
+    expiry_cycle_config: Shared<Option<ExpiryCycleConfig>>,
     /// External index price feed for mark price computation.
     ///
     /// A read-heavy snapshot consulted by mark-price readers, so it sits behind
@@ -190,7 +189,7 @@ impl UnderlyingOrderBook {
             registry: None,
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
-            expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            expiry_cycle_config: Shared::new(None),
             index_feed: RwLock::new(None),
         }
     }
@@ -220,7 +219,7 @@ impl UnderlyingOrderBook {
             registry: Some(registry),
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
-            expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            expiry_cycle_config: Shared::new(None),
             index_feed: RwLock::new(None),
         }
     }
@@ -252,7 +251,7 @@ impl UnderlyingOrderBook {
             registry: Some(registry),
             symbol_index: Some(symbol_index),
             strike_range_configs: SharedStrikeRangeConfigs::new(),
-            expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            expiry_cycle_config: Shared::new(None),
             index_feed: RwLock::new(None),
         }
     }
@@ -481,7 +480,7 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn set_expiry_cycle_config(&self, config: ExpiryCycleConfig) -> Result<()> {
         config.validate()?;
-        self.expiry_cycle_config.set(config);
+        self.expiry_cycle_config.set(Some(config));
         Ok(())
     }
 
@@ -508,7 +507,7 @@ impl UnderlyingOrderBook {
     /// After this call, [`expiry_cycle_config`](Self::expiry_cycle_config) returns `None`.
     #[inline]
     pub fn clear_expiry_cycle_config(&self) {
-        self.expiry_cycle_config.clear();
+        self.expiry_cycle_config.set(None);
     }
 
     /// Sets the external index price feed for this underlying.
@@ -954,9 +953,9 @@ pub struct UnderlyingOrderBookManager {
     /// Shared symbol index for O(1) lookup by symbol string.
     symbol_index: Arc<SymbolIndex>,
     /// STP mode propagated to newly created underlying books.
-    stp_mode: SharedSTPMode,
+    stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created underlying books.
-    fee_schedule: SharedFeeSchedule,
+    fee_schedule: Shared<Option<FeeSchedule>>,
     /// Per-contract NATS listener factory propagated to every underlying book
     /// (and onward to its expirations and strikes). Configured via
     /// [`with_nats_factory`](UnderlyingOrderBookManager::with_nats_factory);
@@ -983,8 +982,8 @@ impl UnderlyingOrderBookManager {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new()),
             symbol_index: Arc::new(SymbolIndex::new()),
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1005,8 +1004,8 @@ impl UnderlyingOrderBookManager {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new_with_seed(seed)),
             symbol_index: Arc::new(SymbolIndex::new()),
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }

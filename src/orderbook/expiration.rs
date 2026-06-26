@@ -4,14 +4,13 @@
 //! for managing all expirations for a single underlying asset.
 
 use super::chain::{ChainMassCancelResult, OptionChainOrderBook};
-use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
-use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
-use super::stp::SharedSTPMode;
+use super::shared::Shared;
 use super::strike::StrikeOrderBook;
 use super::symbol_index::SymbolIndex;
-use super::validation::{SharedValidationConfig, ValidationConfig};
+use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
@@ -564,17 +563,17 @@ pub struct ExpirationOrderBookManager {
     /// The underlying asset symbol.
     underlying: String,
     /// Validation config applied to newly created expiration books.
-    validation_config: SharedValidationConfig,
+    validation_config: Shared<Option<ValidationConfig>>,
     /// Contract specs propagated to newly created expiration books.
-    contract_specs: SharedContractSpecs,
+    contract_specs: Shared<Option<ContractSpecs>>,
     /// Instrument registry propagated to newly created expiration books.
     registry: Option<Arc<InstrumentRegistry>>,
     /// Symbol index for O(1) lookup by symbol string.
     symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode propagated to newly created expiration books.
-    stp_mode: SharedSTPMode,
+    stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created expiration books.
-    fee_schedule: SharedFeeSchedule,
+    fee_schedule: Shared<Option<FeeSchedule>>,
     /// Per-contract NATS listener factory propagated to newly created
     /// expiration books (and onward to their strikes). `None` (the default)
     /// reproduces the non-NATS path exactly.
@@ -593,12 +592,12 @@ impl ExpirationOrderBookManager {
         Self {
             expirations: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: None,
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -622,12 +621,12 @@ impl ExpirationOrderBookManager {
         Self {
             expirations: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -649,12 +648,12 @@ impl ExpirationOrderBookManager {
         Self {
             expirations: SkipMap::new(),
             underlying: underlying.into(),
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: Some(symbol_index),
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -665,7 +664,7 @@ impl ExpirationOrderBookManager {
     /// Existing expiration books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
     pub fn set_specs(&self, specs: ContractSpecs) {
-        self.contract_specs.set(specs);
+        self.contract_specs.set(Some(specs));
     }
 
     /// Returns the current contract specs, if any.
@@ -679,7 +678,7 @@ impl ExpirationOrderBookManager {
     /// Existing expiration books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have this config applied.
     pub fn set_validation(&self, config: ValidationConfig) {
-        self.validation_config.set(config);
+        self.validation_config.set(Some(config));
     }
 
     /// Returns the current validation config, if any.

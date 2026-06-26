@@ -6,13 +6,12 @@
 use super::book::{BookConfig, OptionOrderBook};
 #[cfg(feature = "nats")]
 use super::book::{ContractNatsListenerFactory, PreparedNatsListeners, SharedNatsFactory};
-use super::contract_specs::{ContractSpecs, SharedContractSpecs};
-use super::fees::SharedFeeSchedule;
+use super::contract_specs::ContractSpecs;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
-use super::stp::SharedSTPMode;
+use super::shared::Shared;
 use super::symbol_index::{SymbolIndex, SymbolRef};
-use super::validation::{SharedValidationConfig, ValidationConfig};
+use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crate::utils::{checked_accumulate, format_expiration_yyyymmdd};
 use crossbeam_skiplist::SkipMap;
@@ -735,17 +734,17 @@ pub struct StrikeOrderBookManager {
     /// The expiration date.
     expiration: ExpirationDate,
     /// Validation config applied to newly created strike books.
-    validation_config: SharedValidationConfig,
+    validation_config: Shared<Option<ValidationConfig>>,
     /// Contract specs propagated to newly created strike books.
-    contract_specs: SharedContractSpecs,
+    contract_specs: Shared<Option<ContractSpecs>>,
     /// Instrument registry for allocating IDs to new option books.
     registry: Option<Arc<InstrumentRegistry>>,
     /// Symbol index for O(1) lookup by symbol string.
     symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode applied to newly created option books.
-    stp_mode: SharedSTPMode,
+    stp_mode: Shared<STPMode>,
     /// Fee schedule applied to newly created option books.
-    fee_schedule: SharedFeeSchedule,
+    fee_schedule: Shared<Option<FeeSchedule>>,
     /// Per-contract NATS listener factory propagated from the top of the
     /// hierarchy. When present, each lazily created call/put book installs its
     /// own publishers pre-`Arc` in the [`get_or_create`](Self::get_or_create)
@@ -767,12 +766,12 @@ impl StrikeOrderBookManager {
             strikes: SkipMap::new(),
             underlying: underlying.into(),
             expiration,
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: None,
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -798,12 +797,12 @@ impl StrikeOrderBookManager {
             strikes: SkipMap::new(),
             underlying: underlying.into(),
             expiration,
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: None,
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -828,12 +827,12 @@ impl StrikeOrderBookManager {
             strikes: SkipMap::new(),
             underlying: underlying.into(),
             expiration,
-            validation_config: SharedValidationConfig::new(),
-            contract_specs: SharedContractSpecs::new(),
+            validation_config: Shared::new(None),
+            contract_specs: Shared::new(None),
             registry: Some(registry),
             symbol_index: Some(symbol_index),
-            stp_mode: SharedSTPMode::new(),
-            fee_schedule: SharedFeeSchedule::new(),
+            stp_mode: Shared::new(STPMode::None),
+            fee_schedule: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -852,7 +851,7 @@ impl StrikeOrderBookManager {
     /// via [`specs`](Self::specs). This does not modify any existing
     /// strike books or automatically apply to newly created ones.
     pub fn set_specs(&self, specs: ContractSpecs) {
-        self.contract_specs.set(specs);
+        self.contract_specs.set(Some(specs));
     }
 
     /// Returns the current contract specs, if any.
@@ -866,7 +865,7 @@ impl StrikeOrderBookManager {
     /// Existing strike books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will use this config.
     pub fn set_validation(&self, config: ValidationConfig) {
-        self.validation_config.set(config);
+        self.validation_config.set(Some(config));
     }
 
     /// Returns the current validation config, if any.

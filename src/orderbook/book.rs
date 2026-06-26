@@ -72,12 +72,15 @@ pub(crate) type ContractNatsListenerFactory =
 
 /// Thread-safe holder for an optional [`ContractNatsListenerFactory`].
 ///
-/// Mirrors [`SharedFeeSchedule`](super::fees::SharedFeeSchedule): hierarchy
-/// managers store the factory behind a lock so it can be propagated to children
-/// through `&self` setters — exactly like the STP mode and fee schedule —
-/// without threading it through every constructor signature (keeping the public
-/// constructor surface additive). The factory is an `Arc`, so [`get`](Self::get)
-/// is a cheap clone.
+/// Kept as a bespoke holder rather than the generic
+/// [`Shared`](super::shared::Shared)`<T>`: the inner factory is an
+/// `Arc<dyn Fn(..) -> ..>` which is not `Debug`, so this type carries a custom
+/// `Debug` that surfaces only whether a factory is configured (a `bool`) instead
+/// of the inner value. Like the generic holder, managers store the factory
+/// behind a lock so it can be propagated to children through `&self` setters —
+/// exactly like the STP mode and fee schedule — without threading it through
+/// every constructor signature (keeping the public constructor surface
+/// additive). The factory is an `Arc`, so [`get`](Self::get) is a cheap clone.
 #[cfg(feature = "nats")]
 #[derive(Default)]
 pub(crate) struct SharedNatsFactory {

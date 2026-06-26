@@ -64,6 +64,7 @@ mod instrument_registry;
 mod instrument_status;
 mod mark_price;
 mod quote;
+pub(crate) mod shared;
 mod stp;
 mod strike;
 mod strike_generator;

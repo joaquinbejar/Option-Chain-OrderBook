@@ -349,7 +349,10 @@ impl StrikeRangeConfigBuilder {
 ///
 /// Wraps a [`HashMap<ExpiryType, StrikeRangeConfig>`] in a [`RwLock`] so that
 /// hierarchy managers can store and update configs without requiring `&mut self`.
-/// Follows the same pattern as [`SharedContractSpecs`](super::contract_specs::SharedContractSpecs).
+///
+/// Unlike the single-value [`Shared`](super::shared::Shared)`<T>` holder, this is
+/// a keyed map with map-specific accessors (`set(key, value)` insert, keyed
+/// `get`, `remove`, `get_all`, `len`, `is_empty`), so it stays a bespoke wrapper.
 pub(crate) struct SharedStrikeRangeConfigs {
     /// The inner configs, protected by a read-write lock.
     inner: RwLock<HashMap<ExpiryType, StrikeRangeConfig>>,
