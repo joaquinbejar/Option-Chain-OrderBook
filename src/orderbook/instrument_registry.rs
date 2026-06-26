@@ -63,8 +63,9 @@ impl InstrumentInfo {
     }
 
     /// Returns the expiration date.
-    // No `#[must_use]`: the return type `ExpirationDate` is itself `#[must_use]`,
-    // so a function-level attribute would be a `clippy::double_must_use` error.
+    // No `#[must_use]`: the underlying type `ExpirationDate` (the referent of the
+    // returned `&ExpirationDate`) is itself `#[must_use]`, so a function-level
+    // attribute would be a `clippy::double_must_use` error.
     #[inline]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
@@ -118,11 +119,14 @@ pub struct InstrumentRegistry {
 }
 
 impl std::fmt::Debug for InstrumentRegistry {
-    /// Diagnostic summary. Deliberately a lightweight, **deterministic** summary
-    /// (next id + entry count) rather than a `#[derive(Debug)]` over the inner
-    /// `DashMap`, whose `Debug` dumps entries in arbitrary shard order — a
-    /// determinism footgun if such output were ever folded into a hash or event.
-    /// Use [`iter`](Self::iter) for the full, id-ordered contents.
+    /// Diagnostic summary (next id + entry count). Deliberately lightweight and
+    /// hand-rolled rather than a `#[derive(Debug)]` over the inner `DashMap`,
+    /// whose `Debug` dumps entries in arbitrary shard order — a footgun if such
+    /// output were ever folded into a hash or event. This avoids that
+    /// shard-order nondeterminism; note the two scalar fields are each read
+    /// independently, so under concurrent mutation the summary is a point-in-time
+    /// approximation, not a consistent snapshot. Use [`iter`](Self::iter) for the
+    /// full, id-ordered contents.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstrumentRegistry")
             .field("next_id", &self.next_id.load(Ordering::Relaxed))

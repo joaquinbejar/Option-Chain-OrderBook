@@ -61,8 +61,9 @@ impl SymbolRef {
     }
 
     /// Returns the expiration date.
-    // No `#[must_use]`: the return type `ExpirationDate` is itself `#[must_use]`,
-    // so a function-level attribute would be a `clippy::double_must_use` error.
+    // No `#[must_use]`: the underlying type `ExpirationDate` (the referent of the
+    // returned `&ExpirationDate`) is itself `#[must_use]`, so a function-level
+    // attribute would be a `clippy::double_must_use` error.
     #[inline]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
@@ -204,7 +205,7 @@ impl SymbolIndex {
         self.index.is_empty()
     }
 
-    /// Returns an iterator over all registered symbols.
+    /// Returns a snapshot `Vec` of all registered symbols, in unspecified order.
     #[must_use]
     pub fn symbols(&self) -> Vec<String> {
         self.index.iter().map(|entry| entry.key().clone()).collect()
