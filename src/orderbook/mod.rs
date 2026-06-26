@@ -58,6 +58,7 @@ mod expiry_scheduler;
 mod fees;
 pub mod greeks_aggregator;
 pub mod greeks_engine;
+mod index_feed;
 mod index_price_feed;
 mod instrument_registry;
 mod instrument_status;
@@ -97,10 +98,14 @@ pub use greeks_engine::{
     FlatVolSurface, GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener,
     VolSurface, calculate_tte_years,
 };
-pub use index_price_feed::{
-    IndexPriceFeed, MockPriceFeed, PriceUpdate, PriceUpdateListener, StaticPriceFeed,
-    SubscriptionId, wire_feed_to_calculator,
-};
+// The `IndexPriceFeed` trait and its value types live in the neutral
+// `index_feed` module (so the core hierarchy can depend on them without pulling
+// in the pricing subsystem); the concrete feeds and the calculator wiring live
+// in the pricing module `index_price_feed`. Both are re-exported here so the
+// public paths (`orderbook::IndexPriceFeed`, `orderbook::PriceUpdate`, …) are
+// unchanged.
+pub use index_feed::{IndexPriceFeed, PriceUpdate, PriceUpdateListener, SubscriptionId};
+pub use index_price_feed::{MockPriceFeed, StaticPriceFeed, wire_feed_to_calculator};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use mark_price::{MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder};

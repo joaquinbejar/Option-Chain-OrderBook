@@ -9,7 +9,7 @@ use super::expiration::{
 };
 use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
 use super::fees::SharedFeeSchedule;
-use super::index_price_feed::IndexPriceFeed;
+use super::index_feed::IndexPriceFeed;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
 use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
@@ -21,7 +21,7 @@ use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
@@ -53,7 +53,13 @@ pub struct UnderlyingOrderBook {
     /// Expiry cycle configuration for automatic expiration date generation.
     expiry_cycle_config: SharedExpiryCycleConfig,
     /// External index price feed for mark price computation.
-    index_feed: Mutex<Option<Arc<dyn IndexPriceFeed>>>,
+    ///
+    /// A read-heavy snapshot consulted by mark-price readers, so it sits behind
+    /// a [`RwLock`] rather than a `Mutex` to let concurrent readers proceed
+    /// without serializing. The trait comes from the neutral
+    /// [`index_feed`](super::index_feed) module, keeping this top-of-hierarchy
+    /// type independent of the pricing subsystem.
+    index_feed: RwLock<Option<Arc<dyn IndexPriceFeed>>>,
 }
 
 /// Underlying-level mass cancel summary.
@@ -177,7 +183,7 @@ impl UnderlyingOrderBook {
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
-            index_feed: Mutex::new(None),
+            index_feed: RwLock::new(None),
         }
     }
 
@@ -207,7 +213,7 @@ impl UnderlyingOrderBook {
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
-            index_feed: Mutex::new(None),
+            index_feed: RwLock::new(None),
         }
     }
 
@@ -239,7 +245,7 @@ impl UnderlyingOrderBook {
             symbol_index: Some(symbol_index),
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
-            index_feed: Mutex::new(None),
+            index_feed: RwLock::new(None),
         }
     }
 
@@ -508,15 +514,18 @@ impl UnderlyingOrderBook {
     /// assert!(book.index_feed().is_some());
     /// ```
     pub fn set_index_feed(&self, feed: Arc<dyn IndexPriceFeed>) {
-        let mut guard = self.index_feed.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.index_feed.write().unwrap_or_else(|p| p.into_inner());
         *guard = Some(feed);
     }
 
     /// Returns the currently attached index price feed, if any.
+    ///
+    /// Uses a shared read lock so concurrent mark-price readers do not
+    /// serialize against one another.
     #[must_use]
     pub fn index_feed(&self) -> Option<Arc<dyn IndexPriceFeed>> {
         self.index_feed
-            .lock()
+            .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
