@@ -74,6 +74,19 @@ This architecture enables:
 | [`error`] | Error types and `Result` type alias |
 | [`utils`] | Utility functions (e.g., date formatting) |
 
+### Re-export Convention
+
+Every public item is available at the crate root **and** under
+[`orderbook`]: `option_chain_orderbook::OptionOrderBook` and
+`option_chain_orderbook::orderbook::OptionOrderBook` resolve to the same
+type. Prefer the shorter crate-root path; the `orderbook::` path remains
+valid.
+
+The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`, and
+`Hash32` — are re-exported here from `orderbook_rs` / `pricelevel`, so
+consumers need **no direct `orderbook_rs` dependency** to use the hierarchy.
+(Price and quantity cross the leaf boundary as plain `u128` / `u64`.)
+
 ### Core Components
 
 #### Order Book Hierarchy ([`orderbook`])
@@ -94,10 +107,9 @@ This architecture enables:
 #### Creating a Hierarchical Order Book
 
 ```rust
-use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
+use option_chain_orderbook::{OrderId, Side, UnderlyingOrderBookManager};
 use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{OrderId, Side};
 
 let manager = UnderlyingOrderBookManager::new();
 let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
@@ -126,9 +138,8 @@ let stats = manager.stats();
 #### Creating a Single Option Order Book
 
 ```rust
-use option_chain_orderbook::orderbook::OptionOrderBook;
+use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
 use optionstratlib::OptionStyle;
-use orderbook_rs::{OrderId, Side};
 
 // Create an order book for a specific option
 let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);

@@ -60,6 +60,19 @@
 //! | [`error`] | Error types and `Result` type alias |
 //! | [`utils`] | Utility functions (e.g., date formatting) |
 //!
+//! ## Re-export Convention
+//!
+//! Every public item is available at the crate root **and** under
+//! [`orderbook`]: `option_chain_orderbook::OptionOrderBook` and
+//! `option_chain_orderbook::orderbook::OptionOrderBook` resolve to the same
+//! type. Prefer the shorter crate-root path; the `orderbook::` path remains
+//! valid.
+//!
+//! The boundary newtypes — `OrderId`, `OrderType`, `Side`, `TimeInForce`, and
+//! `Hash32` — are re-exported here from `orderbook_rs` / `pricelevel`, so
+//! consumers need **no direct `orderbook_rs` dependency** to use the hierarchy.
+//! (Price and quantity cross the leaf boundary as plain `u128` / `u64`.)
+//!
 //! ## Core Components
 //!
 //! ### Order Book Hierarchy ([`orderbook`])
@@ -80,10 +93,9 @@
 //! ### Creating a Hierarchical Order Book
 //!
 //! ```rust
-//! use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
+//! use option_chain_orderbook::{OrderId, Side, UnderlyingOrderBookManager};
 //! use optionstratlib::prelude::pos_or_panic;
 //! use optionstratlib::ExpirationDate;
-//! use orderbook_rs::{OrderId, Side};
 //!
 //! let manager = UnderlyingOrderBookManager::new();
 //! let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
@@ -112,9 +124,8 @@
 //! ### Creating a Single Option Order Book
 //!
 //! ```rust
-//! use option_chain_orderbook::orderbook::OptionOrderBook;
+//! use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
 //! use optionstratlib::OptionStyle;
-//! use orderbook_rs::{OrderId, Side};
 //!
 //! // Create an order book for a specific option
 //! let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
@@ -220,14 +231,42 @@ pub mod orderbook;
 pub mod utils;
 
 pub use error::{Error, Result};
+
+// Every public item of the [`orderbook`] module is also re-exported at the crate
+// root, so each type is reachable both as `option_chain_orderbook::X` and as
+// `option_chain_orderbook::orderbook::X`. This includes the primary hierarchy
+// types, the side subsystems, and the boundary newtypes (`OrderId`, `OrderType`,
+// `Side`, `TimeInForce`, `Hash32`) re-exported from `orderbook_rs` / `pricelevel`.
 pub use orderbook::{
-    AggregatedGreeks, CleanupResult, CycleRule, ExpirationCallback, ExpiryCycleConfig,
-    ExpiryLifecycleManager, ExpiryScheduler, ExpiryType, FlatVolSurface, GreeksAggregator,
-    GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener, IndexPriceFeed,
-    InstrumentInfo, InstrumentRegistry, LifecycleConfig, LifecycleEvent, LifecycleListener,
-    LifecycleResult, MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MockPriceFeed,
-    Position, PriceUpdate, PriceUpdateListener, RefreshResult, StaticPriceFeed, StrikeGenerator,
-    StrikeRangeConfig, StrikeRangeConfigBuilder, SubscriptionId, SymbolIndex, SymbolRef,
-    VolSurface, calculate_tte_years, wire_feed_to_calculator,
+    AggregatedGreeks, CancelReason, ChainMassCancelResult, CleanupResult, ContractSpecs,
+    ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback, ExpirationManagerStats,
+    ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager, ExpiryCycleConfig,
+    ExpiryLifecycleManager, ExpiryScheduler, ExpiryType, FeeSchedule, FlatVolSurface,
+    GlobalMassCancelResult, GlobalStats, GreeksAggregator, GreeksEngine, GreeksRecalcTrigger,
+    GreeksUpdate, GreeksUpdateListener, Hash32, IndexPriceFeed, InstrumentInfo, InstrumentRegistry,
+    InstrumentStatus, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
+    MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MassCancelResult, MockPriceFeed,
+    OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats, OptionOrderBook, OrderId,
+    OrderStateTracker, OrderStatus, OrderType, Position, PriceUpdate, PriceUpdateListener, Quote,
+    QuoteUpdate, RefreshResult, STPMode, SettlementType, Side, StaticPriceFeed, StrikeGenerator,
+    StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager, StrikeRangeConfig,
+    StrikeRangeConfigBuilder, SubscriptionId, SymbolIndex, SymbolRef, TerminalOrderSummary,
+    TimeInForce, TradeResult, UnderlyingMassCancelResult, UnderlyingOrderBook,
+    UnderlyingOrderBookManager, UnderlyingStats, ValidationConfig, VolSurface, calculate_tte_years,
+    wire_feed_to_calculator,
 };
+
+#[cfg(feature = "nats")]
+pub use orderbook::{
+    NatsPublisherHandles, OptionChainNatsConfig, OptionChainSubjectBuilder,
+    build_option_order_book_with_nats,
+};
+
+#[cfg(feature = "sequencer")]
+pub use orderbook::{
+    InMemoryOptionChainJournal, MassCancelScope, MassCancelType, OptionChainCommand,
+    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult,
+    SequencedUnderlyingOrderBook,
+};
+
 pub use utils::{ParsedSymbol, SymbolParser};

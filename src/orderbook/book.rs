@@ -971,9 +971,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
@@ -1012,9 +1011,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
@@ -1053,9 +1051,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     /// use pricelevel::Hash32;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
@@ -1098,9 +1095,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// let id = OrderId::new();
@@ -1136,9 +1132,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// let id = OrderId::new();
@@ -1276,9 +1271,8 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
     /// use optionstratlib::OptionStyle;
-    /// use orderbook_rs::{OrderId, Side};
     /// use pricelevel::Hash32;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);

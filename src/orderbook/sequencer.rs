@@ -453,7 +453,7 @@ impl Default for OptionChainSequencer {
 /// use option_chain_orderbook::orderbook::{
 ///     InstrumentRegistry, SequencedUnderlyingOrderBook, SymbolIndex,
 /// };
-/// use orderbook_rs::{OrderId, Side};
+/// use option_chain_orderbook::{OrderId, Side};
 ///
 /// // 1. Create shared registry & symbol index
 /// let registry = Arc::new(InstrumentRegistry::new());
