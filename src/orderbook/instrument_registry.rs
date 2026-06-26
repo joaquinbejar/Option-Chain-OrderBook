@@ -10,6 +10,7 @@
 //! each call/put [`OptionOrderBook`](super::book::OptionOrderBook) is assigned a
 //! unique ID from the registry.
 
+use crate::error::{Error, Result};
 use dashmap::DashMap;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -150,16 +151,20 @@ impl InstrumentRegistry {
     /// Uses `Ordering::Relaxed` since the only invariant is uniqueness,
     /// not ordering relative to other memory operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the `u32` counter is exhausted (> 4 billion instruments).
+    /// Returns [`Error::InstrumentIdExhausted`] if the `u32` counter has
+    /// reached its `u32::MAX` ceiling (after roughly 4 billion allocations).
+    /// The instrument ID is protocol state, so exhaustion is surfaced as a
+    /// recoverable typed error rather than a panic. Reaching this ceiling is
+    /// astronomically unlikely in practice.
     #[inline]
-    pub fn allocate(&self) -> u32 {
+    pub fn allocate(&self) -> Result<u32> {
         self.next_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
-            .expect("instrument ID counter exhausted")
+            .map_err(|_| Error::instrument_id_exhausted())
     }
 
     /// Registers an instrument in the reverse index.
@@ -223,7 +228,7 @@ impl InstrumentRegistry {
     /// use optionstratlib::prelude::pos_or_panic;
     ///
     /// let registry = InstrumentRegistry::new();
-    /// let id = registry.allocate();
+    /// let id = registry.allocate().expect("fresh registry has IDs available");
     /// registry.register(id, InstrumentInfo::new(
     ///     "BTC-20240329-50000-C",
     ///     ExpirationDate::Days(pos_or_panic!(30.0)),
@@ -275,9 +280,9 @@ mod tests {
     #[test]
     fn test_allocate_monotonic() {
         let registry = InstrumentRegistry::new();
-        let id1 = registry.allocate();
-        let id2 = registry.allocate();
-        let id3 = registry.allocate();
+        let id1 = registry.allocate().expect("id available");
+        let id2 = registry.allocate().expect("id available");
+        let id3 = registry.allocate().expect("id available");
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -288,15 +293,44 @@ mod tests {
     #[test]
     fn test_allocate_with_seed() {
         let registry = InstrumentRegistry::new_with_seed(50);
-        assert_eq!(registry.allocate(), 50);
-        assert_eq!(registry.allocate(), 51);
+        assert_eq!(registry.allocate().expect("id available"), 50);
+        assert_eq!(registry.allocate().expect("id available"), 51);
         assert_eq!(registry.current_id(), 52);
+    }
+
+    #[test]
+    fn test_allocate_exhaustion_returns_typed_error() {
+        // Seeding at u32::MAX means checked_add(1) immediately overflows: the
+        // very first allocation must surface a typed error, never panic.
+        let registry = InstrumentRegistry::new_with_seed(u32::MAX);
+        let result = registry.allocate();
+        assert!(matches!(result, Err(Error::InstrumentIdExhausted)));
+    }
+
+    #[test]
+    fn test_allocate_exhaustion_after_last_id() {
+        // Seeding one below the ceiling allows exactly one successful allocation
+        // (returning u32::MAX - 1, advancing the counter to u32::MAX); the next
+        // allocation overflows and returns the typed exhaustion error.
+        let registry = InstrumentRegistry::new_with_seed(u32::MAX - 1);
+        assert_eq!(registry.allocate().expect("one id remains"), u32::MAX - 1);
+        assert_eq!(registry.current_id(), u32::MAX);
+        assert!(matches!(
+            registry.allocate(),
+            Err(Error::InstrumentIdExhausted)
+        ));
+        // Counter stays pinned at the ceiling; repeated calls keep erroring.
+        assert_eq!(registry.current_id(), u32::MAX);
+        assert!(matches!(
+            registry.allocate(),
+            Err(Error::InstrumentIdExhausted)
+        ));
     }
 
     #[test]
     fn test_register_and_get() {
         let registry = InstrumentRegistry::new();
-        let id = registry.allocate();
+        let id = registry.allocate().expect("id available");
 
         let info = InstrumentInfo::new(
             "BTC-20240329-50000-C",
@@ -330,7 +364,7 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
 
-        let id = registry.allocate();
+        let id = registry.allocate().expect("id available");
         registry.register(
             id,
             InstrumentInfo::new(
@@ -350,7 +384,7 @@ mod tests {
         let registry = InstrumentRegistry::new();
 
         for i in 0..10 {
-            let id = registry.allocate();
+            let id = registry.allocate().expect("id available");
             registry.register(
                 id,
                 InstrumentInfo::new(
@@ -396,7 +430,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let mut ids = Vec::new();
                 for _ in 0..100 {
-                    ids.push(reg.allocate());
+                    ids.push(reg.allocate().expect("id available"));
                 }
                 ids
             }));
@@ -456,7 +490,7 @@ mod tests {
     fn test_seed_zero_clamped_to_one() {
         let registry = InstrumentRegistry::new_with_seed(0);
         assert_eq!(registry.current_id(), 1);
-        assert_eq!(registry.allocate(), 1);
+        assert_eq!(registry.allocate().expect("id available"), 1);
     }
 
     #[test]
@@ -471,7 +505,7 @@ mod tests {
         let registry = InstrumentRegistry::new();
 
         for i in 0..5 {
-            let id = registry.allocate();
+            let id = registry.allocate().expect("id available");
             registry.register(
                 id,
                 InstrumentInfo::new(
