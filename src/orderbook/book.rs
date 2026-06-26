@@ -8,9 +8,11 @@ use super::quote::Quote;
 use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
+#[cfg(feature = "nats")]
+use orderbook_rs::PriceLevelChangedListener;
 use orderbook_rs::{
     DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, OrderStateTracker,
-    OrderStatus, STPMode, Side, TimeInForce, TradeResult,
+    OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
 };
 use pricelevel::{Hash32, MatchResult, Quantity};
 use std::collections::hash_map::DefaultHasher;
@@ -19,12 +21,36 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Pre-built NATS publisher listeners to install on the inner order book
+/// *before* it is wrapped in `Arc`.
+///
+/// `orderbook_rs` only allows a single trade listener and a single book-change
+/// listener, and both must be registered while the `OrderBook<T>` is still
+/// owned mutably (pre-`Arc`). This struct ferries the already-constructed
+/// listeners — typed purely as `orderbook_rs`-native callbacks — into
+/// [`OptionOrderBook::new_with_config`] so the leaf never imports the eventing
+/// `nats` module. The dependency direction is therefore `nats` → `book`, never
+/// the reverse.
+///
+/// Constructed by the `nats` module's `build_option_order_book_with_nats`
+/// free function (kept as a plain reference, not an intra-doc link, so the leaf
+/// carries no path into the eventing layer).
+#[cfg(feature = "nats")]
+#[derive(Clone)]
+pub(crate) struct PreparedNatsListeners {
+    /// Trade publisher listener, multiplexed with the internal trade-capture
+    /// listener into a single [`TradeListener`].
+    pub trade_listener: TradeListener,
+    /// Book-change publisher listener installed via `set_price_level_listener`.
+    pub book_listener: PriceLevelChangedListener,
+}
+
 /// Internal configuration for constructing an [`OptionOrderBook`].
 ///
 /// Consolidates all optional configuration (instrument ID, validation,
 /// STP mode, fee schedule) into a single struct, avoiding constructor
 /// explosion as new features are added.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct BookConfig {
     /// Numeric instrument ID (0 for standalone books).
     pub instrument_id: u32,
@@ -40,6 +66,26 @@ pub(crate) struct BookConfig {
     /// due to status recording. For extreme low-latency scenarios where every
     /// microsecond matters, set this to `false` to disable tracking entirely.
     pub enable_state_tracking: bool,
+    /// Pre-built NATS publisher listeners installed before the inner book is
+    /// wrapped in `Arc` (feature `nats`). `None` for every non-NATS path.
+    #[cfg(feature = "nats")]
+    pub nats_listeners: Option<PreparedNatsListeners>,
+}
+
+impl std::fmt::Debug for BookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut dbg = f.debug_struct("BookConfig");
+        dbg.field("instrument_id", &self.instrument_id)
+            .field("validation", &self.validation)
+            .field("stp_mode", &self.stp_mode)
+            .field("fee_schedule", &self.fee_schedule)
+            .field("enable_state_tracking", &self.enable_state_tracking);
+        // The NATS listeners are boxed closures and carry no `Debug`; surface
+        // only whether they are present so the impl stays informative.
+        #[cfg(feature = "nats")]
+        dbg.field("nats_listeners", &self.nats_listeners.is_some());
+        dbg.finish()
+    }
 }
 
 impl Default for BookConfig {
@@ -50,6 +96,8 @@ impl Default for BookConfig {
             stp_mode: STPMode::None,
             fee_schedule: None,
             enable_state_tracking: true,
+            #[cfg(feature = "nats")]
+            nats_listeners: None,
         }
     }
 }
@@ -226,12 +274,33 @@ impl OptionOrderBook {
         // Install trade-capture listener so `_full` methods can return TradeResult
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
         let capture_clone = Arc::clone(&capture);
-        book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+        let capture_listener: TradeListener = Arc::new(move |tr: &TradeResult| {
             let mut guard = capture_clone
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(tr.clone());
-        }));
+        });
+
+        // When NATS publishers were prepared (feature `nats`), multiplex the
+        // trade-capture listener with the NATS trade publisher into the single
+        // `TradeListener` that `orderbook_rs` supports, and install the
+        // book-change publisher listener. This is done here — before the book
+        // is wrapped in `Arc` — because that is the only window in which the
+        // inner `OrderBook<T>` can have listeners registered.
+        #[cfg(feature = "nats")]
+        match config.nats_listeners {
+            Some(prepared) => {
+                let nats_trade = prepared.trade_listener;
+                book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+                    capture_listener(tr);
+                    nats_trade(tr);
+                }));
+                book.set_price_level_listener(prepared.book_listener);
+            }
+            None => book.set_trade_listener(capture_listener),
+        }
+        #[cfg(not(feature = "nats"))]
+        book.set_trade_listener(capture_listener);
 
         // Install order state tracker for lifecycle tracking (enabled by default)
         let terminal_counters = if config.enable_state_tracking {
@@ -1424,88 +1493,6 @@ impl OptionOrderBook {
     pub fn market_impact(&self, quantity: u64, side: Side) -> orderbook_rs::MarketImpact {
         self.book.market_impact(quantity, side)
     }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS trade and book change publishers to this order book.
-    ///
-    /// This method creates NATS publishers for trade events and price level
-    /// changes, using hierarchical subjects based on the option symbol.
-    ///
-    /// # Subject Format
-    ///
-    /// - Trades: `{prefix}.trades.{underlying}.{expiry}.{strike}.{type}`
-    /// - Book changes: `{prefix}.book.{underlying}.{expiry}.{strike}.{type}`
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the symbol cannot be parsed into its components.
-    ///
-    /// # Feature Gate
-    ///
-    /// This method is only available when the `nats` feature is enabled.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<NatsPublisherHandles> {
-        use super::nats::OptionChainSubjectBuilder;
-        use orderbook_rs::prelude::{NatsBookChangePublisher, NatsTradePublisher};
-
-        let subject = OptionChainSubjectBuilder::from_symbol(&self.symbol)?;
-        let trade_subject = subject.trade_subject(config.subject_prefix());
-        let book_subject = subject.book_subject(config.subject_prefix());
-
-        // Create trade publisher
-        let trade_publisher = NatsTradePublisher::new(
-            config.jetstream().clone(),
-            trade_subject,
-            config.runtime().clone(),
-        );
-        let (trade_handle, trade_listener) = trade_publisher.into_listener();
-
-        // Create book change publisher
-        let book_change_publisher = NatsBookChangePublisher::new(
-            config.jetstream().clone(),
-            self.symbol.clone(),
-            book_subject,
-            config.runtime().clone(),
-        );
-        let (book_handle, book_listener) = book_change_publisher.into_listener();
-
-        // Note: The underlying DefaultOrderBook is wrapped in Arc, so we cannot
-        // modify listeners after construction. This is a limitation - NATS
-        // integration should ideally be configured at construction time.
-        // For now, we return the handles and listeners for the caller to use.
-
-        Ok(NatsPublisherHandles {
-            trade_handle,
-            trade_listener,
-            book_handle,
-            book_listener,
-        })
-    }
-}
-
-/// Handles and listeners for NATS publishers.
-///
-/// Returned by [`OptionOrderBook::connect_nats`] when the `nats` feature is enabled.
-/// The handles can be used to read metrics (publish counts, error counts), and
-/// the listeners should be attached to the order book during construction.
-#[cfg(feature = "nats")]
-pub struct NatsPublisherHandles {
-    /// Handle to the trade publisher for reading metrics.
-    pub trade_handle: std::sync::Arc<orderbook_rs::prelude::NatsTradePublisher>,
-    /// Trade listener to attach to the order book.
-    pub trade_listener: orderbook_rs::prelude::TradeListener,
-    /// Handle to the book change publisher for reading metrics.
-    pub book_handle: std::sync::Arc<orderbook_rs::prelude::NatsBookChangePublisher>,
-    /// Book change listener to attach to the order book.
-    pub book_listener: orderbook_rs::orderbook::book_change_event::PriceLevelChangedListener,
 }
 
 #[cfg(test)]
@@ -2596,6 +2583,8 @@ mod tests {
                 stp_mode: STPMode::CancelTaker,
                 fee_schedule: Some(schedule),
                 enable_state_tracking: true,
+                #[cfg(feature = "nats")]
+                nats_listeners: None,
             },
         );
         assert_eq!(book.instrument_id(), 42);
@@ -2938,5 +2927,91 @@ mod tests {
         assert!(book.get_order_status(id).is_none());
         assert_eq!(book.active_order_count(), 0);
         assert_eq!(book.terminal_order_count(), 0);
+    }
+
+    /// A matched trade must drive the prepared NATS trade publisher listener
+    /// (carrying the configured subject), while the internal trade-capture
+    /// listener and the book-change publisher listener stay wired too.
+    ///
+    /// This is a fully in-process check: the prepared listeners are capturable
+    /// stand-ins for the real `NatsTradePublisher` / `NatsBookChangePublisher`
+    /// callbacks (which capture their subject the same way), so no live NATS
+    /// server is required.
+    #[cfg(feature = "nats")]
+    #[test]
+    fn test_new_with_config_nats_listener_publishes_to_subject_on_match() {
+        use orderbook_rs::PriceLevelChangedEvent;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let symbol = "BTC-20240329-50000-C";
+
+        // The trade subject the production free function computes for this
+        // symbol with prefix "optionchain" (subject derivation is covered by
+        // `OptionChainSubjectBuilder`'s own tests; kept literal here so the leaf
+        // test stays free of the eventing `nats` module).
+        let expected_subject = "optionchain.trades.BTC.20240329.50000.C".to_string();
+
+        // Capturable stand-in for the NATS trade publisher's listener: it
+        // records the (captured) subject and counts the trades it receives,
+        // exactly as the real publisher's listener closure does.
+        let trade_count = Arc::new(AtomicU64::new(0));
+        let captured_subject = Arc::new(Mutex::new(None::<String>));
+        let trade_count_c = Arc::clone(&trade_count);
+        let captured_subject_c = Arc::clone(&captured_subject);
+        let subject_for_closure = expected_subject.clone();
+        let trade_listener: TradeListener = Arc::new(move |_tr: &TradeResult| {
+            trade_count_c.fetch_add(1, Ordering::Relaxed);
+            *captured_subject_c.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(subject_for_closure.clone());
+        });
+
+        // Capturable stand-in for the book-change publisher's listener.
+        let book_change_count = Arc::new(AtomicU64::new(0));
+        let book_change_count_c = Arc::clone(&book_change_count);
+        let book_listener: PriceLevelChangedListener =
+            Arc::new(move |_ev: PriceLevelChangedEvent| {
+                book_change_count_c.fetch_add(1, Ordering::Relaxed);
+            });
+
+        let book = OptionOrderBook::new_with_config(
+            symbol,
+            OptionStyle::Call,
+            BookConfig {
+                nats_listeners: Some(PreparedNatsListeners {
+                    trade_listener,
+                    book_listener,
+                }),
+                ..BookConfig::default()
+            },
+        );
+
+        // Rest a sell, then cross it with a marketable buy to force a trade.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
+            .expect("rest sell");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("cross buy");
+
+        // The NATS trade listener fired on the match, carrying the subject.
+        assert!(
+            trade_count.load(Ordering::Relaxed) >= 1,
+            "nats trade listener must fire on a matched trade"
+        );
+        let got = captured_subject
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(got, Some(expected_subject));
+
+        // The internal trade-capture listener is preserved by the multiplex.
+        assert!(
+            book.last_trade_result().is_some(),
+            "trade-capture listener must remain wired alongside NATS"
+        );
+
+        // The book-change publisher listener was installed and fired.
+        assert!(
+            book_change_count.load(Ordering::Relaxed) >= 1,
+            "book-change listener must fire on price-level changes"
+        );
     }
 }

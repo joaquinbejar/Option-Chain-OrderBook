@@ -836,34 +836,6 @@ impl UnderlyingOrderBook {
             total_orders: self.total_order_count(),
         }
     }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS publishers to all expirations for this underlying.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Returns
-    ///
-    /// The total number of option books successfully connected.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered while connecting.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<usize> {
-        let mut total_connected = 0usize;
-        for (_, book) in self.expirations.iter() {
-            let connected = book.connect_nats(config)?;
-            total_connected = total_connected.saturating_add(connected);
-        }
-        Ok(total_connected)
-    }
 }
 
 /// Statistics about an underlying order book.
@@ -1492,34 +1464,6 @@ impl UnderlyingOrderBookManager {
             total_strikes: self.total_strike_count(),
             total_orders: self.total_order_count(),
         }
-    }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS publishers to all underlyings in the system.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Returns
-    ///
-    /// The total number of option books successfully connected.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered while connecting.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<usize> {
-        let mut total_connected = 0usize;
-        for entry in self.underlyings.iter() {
-            let connected = entry.value().connect_nats(config)?;
-            total_connected = total_connected.saturating_add(connected);
-        }
-        Ok(total_connected)
     }
 }
 

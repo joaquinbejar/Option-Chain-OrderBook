@@ -25,7 +25,10 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use option_chain_orderbook::orderbook::nats::OptionChainNatsConfig;
+//! use option_chain_orderbook::orderbook::nats::{
+//!     build_option_order_book_with_nats, OptionChainNatsConfig,
+//! };
+//! use optionstratlib::OptionStyle;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = async_nats::connect("nats://localhost:4222").await?;
@@ -33,14 +36,22 @@
 //! let handle = tokio::runtime::Handle::current();
 //!
 //! let config = OptionChainNatsConfig::new(jetstream, "optionchain".to_string(), handle);
-//! // Use underlying.connect_nats(&config) on any hierarchy level to wire up publishers
+//! // Build a contract order book with trade + book-change publishers attached
+//! // *before* the inner book is wrapped in `Arc` (the only valid install point).
+//! let (book, handles) =
+//!     build_option_order_book_with_nats("BTC-20240329-50000-C", OptionStyle::Call, &config)?;
+//! // `handles` exposes publish metrics and an async `shutdown()`.
+//! # let _ = (book, handles);
 //! # Ok(())
 //! # }
 //! ```
 
+use super::book::{BookConfig, OptionOrderBook, PreparedNatsListeners};
 use crate::error::Error;
 use crate::utils::SymbolParser;
 use optionstratlib::OptionStyle;
+use orderbook_rs::prelude::{NatsBookChangePublisher, NatsTradePublisher};
+use std::sync::Arc;
 
 /// Configuration for connecting NATS publishers to the option chain hierarchy.
 ///
@@ -288,6 +299,164 @@ impl OptionChainSubjectBuilder {
     pub fn subjects(&self, prefix: &str) -> (String, String) {
         (self.trade_subject(prefix), self.book_subject(prefix))
     }
+}
+
+/// Handles to the NATS publishers wired into an [`OptionOrderBook`].
+///
+/// Returned by [`build_option_order_book_with_nats`]. The listeners themselves
+/// are already installed on the inner order book; these handles are retained so
+/// the caller can read publish metrics and drive a clean async shutdown of the
+/// background batch tasks the publishers spawn.
+///
+/// Dropping the handles does **not** stop the background tasks immediately —
+/// call [`shutdown`](Self::shutdown) for a graceful drain.
+pub struct NatsPublisherHandles {
+    /// Handle to the trade publisher (metrics + shutdown).
+    pub trade_handle: Arc<NatsTradePublisher>,
+    /// Handle to the book-change publisher (metrics + shutdown).
+    pub book_handle: Arc<NatsBookChangePublisher>,
+}
+
+impl NatsPublisherHandles {
+    /// Returns the number of successfully published trades.
+    #[must_use]
+    #[inline]
+    pub fn trade_publish_count(&self) -> u64 {
+        self.trade_handle.publish_count()
+    }
+
+    /// Returns the number of permanently failed trade publishes.
+    #[must_use]
+    #[inline]
+    pub fn trade_error_count(&self) -> u64 {
+        self.trade_handle.error_count()
+    }
+
+    /// Returns the number of successfully published book-change events.
+    #[must_use]
+    #[inline]
+    pub fn book_publish_count(&self) -> u64 {
+        self.book_handle.publish_count()
+    }
+
+    /// Returns the number of permanently failed book-change publishes.
+    #[must_use]
+    #[inline]
+    pub fn book_error_count(&self) -> u64 {
+        self.book_handle.error_count()
+    }
+
+    /// Gracefully shuts down both publishers, draining and awaiting their
+    /// background batch tasks. Provides the cancellation/await path required of
+    /// every spawned task in this crate.
+    pub async fn shutdown(&self) {
+        self.trade_handle.shutdown().await;
+        self.book_handle.shutdown().await;
+    }
+}
+
+impl std::fmt::Debug for NatsPublisherHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsPublisherHandles")
+            .field("trade_publish_count", &self.trade_publish_count())
+            .field("trade_error_count", &self.trade_error_count())
+            .field("book_publish_count", &self.book_publish_count())
+            .field("book_error_count", &self.book_error_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builds an [`OptionOrderBook`] with NATS trade and book-change publishers
+/// attached.
+///
+/// `orderbook_rs` only permits a single trade listener and a single book-change
+/// listener, both of which must be registered while the inner `OrderBook<T>`
+/// is still owned mutably — i.e. *before* it is wrapped in `Arc`. This function
+/// constructs both publishers, converts them into their `orderbook_rs`-native
+/// listener callbacks, and threads those callbacks into the contract order book
+/// at construction time via [`OptionOrderBook::new_with_config`]. The trade
+/// publisher listener is multiplexed with the internal trade-capture listener.
+///
+/// The dependency direction is `nats` → `book`: this eventing-layer function
+/// consumes the leaf; the leaf never imports this module.
+///
+/// # Subject Format
+///
+/// - Trades: `{prefix}.trades.{underlying}.{expiry}.{strike}.{type}`
+/// - Book changes: `{prefix}.book.{underlying}.{expiry}.{strike}.{type}`
+///
+/// # Arguments
+///
+/// * `symbol` - The option contract symbol (e.g. `"BTC-20240329-50000-C"`)
+/// * `option_style` - The option style (Call or Put)
+/// * `config` - NATS configuration with JetStream context, subject prefix, and
+///   Tokio runtime handle
+///
+/// # Returns
+///
+/// The constructed [`OptionOrderBook`] (with publishers already wired) and the
+/// [`NatsPublisherHandles`] for metrics and shutdown.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSymbol`](crate::error::Error::InvalidSymbol) if the
+/// symbol cannot be parsed into its `{underlying}-{expiry}-{strike}-{type}`
+/// components or carries a NATS subject-reserved character.
+#[must_use = "the returned order book and publisher handles must be retained; \
+              dropping them tears the publishers down"]
+pub fn build_option_order_book_with_nats(
+    symbol: impl Into<String>,
+    option_style: OptionStyle,
+    config: &OptionChainNatsConfig,
+) -> crate::Result<(OptionOrderBook, NatsPublisherHandles)> {
+    let symbol = symbol.into();
+    let subject = OptionChainSubjectBuilder::from_symbol(&symbol)?;
+    let trade_subject = subject.trade_subject(config.subject_prefix());
+    let book_subject = subject.book_subject(config.subject_prefix());
+
+    // Build the trade publisher and convert it into its listener callback.
+    let trade_publisher = NatsTradePublisher::new(
+        config.jetstream().clone(),
+        trade_subject,
+        config.runtime().clone(),
+    );
+    let (trade_handle, trade_listener) = trade_publisher.into_listener();
+
+    // Build the book-change publisher and convert it into its listener callback.
+    let book_change_publisher = NatsBookChangePublisher::new(
+        config.jetstream().clone(),
+        symbol.clone(),
+        book_subject,
+        config.runtime().clone(),
+    );
+    let (book_handle, book_listener) = book_change_publisher.into_listener();
+
+    // Install both listeners on the inner book pre-`Arc` via the constructor.
+    let book = OptionOrderBook::new_with_config(
+        symbol,
+        option_style,
+        BookConfig {
+            nats_listeners: Some(PreparedNatsListeners {
+                trade_listener,
+                book_listener,
+            }),
+            ..BookConfig::default()
+        },
+    );
+
+    tracing::info!(
+        symbol = %book.symbol(),
+        prefix = %config.subject_prefix(),
+        "nats trade and book-change publishers attached to option order book"
+    );
+
+    Ok((
+        book,
+        NatsPublisherHandles {
+            trade_handle,
+            book_handle,
+        },
+    ))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
