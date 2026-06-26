@@ -118,9 +118,17 @@ impl ExpiryScheduler {
     /// # Algorithm
     ///
     /// 1. Generate expected dates from `expiry_config.generate_dates(now)`
-    /// 2. For each date, check if expiration already exists
-    /// 3. If new, create expiration and generate strikes
+    /// 2. For each date, atomically get-or-create the expiration, learning from
+    ///    the insert result whether this call created it
+    /// 3. If this call created it, generate strikes
     /// 4. Invoke callback for each newly created expiration
+    ///
+    /// # Concurrency
+    ///
+    /// Newness is derived from the atomic
+    /// [`UnderlyingOrderBook::get_or_create_expiration_inserted`] result rather
+    /// than a separate existence probe, so concurrent refreshes of the same
+    /// date create it, generate strikes, and invoke the callback exactly once.
     ///
     /// # Arguments
     ///
@@ -186,13 +194,15 @@ impl ExpiryScheduler {
         let mut result = RefreshResult::default();
 
         for date in expected_dates {
-            // Check if expiration already exists (not just empty)
-            let is_new = underlying.get_expiration(&date).is_err();
+            // Atomically get-or-create the expiration. `is_new` is the
+            // insert result of that single atomic publish, NOT a separate
+            // check-then-act probe: exactly one concurrent caller observes
+            // `is_new == true` for a given date (the `get_or_insert` winner),
+            // so strike generation and the callback run exactly once per date
+            // even under concurrent refreshes.
+            let (exp, is_new) = underlying.get_or_create_expiration_inserted(date);
 
-            // Get or create the expiration
-            let exp = underlying.get_or_create_expiration(date);
-
-            // Only process truly new expirations (not pre-existing empty ones)
+            // Only process truly new expirations (the unique creating caller).
             if is_new {
                 // Generate and apply strikes
                 let strikes =
@@ -568,6 +578,100 @@ mod tests {
             callback_count.load(Ordering::SeqCst),
             0,
             "callback should not be invoked for existing expirations"
+        );
+    }
+
+    // ── concurrent refresh race ────────────────────────────────────────────────
+
+    #[test]
+    fn test_refresh_expirations_concurrent_creates_each_date_once() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // N threads race to refresh the SAME set of expiration dates at the
+        // SAME wall-clock instant, started in lockstep via a Barrier (no
+        // sleeps). With newness derived from the atomic get-or-create insert
+        // result, each date is created exactly once: the manager holds one
+        // entry per date AND the callback fires exactly once per date.
+        //
+        // Regression direction: against the old separate `get_expiration`
+        // probe (check-then-act), multiple threads could each observe
+        // `is_new == true` for the same date before any insert landed,
+        // double-invoking the callback and re-running strike generation. That
+        // logic would make `callback_count` and `total_created` exceed the
+        // distinct-date count, failing the assertions below.
+        const N: usize = 16;
+        const SPOT: u64 = 50_000;
+
+        let book = Arc::new(UnderlyingOrderBook::new("BTC"));
+        let expiry_config = minimal_expiry_config(); // 2 daily expirations
+        let strike_config = default_strike_config();
+        // Capture a single fixed instant so every thread computes the SAME
+        // dates deterministically (no day-boundary flakiness, no RNG).
+        let now = Utc::now();
+
+        let expected_dates = expiry_config
+            .generate_dates(now)
+            .expect("valid config")
+            .len();
+        assert_eq!(expected_dates, 2, "fixture should produce 2 dates");
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_clone = Arc::clone(&callback_count);
+        let callback: Arc<ExpirationCallback> = Arc::new(Box::new(move |_date| {
+            callback_count_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let book = Arc::clone(&book);
+            let expiry_config = expiry_config.clone();
+            let strike_config = strike_config.clone();
+            let callback = Arc::clone(&callback);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                ExpiryScheduler::refresh_expirations(
+                    &book,
+                    now,
+                    &expiry_config,
+                    &strike_config,
+                    SPOT,
+                    Some(callback.as_ref()),
+                )
+                .expect("refresh should succeed")
+            }));
+        }
+
+        let mut total_created = 0usize;
+        for handle in handles {
+            let result = handle.join().expect("thread panicked");
+            total_created = total_created
+                .checked_add(result.created.len())
+                .expect("created overflow");
+        }
+
+        // Exactly-once create: the manager holds one entry per date.
+        assert_eq!(
+            book.expiration_count(),
+            expected_dates,
+            "each date must be created exactly once in the manager"
+        );
+
+        // Exactly-once create across threads: summed `created` over all
+        // refreshes equals the distinct-date count (one winner per date).
+        assert_eq!(
+            total_created, expected_dates,
+            "exactly one thread should report creating each date"
+        );
+
+        // Exactly-once callback: callback fired once per distinct date.
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            expected_dates,
+            "callback must fire exactly once per date"
         );
     }
 

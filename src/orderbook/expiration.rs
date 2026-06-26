@@ -729,9 +729,39 @@ impl ExpirationOrderBookManager {
     /// (instrument IDs and symbol-index entries are only allocated lazily at
     /// strike creation), so a dropped loser leaks nothing.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<ExpirationOrderBook> {
+        self.get_or_create_inserted(expiration).0
+    }
+
+    /// Gets or creates an expiration order book, reporting whether this call
+    /// performed the insertion.
+    ///
+    /// Returns `(book, inserted)` where `inserted` is `true` for exactly one
+    /// caller across all concurrent callers for a given expiration — the one
+    /// whose freshly built book actually won the atomic
+    /// [`SkipMap::get_or_insert`] publish. Every other caller (including the
+    /// fast path that observes a pre-existing entry, and concurrent race losers
+    /// whose fresh book is dropped) receives `inserted == false`. The returned
+    /// `book` is always the single winning handle.
+    ///
+    /// The `inserted` bit is the canonical signal for "this expiration was
+    /// genuinely created now" — callers must NOT re-probe with
+    /// [`get`](Self::get) to decide newness, because a separate probe reopens a
+    /// check-then-act race that double-counts a date under concurrency.
+    ///
+    /// # Concurrency
+    ///
+    /// Identical guarantees to [`get_or_create`](Self::get_or_create): atomic,
+    /// idempotent, lock-free. The winner is detected via
+    /// [`Arc::ptr_eq`] against the locally built handle, so the `inserted` flag
+    /// is derived purely from the atomic insert result with no extra map probe.
+    #[must_use]
+    pub fn get_or_create_inserted(
+        &self,
+        expiration: ExpirationDate,
+    ) -> (Arc<ExpirationOrderBook>, bool) {
         let key = ExpirationKey::from(&expiration);
         if let Some(entry) = self.expirations.get(&key) {
-            return Arc::clone(entry.value());
+            return (Arc::clone(entry.value()), false);
         }
         // Build and fully configure the fresh book BEFORE publishing it, so the
         // winning book is configured-before-visible. Configuration only mutates
@@ -764,9 +794,15 @@ impl ExpirationOrderBookManager {
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
         }
+        // Keep a handle to the locally built book so we can identify whether it
+        // won the race after the atomic publish.
+        let candidate = Arc::clone(&fresh);
         // Atomic, idempotent publish: first inserter wins and is never evicted.
         let entry = self.expirations.get_or_insert(key, fresh);
-        Arc::clone(entry.value())
+        // `inserted` is true iff the published value is the book we just built,
+        // i.e. this call is the unique `get_or_insert` winner for this key.
+        let inserted = Arc::ptr_eq(entry.value(), &candidate);
+        (Arc::clone(entry.value()), inserted)
     }
 
     /// Gets an expiration order book.
