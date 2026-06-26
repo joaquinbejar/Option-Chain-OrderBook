@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use chrono::{NaiveDate, TimeZone, Utc};
 use optionstratlib::{ExpirationDate, OptionStyle};
+use std::sync::Once;
 
 /// Formats an `ExpirationDate` as a string in `YYYYMMDD` format.
 ///
@@ -86,11 +87,17 @@ pub(crate) fn checked_accumulate(acc: usize, add: usize) -> usize {
     }
 }
 
-/// Logs the structurally unreachable subtree-stat counter overflow.
+/// Logs the structurally unreachable subtree-stat counter overflow exactly once
+/// per process. The cap keeps the tally at `usize::MAX`, so every subsequent
+/// accumulation also overflows; the [`Once`] guard prevents that from spamming
+/// the log.
 #[cold]
 #[inline(never)]
 fn cold_count_overflow() {
-    tracing::warn!("subtree stats counter overflowed usize; capping at usize::MAX");
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!("subtree stats counter overflowed usize; capping at usize::MAX");
+    });
 }
 
 /// Parsed components of an option symbol.
