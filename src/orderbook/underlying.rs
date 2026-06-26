@@ -2084,7 +2084,8 @@ mod tests {
             .settlement(SettlementType::Cash)
             .exercise_style(ExerciseStyle::European)
             .settlement_currency("USDC")
-            .build();
+            .build()
+            .expect("valid specs");
 
         book.set_specs(specs.clone());
 
@@ -2101,7 +2102,8 @@ mod tests {
             .lot_size(10)
             .min_order_size(5)
             .max_order_size(1000)
-            .build();
+            .build()
+            .expect("valid specs");
 
         book.set_specs(specs);
 
@@ -2128,7 +2130,8 @@ mod tests {
             .lot_size(10)
             .min_order_size(10)
             .max_order_size(1000)
-            .build();
+            .build()
+            .expect("valid specs");
 
         book.set_specs(specs);
 
@@ -2192,7 +2195,8 @@ mod tests {
             .settlement(SettlementType::Cash)
             .exercise_style(ExerciseStyle::European)
             .settlement_currency("USDC")
-            .build();
+            .build()
+            .expect("valid specs");
 
         btc.set_specs(specs.clone());
 
@@ -2231,7 +2235,12 @@ mod tests {
         let exp_before = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
 
         // Set specs after
-        book.set_specs(ContractSpecs::builder().tick_size(100).build());
+        book.set_specs(
+            ContractSpecs::builder()
+                .tick_size(100)
+                .build()
+                .expect("valid specs"),
+        );
 
         // Existing expiration's new strikes are NOT affected by validation
         let strike = exp_before.get_or_create_strike(50000);

@@ -4,6 +4,7 @@
 //! pre-trade validation rules (tick size, lot size, min/max order size)
 //! across the option chain hierarchy.
 
+use crate::error::{Error, Result};
 use std::sync::RwLock;
 
 /// Configuration for order validation rules.
@@ -60,6 +61,14 @@ impl ValidationConfig {
     /// # Arguments
     ///
     /// * `tick_size` - Minimum price increment in smallest price units
+    ///
+    /// # Footgun
+    ///
+    /// This setter is infallible. Setting `0` does NOT disable the rule cleanly
+    /// here: the upstream matching engine treats a zero tick as "validation
+    /// disabled", so an intended constraint silently vanishes. To disable tick
+    /// validation, leave it unset (`None`); to reject a zero tick as an error,
+    /// call [`validate`](Self::validate).
     #[must_use]
     #[inline]
     pub const fn with_tick_size(mut self, tick_size: u128) -> Self {
@@ -72,6 +81,14 @@ impl ValidationConfig {
     /// # Arguments
     ///
     /// * `lot_size` - Minimum quantity increment in smallest quantity units
+    ///
+    /// # Footgun
+    ///
+    /// This setter is infallible. Setting `0` does NOT disable the rule cleanly
+    /// here: the upstream matching engine treats a zero lot as "validation
+    /// disabled", so an intended constraint silently vanishes. To disable lot
+    /// validation, leave it unset (`None`); to reject a zero lot as an error,
+    /// call [`validate`](Self::validate).
     #[must_use]
     #[inline]
     pub const fn with_lot_size(mut self, lot_size: u64) -> Self {
@@ -84,6 +101,14 @@ impl ValidationConfig {
     /// # Arguments
     ///
     /// * `min` - Minimum allowed order quantity
+    ///
+    /// # Footgun
+    ///
+    /// This setter is infallible. Setting `0` does NOT disable the rule cleanly
+    /// here: the upstream matching engine treats a zero minimum as "validation
+    /// disabled". Additionally, the minimum must not exceed the maximum (when
+    /// both are set), otherwise every order is rejected. To enforce these
+    /// invariants, call [`validate`](Self::validate).
     #[must_use]
     #[inline]
     pub const fn with_min_order_size(mut self, min: u64) -> Self {
@@ -96,6 +121,12 @@ impl ValidationConfig {
     /// # Arguments
     ///
     /// * `max` - Maximum allowed order quantity
+    ///
+    /// # Footgun
+    ///
+    /// This setter is infallible and does not check that `max >= min`. An
+    /// inverted window (`max < min`) rejects every order. Call
+    /// [`validate`](Self::validate) to reject an inverted window.
     #[must_use]
     #[inline]
     pub const fn with_max_order_size(mut self, max: u64) -> Self {
@@ -139,6 +170,49 @@ impl ValidationConfig {
             && self.lot_size.is_none()
             && self.min_order_size.is_none()
             && self.max_order_size.is_none()
+    }
+
+    /// Validates the configured rules, rejecting structurally-broken settings.
+    ///
+    /// A field left unset (`None`) means "rule disabled" and always passes — the
+    /// empty default is valid. A field explicitly set to zero is rejected,
+    /// because the upstream matching engine treats a zero tick / lot / minimum
+    /// as "validation disabled", which silently discards an intended
+    /// constraint. An inverted `[min, max]` window is rejected because it would
+    /// reject every order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigurationError`] if:
+    /// - `tick_size` is set to zero
+    /// - `lot_size` is set to zero
+    /// - `min_order_size` is set to zero
+    /// - both `min_order_size` and `max_order_size` are set and
+    ///   `max_order_size < min_order_size`
+    pub fn validate(&self) -> Result<()> {
+        if self.tick_size == Some(0) {
+            return Err(Error::configuration(
+                "tick_size must be at least 1 (got 0); leave it unset to disable tick validation",
+            ));
+        }
+        if self.lot_size == Some(0) {
+            return Err(Error::configuration(
+                "lot_size must be at least 1 (got 0); leave it unset to disable lot validation",
+            ));
+        }
+        if self.min_order_size == Some(0) {
+            return Err(Error::configuration(
+                "min_order_size must be at least 1 (got 0); leave it unset to disable minimum-size validation",
+            ));
+        }
+        if let (Some(min), Some(max)) = (self.min_order_size, self.max_order_size)
+            && max < min
+        {
+            return Err(Error::configuration(format!(
+                "max_order_size ({max}) must be greater than or equal to min_order_size ({min})"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -335,5 +409,76 @@ mod tests {
         let shared = SharedValidationConfig::new();
         let debug = format!("{shared:?}");
         assert!(debug.contains("SharedValidationConfig"));
+    }
+
+    // ========== ValidationConfig::validate tests ==========
+
+    #[test]
+    fn test_validation_config_validate_empty_ok() {
+        let config = ValidationConfig::new();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_config_validate_full_ok() {
+        let config = ValidationConfig::new()
+            .with_tick_size(100)
+            .with_lot_size(10)
+            .with_min_order_size(1)
+            .with_max_order_size(1_000_000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_config_validate_zero_tick_rejected() {
+        let config = ValidationConfig::new().with_tick_size(0);
+        let err = match config.validate() {
+            Ok(()) => panic!("expected zero tick_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("tick_size"));
+        assert!(err.to_string().contains('0'));
+    }
+
+    #[test]
+    fn test_validation_config_validate_zero_lot_rejected() {
+        let config = ValidationConfig::new().with_lot_size(0);
+        let err = match config.validate() {
+            Ok(()) => panic!("expected zero lot_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("lot_size"));
+    }
+
+    #[test]
+    fn test_validation_config_validate_zero_min_rejected() {
+        let config = ValidationConfig::new().with_min_order_size(0);
+        let err = match config.validate() {
+            Ok(()) => panic!("expected zero min_order_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("min_order_size"));
+    }
+
+    #[test]
+    fn test_validation_config_validate_inverted_window_rejected() {
+        let config = ValidationConfig::new()
+            .with_min_order_size(100)
+            .with_max_order_size(10);
+        let err = match config.validate() {
+            Ok(()) => panic!("expected max < min to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("max_order_size"));
+        assert!(msg.contains("10"));
+        assert!(msg.contains("100"));
+    }
+
+    #[test]
+    fn test_validation_config_validate_only_max_set_ok() {
+        // A max with no min is a valid one-sided window.
+        let config = ValidationConfig::new().with_max_order_size(500);
+        assert!(config.validate().is_ok());
     }
 }
