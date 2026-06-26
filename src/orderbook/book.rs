@@ -578,12 +578,13 @@ impl OptionOrderBook {
 
     /// Stores the lifecycle status without validating the transition.
     ///
-    /// Test-only raw setter used to seed lifecycle states that no legal edge of
-    /// the enforced state machine can reach (e.g.
-    /// [`Pending`](InstrumentStatus::Pending), which every book leaves at
-    /// construction). It bypasses the transition check entirely, so it must
-    /// never be used on the production order path — [`set_status`](Self::set_status)
-    /// is the only validated, race-free way to mutate status.
+    /// Test-only raw setter used to seed lifecycle states that the enforced
+    /// state machine cannot reach from a constructed book (e.g.
+    /// [`Pending`](InstrumentStatus::Pending): books are constructed as
+    /// [`Active`](InstrumentStatus::Active) and no legal edge leads back to
+    /// `Pending`). It bypasses the transition check entirely, so it must never be
+    /// used on the production order path — [`set_status`](Self::set_status) is the
+    /// only validated, race-free way to mutate status.
     #[cfg(test)]
     #[inline]
     fn store_status(&self, status: InstrumentStatus) {
@@ -752,7 +753,7 @@ impl OptionOrderBook {
     /// Expiry is a terminal sweep: it is a legal transition from every
     /// non-terminal status and an idempotent no-op from
     /// [`Expired`](InstrumentStatus::Expired), so in practice it always
-    /// succeeds. The orders are only swept once the transition is accepted.
+    /// succeeds. The orders are only swept when the transition is accepted.
     ///
     /// The status transition is atomic (a CAS loop in
     /// [`set_status`](Self::set_status)), but the sweep is *idempotent* rather
@@ -2396,18 +2397,76 @@ mod tests {
 
     #[test]
     fn test_set_status_expired_is_terminal_under_concurrent_resume() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::{Arc, Barrier, Mutex};
         use std::thread;
 
-        // Spin the interleaving over many fresh books so the lost-CAS path is
-        // reliably exercised: one thread drives `Halted -> Expired` while another
-        // concurrently races `Halted -> Active` (resume), both released from the
+        // Race one expirer (`Halted -> Expired`) against one resumer
+        // (`Halted -> Active`) on a fresh book each round, both released from the
         // same barrier. The invariant under test is that once a book reaches the
-        // terminal `Expired` status it can NEVER end `Active` — `set_status(Active)`
-        // must either win the CAS before expiry (returning `Ok`) or lose it and
-        // return `IllegalStatusTransition`. The former check-then-act setter could
-        // clobber `Expired` with `Active` here; the CAS loop closes that race.
-        for _ in 0..2_000 {
+        // terminal `Expired` status it can NEVER end `Active` — `resume()` must
+        // either win the CAS before expiry (returning `Ok`) or lose it and return
+        // `IllegalStatusTransition`. The former check-then-act setter could clobber
+        // `Expired` with `Active` here; the CAS loop closes that race.
+        //
+        // Two long-lived worker threads are reused across every round (only two
+        // spawns total) and synchronized per round by a pair of 3-party barriers,
+        // so the test stays cheap on constrained CI rather than spawning a thread
+        // pair per round. `round_ready` publishes the round's book to both workers
+        // (the barrier provides the happens-before for the slot write); `round_done`
+        // ensures both workers finished before the main thread asserts.
+        const ROUNDS: usize = 2_000;
+        let slot: Arc<Mutex<Option<Arc<OptionOrderBook>>>> = Arc::new(Mutex::new(None));
+        let round_ready = Arc::new(Barrier::new(3));
+        let round_done = Arc::new(Barrier::new(3));
+
+        let expirer = {
+            let slot = Arc::clone(&slot);
+            let round_ready = Arc::clone(&round_ready);
+            let round_done = Arc::clone(&round_done);
+            thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    round_ready.wait();
+                    let book = slot.lock().unwrap().clone().expect("book published");
+                    book.set_status(InstrumentStatus::Expired)
+                        .expect("transition to Expired is legal from every live state");
+                    round_done.wait();
+                }
+            })
+        };
+
+        let resumer = {
+            let slot = Arc::clone(&slot);
+            let round_ready = Arc::clone(&round_ready);
+            let round_done = Arc::clone(&round_done);
+            thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    round_ready.wait();
+                    let book = slot.lock().unwrap().clone().expect("book published");
+                    // Concurrent cross-check: IF resume happened to lose the race,
+                    // it must have failed with the typed illegal-transition error
+                    // (`Expired -> Active`), never silently. A resume that wins
+                    // returns `Ok`, so this branch is schedule-dependent and we do
+                    // not assert it fires — the typed rejection is covered
+                    // deterministically by `test_set_status_expired_to_active_rejected`
+                    // and `test_resume_expired_rejected`.
+                    if let Err(err) = book.resume() {
+                        assert!(
+                            matches!(
+                                err,
+                                Error::IllegalStatusTransition {
+                                    from: InstrumentStatus::Expired,
+                                    to: InstrumentStatus::Active,
+                                }
+                            ),
+                            "unexpected resume error: {err:?}",
+                        );
+                    }
+                    round_done.wait();
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
             let book = Arc::new(OptionOrderBook::new(
                 "BTC-20240329-50000-C",
                 OptionStyle::Call,
@@ -2417,30 +2476,10 @@ mod tests {
             // genuinely contend (an `Active -> Active` resume is a no-op and would
             // not exercise the race).
             book.halt().expect("Active -> Halted is legal");
+            *slot.lock().unwrap() = Some(Arc::clone(&book));
 
-            let barrier = Arc::new(Barrier::new(2));
-
-            let expirer = {
-                let book = Arc::clone(&book);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    book.set_status(InstrumentStatus::Expired)
-                        .expect("transition to Expired is legal from every live state");
-                })
-            };
-
-            let resumer = {
-                let book = Arc::clone(&book);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    book.resume()
-                })
-            };
-
-            expirer.join().expect("expirer thread panicked");
-            let resume_result = resumer.join().expect("resumer thread panicked");
+            round_ready.wait(); // release both workers onto this round's book
+            round_done.wait(); // both have finished; safe to read the final status
 
             // The book always ends terminal-`Expired`, never reactivated.
             assert_eq!(
@@ -2448,28 +2487,10 @@ mod tests {
                 InstrumentStatus::Expired,
                 "book must remain Expired after a concurrent resume",
             );
-
-            // Concurrent cross-check: IF resume happened to lose the race, it
-            // must have failed with the typed illegal-transition error
-            // (`Expired -> Active`), never silently. This branch is
-            // schedule-dependent (a resume that wins returns `Ok`), so we do not
-            // assert it fires here — the typed rejection is covered
-            // deterministically by `test_set_status_expired_to_active_rejected`
-            // and `test_resume_expired_rejected`. The deterministic invariant
-            // this concurrent test owns is the `status() == Expired` assert above.
-            if let Err(err) = resume_result {
-                assert!(
-                    matches!(
-                        err,
-                        Error::IllegalStatusTransition {
-                            from: InstrumentStatus::Expired,
-                            to: InstrumentStatus::Active,
-                        }
-                    ),
-                    "unexpected resume error: {err:?}",
-                );
-            }
         }
+
+        expirer.join().expect("expirer thread panicked");
+        resumer.join().expect("resumer thread panicked");
     }
 
     #[test]
