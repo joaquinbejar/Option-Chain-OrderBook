@@ -30,21 +30,28 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
+//! use option_chain_orderbook::{OrderId, Side};
+//! use optionstratlib::ExpirationDate;
+//! use optionstratlib::prelude::pos_or_panic;
 //!
-//! let mut manager = UnderlyingOrderBookManager::new();
+//! let manager = UnderlyingOrderBookManager::new();
 //!
-//! // Create BTC option chain
+//! // Create a BTC option chain at a 30-day expiry and a 50_000 strike.
 //! let btc = manager.get_or_create("BTC");
-//! let exp = btc.get_or_create_expiration("20240329");
-//! let strike = exp.get_or_create_strike(50000);
+//! let exp = btc.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
+//! let strike = exp.get_or_create_strike(50_000);
 //!
-//! // Add orders to call
-//! strike.call().add_limit_order(order_id, Side::Buy, 100, 10)?;
+//! // Add a two-sided market to the call book.
+//! strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+//!     .expect("add bid should succeed");
+//! strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+//!     .expect("add ask should succeed");
 //!
-//! // Get quote
+//! // Read the best quote.
 //! let quote = strike.call().best_quote();
+//! assert!(quote.is_two_sided());
 //! ```
 
 mod book;

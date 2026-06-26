@@ -261,7 +261,8 @@ impl OptionChainSubjectBuilder {
     /// ```
     /// use option_chain_orderbook::orderbook::nats::OptionChainSubjectBuilder;
     ///
-    /// let builder = OptionChainSubjectBuilder::from_symbol("BTC-20240329-50000-C").unwrap();
+    /// let builder = OptionChainSubjectBuilder::from_symbol("BTC-20240329-50000-C")
+    ///     .expect("well-formed contract symbol should parse");
     /// assert_eq!(builder.underlying(), "BTC");
     /// assert_eq!(builder.expiry(), "20240329");
     /// assert_eq!(builder.strike(), "50000");
