@@ -93,6 +93,31 @@ pub fn underlying_orderbook_operations(c: &mut Criterion) {
         b.iter(|| underlying.stats());
     });
 
+    // Benchmark a WIDE-chain `stats()` (issue #81 Part A: the single-pass
+    // accumulator replaces the three independent subtree walks
+    // expiration_count() + total_strike_count() + total_order_count() with one
+    // coherent traversal). 4 expirations x 250 strikes = 1000 strikes, with the
+    // put leg populated on every other strike so the order tally is non-trivial.
+    group.bench_function("stats_wide_chain", |b| {
+        let underlying = UnderlyingOrderBook::new("BTC");
+        for days in [30, 60, 90, 120] {
+            let exp = ExpirationDate::Days(pos_or_panic!(days as f64));
+            let exp_book = underlying.get_or_create_expiration(exp);
+            for i in 0..250u64 {
+                let s = exp_book.get_or_create_strike(10000 + i * 100);
+                s.call()
+                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .unwrap();
+                if i % 2 == 0 {
+                    s.put()
+                        .add_limit_order(OrderId::new(), Side::Sell, 50, 10)
+                        .unwrap();
+                }
+            }
+        }
+        b.iter(|| underlying.stats());
+    });
+
     group.finish();
 }
 
@@ -167,6 +192,33 @@ pub fn underlying_manager_operations(c: &mut Criterion) {
                 let exp = ExpirationDate::Days(pos_or_panic!(days as f64));
                 let exp_book = underlying.get_or_create_expiration(exp);
                 for strike in (40000..60000).step_by(10000) {
+                    let s = exp_book.get_or_create_strike(strike);
+                    s.call()
+                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .unwrap();
+                }
+            }
+        }
+        b.iter(|| manager.stats());
+    });
+
+    // Benchmark a HIGH-FANOUT manager `stats()` (issue #81 Part A): many
+    // underlyings x many expirations x few strikes each — the shape that most
+    // exercises the single-pass accumulator (the manager walks the `underlyings`
+    // map ONCE instead of len + total_expiration_count + total_strike_count +
+    // total_order_count, and each underlying fuses its expiration and strike
+    // walks). Measured perf is neutral vs the old multi-pass path even here
+    // (leaf `order_count()` is called once per leaf either way and dominates);
+    // the change's value is the coherent single-walk snapshot under concurrency,
+    // not throughput. This case documents the non-regression.
+    group.bench_function("stats_high_fanout", |b| {
+        let manager = UnderlyingOrderBookManager::new();
+        for u in 0..20u64 {
+            let underlying = manager.get_or_create(format!("SYM{u}"));
+            for days in [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84] {
+                let exp = ExpirationDate::Days(pos_or_panic!(days as f64));
+                let exp_book = underlying.get_or_create_expiration(exp);
+                for strike in [40000u64, 50000, 60000] {
                     let s = exp_book.get_or_create_strike(strike);
                     s.call()
                         .add_limit_order(OrderId::new(), Side::Buy, 100, 10)

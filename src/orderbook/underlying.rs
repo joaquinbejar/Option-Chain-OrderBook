@@ -5,7 +5,7 @@
 
 use super::contract_specs::ContractSpecs;
 use super::expiration::{
-    ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager,
+    ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager, SubtreeStats,
 };
 use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
 use super::fees::SharedFeeSchedule;
@@ -16,6 +16,7 @@ use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfi
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
+use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
@@ -634,7 +635,7 @@ impl UnderlyingOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_all(&self) -> Result<UnderlyingMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
             let expiration_key = expiration.to_string();
@@ -678,7 +679,7 @@ impl UnderlyingOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_by_side(&self, side: Side) -> Result<UnderlyingMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
             let expiration_key = expiration.to_string();
@@ -725,7 +726,7 @@ impl UnderlyingOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_by_user(&self, user_id: Hash32) -> Result<UnderlyingMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
             let expiration_key = expiration.to_string();
@@ -873,14 +874,34 @@ impl UnderlyingOrderBook {
         self.expirations.total_strike_count()
     }
 
+    /// Returns a single-pass subtree tally (expirations, strikes, orders).
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::subtree_stats`], walking the
+    /// whole expiration/strike subtree exactly once. Consumed by both
+    /// [`stats`](Self::stats) and the global
+    /// [`UnderlyingOrderBookManager::stats`].
+    #[must_use]
+    pub(crate) fn subtree_stats(&self) -> SubtreeStats {
+        self.expirations.subtree_stats()
+    }
+
     /// Returns statistics about this underlying.
+    ///
+    /// Computed in a single leaf-up traversal of the expiration/strike subtree:
+    /// the expiration, strike, and order counts are tallied together in one
+    /// walk, producing a coherent snapshot instead of the three independent
+    /// walks the separate [`expiration_count`](Self::expiration_count),
+    /// [`total_strike_count`](Self::total_strike_count), and
+    /// [`total_order_count`](Self::total_order_count) accessors perform. Those
+    /// accessors remain available and unchanged for single-metric reads.
     #[must_use]
     pub fn stats(&self) -> UnderlyingStats {
+        let tally = self.subtree_stats();
         UnderlyingStats {
             underlying: self.underlying.clone(),
-            expiration_count: self.expiration_count(),
-            total_strikes: self.total_strike_count(),
-            total_orders: self.total_order_count(),
+            expiration_count: tally.expirations,
+            total_strikes: tally.strikes,
+            total_orders: tally.orders,
         }
     }
 }
@@ -1238,7 +1259,7 @@ impl UnderlyingOrderBookManager {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_all_across_underlyings(&self) -> Result<GlobalMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.underlyings.len());
 
         for entry in self.underlyings.iter() {
             let underlying_key = entry.key().clone();
@@ -1283,7 +1304,7 @@ impl UnderlyingOrderBookManager {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_by_side_across_underlyings(&self, side: Side) -> Result<GlobalMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.underlyings.len());
 
         for entry in self.underlyings.iter() {
             let underlying_key = entry.key().clone();
@@ -1334,7 +1355,7 @@ impl UnderlyingOrderBookManager {
         &self,
         user_id: Hash32,
     ) -> Result<GlobalMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.underlyings.len());
 
         for entry in self.underlyings.iter() {
             let underlying_key = entry.key().clone();
@@ -1540,13 +1561,28 @@ impl UnderlyingOrderBookManager {
     }
 
     /// Returns statistics about the entire order book system.
+    ///
+    /// Computed in a single leaf-up traversal: each underlying is visited once
+    /// and its expiration/strike subtree walked once, so the underlying,
+    /// expiration, strike, and order counts form a coherent snapshot rather
+    /// than four independent passes over the hierarchy. The per-metric
+    /// accessors ([`total_expiration_count`](Self::total_expiration_count),
+    /// [`total_strike_count`](Self::total_strike_count),
+    /// [`total_order_count`](Self::total_order_count)) remain available and
+    /// unchanged.
     #[must_use]
     pub fn stats(&self) -> GlobalStats {
+        let mut underlying_count = 0usize;
+        let mut acc = SubtreeStats::default();
+        for entry in self.underlyings.iter() {
+            underlying_count = checked_accumulate(underlying_count, 1);
+            acc.merge(entry.value().subtree_stats());
+        }
         GlobalStats {
-            underlying_count: self.len(),
-            total_expirations: self.total_expiration_count(),
-            total_strikes: self.total_strike_count(),
-            total_orders: self.total_order_count(),
+            underlying_count,
+            total_expirations: acc.expirations,
+            total_strikes: acc.strikes,
+            total_orders: acc.orders,
         }
     }
 }
@@ -2039,6 +2075,70 @@ mod tests {
 
         let display = format!("{}", stats);
         assert!(display.contains("BTC"));
+    }
+
+    #[test]
+    fn test_single_pass_stats_equals_per_accessor_values() {
+        // Issue #81 Part A: the single-pass `stats()` accumulator must yield
+        // exactly the same field values that the independent per-metric
+        // accessors produce on a quiescent, populated tree. Build a multi
+        // underlying / multi expiration / multi strike tree with a varying
+        // number of orders per leg, then cross-check both the per-underlying
+        // and the global `stats()` against the old separate walks.
+        let manager = UnderlyingOrderBookManager::new();
+
+        for (u, sym) in ["BTC", "ETH", "SPX"].iter().enumerate() {
+            let underlying = manager.get_or_create(*sym);
+            for d in 0..(u + 2) {
+                let exp = ExpirationDate::Days(pos_or_panic!((30 + d * 7) as f64));
+                let exp_book = underlying.get_or_create_expiration(exp);
+                for s in 0..(d + 3) {
+                    let strike = 40000 + (s as u64) * 1000;
+                    let strike_book = exp_book.get_or_create_strike(strike);
+                    strike_book
+                        .call()
+                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .expect("add call");
+                    // Populate the put leg on only some strikes so call/put
+                    // counts differ and the order tally cannot accidentally
+                    // match by symmetry.
+                    if s % 2 == 0 {
+                        strike_book
+                            .put()
+                            .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
+                            .expect("add put");
+                    }
+                }
+            }
+
+            // Per-underlying single-pass stats equals the three separate walks.
+            let stats = underlying.stats();
+            assert_eq!(stats.expiration_count, underlying.expiration_count());
+            assert_eq!(stats.total_strikes, underlying.total_strike_count());
+            assert_eq!(stats.total_orders, underlying.total_order_count());
+        }
+
+        // Global single-pass stats equals the four separate manager walks.
+        let global = manager.stats();
+        assert_eq!(global.underlying_count, manager.len());
+        assert_eq!(global.total_expirations, manager.total_expiration_count());
+        assert_eq!(global.total_strikes, manager.total_strike_count());
+        assert_eq!(global.total_orders, manager.total_order_count());
+
+        // The global totals also equal the sum of the per-underlying single
+        // pass tallies, proving the accumulator folds consistently up the tree.
+        let mut exp_sum = 0usize;
+        let mut strike_sum = 0usize;
+        let mut order_sum = 0usize;
+        for sym in ["BTC", "ETH", "SPX"] {
+            let s = manager.get(sym).expect("underlying exists").stats();
+            exp_sum += s.expiration_count;
+            strike_sum += s.total_strikes;
+            order_sum += s.total_orders;
+        }
+        assert_eq!(global.total_expirations, exp_sum);
+        assert_eq!(global.total_strikes, strike_sum);
+        assert_eq!(global.total_orders, order_sum);
     }
 
     #[test]

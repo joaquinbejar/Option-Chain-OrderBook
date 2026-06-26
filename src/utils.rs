@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use chrono::{NaiveDate, TimeZone, Utc};
 use optionstratlib::{ExpirationDate, OptionStyle};
+use std::sync::Once;
 
 /// Formats an `ExpirationDate` as a string in `YYYYMMDD` format.
 ///
@@ -61,6 +62,42 @@ pub(crate) fn nanos_since_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// Accumulates a `usize` subtree-stat counter with checked addition.
+///
+/// Hierarchy stats (expiration / strike / order counts) are tallied through
+/// this helper so the per-counter arithmetic uses `checked_add` rather than a
+/// `saturating_*` / `wrapping_*` method (per the crate's counter-arithmetic
+/// rule). On the structurally unreachable overflow of a `usize` count it logs
+/// once via the [`cold`](cold_count_overflow) path and caps at `usize::MAX`,
+/// keeping the tally monotonic without panicking or wrapping. The explicit
+/// `match` (rather than `checked_add(..).unwrap_or(usize::MAX)`) deliberately
+/// keeps the checked form instead of collapsing to manual saturating
+/// arithmetic.
+#[inline]
+#[must_use]
+pub(crate) fn checked_accumulate(acc: usize, add: usize) -> usize {
+    match acc.checked_add(add) {
+        Some(sum) => sum,
+        None => {
+            cold_count_overflow();
+            usize::MAX
+        }
+    }
+}
+
+/// Logs the structurally unreachable subtree-stat counter overflow exactly once
+/// per process. The cap keeps the tally at `usize::MAX`, so every subsequent
+/// accumulation also overflows; the [`Once`] guard prevents that from spamming
+/// the log.
+#[cold]
+#[inline(never)]
+fn cold_count_overflow() {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!("subtree stats counter overflowed usize; capping at usize::MAX");
+    });
 }
 
 /// Parsed components of an option symbol.

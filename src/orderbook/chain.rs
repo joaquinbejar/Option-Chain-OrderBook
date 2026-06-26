@@ -292,6 +292,17 @@ impl OptionChainOrderBook {
         self.strikes.total_order_count()
     }
 
+    /// Returns the strike count and total order count in a single ordered pass.
+    ///
+    /// Delegates to [`StrikeOrderBookManager::strike_and_order_counts`], walking
+    /// the chain's strikes once to produce a coherent `(strikes, orders)`
+    /// snapshot for the single-pass `stats()` aggregation higher up the
+    /// hierarchy.
+    #[must_use]
+    pub(crate) fn strike_and_order_counts(&self) -> (usize, usize) {
+        self.strikes.strike_and_order_counts()
+    }
+
     /// Cancels all resting orders across every strike in the chain.
     ///
     /// # Description
@@ -327,7 +338,7 @@ impl OptionChainOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_all(&self) -> Result<ChainMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.strikes.len());
 
         for entry in self.strikes.iter() {
             let strike_key = entry.key().to_string();
@@ -373,7 +384,7 @@ impl OptionChainOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_by_side(&self, side: Side) -> Result<ChainMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.strikes.len());
 
         for entry in self.strikes.iter() {
             let strike_key = entry.key().to_string();
@@ -421,7 +432,7 @@ impl OptionChainOrderBook {
     /// assert_eq!(result.total_cancelled(), 0);
     /// ```
     pub fn cancel_by_user(&self, user_id: Hash32) -> Result<ChainMassCancelResult> {
-        let mut per_child = Vec::new();
+        let mut per_child = Vec::with_capacity(self.strikes.len());
 
         for entry in self.strikes.iter() {
             let strike_key = entry.key().to_string();

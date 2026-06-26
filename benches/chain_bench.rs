@@ -90,6 +90,31 @@ pub fn chain_orderbook_operations(c: &mut Criterion) {
         b.iter(|| chain.stats());
     });
 
+    // Benchmark a WIDE-chain mass-cancel sweep (issue #81 Part B: the per-child
+    // result Vec is pre-sized to the strike count, eliminating the reallocation
+    // churn the old `Vec::new()` + push loop incurred). 500 strikes, both legs
+    // populated; the tree is rebuilt each iteration because cancel is
+    // destructive.
+    group.bench_function("cancel_all_wide", |b| {
+        b.iter_batched(
+            || {
+                let chain = OptionChainOrderBook::new("BTC", test_expiration());
+                for strike in (10000..60000).step_by(100) {
+                    let s = chain.get_or_create_strike(strike);
+                    s.call()
+                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .unwrap();
+                    s.put()
+                        .add_limit_order(OrderId::new(), Side::Sell, 50, 10)
+                        .unwrap();
+                }
+                chain
+            },
+            |chain| chain.cancel_all().unwrap(),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
