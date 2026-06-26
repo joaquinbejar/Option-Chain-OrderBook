@@ -23,12 +23,16 @@
 //! let engine = GreeksEngine::new();
 //! let vol_surface = FlatVolSurface::new(0.30); // 30% IV
 //!
-//! // Subscribe to Greeks updates
-//! engine.subscribe(Arc::new(|update| {
+//! // Subscribe to Greeks updates; keep the id to unsubscribe later.
+//! let sub_id = engine.subscribe(Arc::new(|update| {
 //!     println!("Greeks updated for strike {}", update.strike);
 //! }));
+//!
+//! // Stop receiving updates and drop the listener.
+//! assert!(engine.unsubscribe(sub_id));
 //! ```
 
+use super::index_feed::SubscriptionId;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use optionstratlib::greeks::Greek;
@@ -214,8 +218,18 @@ pub type GreeksUpdateListener = Arc<dyn Fn(&GreeksUpdate) + Send + Sync>;
 /// let engine = GreeksEngine::with_throttle(Duration::from_millis(50));
 /// ```
 pub struct GreeksEngine {
-    /// Registered listeners notified on each Greeks update.
-    listeners: Mutex<Vec<GreeksUpdateListener>>,
+    /// Registered listeners notified on each Greeks update, each keyed by the
+    /// [`SubscriptionId`] handed back from [`subscribe`](Self::subscribe).
+    ///
+    /// Stored as an **ordered** `Vec<(SubscriptionId, GreeksUpdateListener)>`
+    /// (never a `HashMap`/`DashMap`): notification order must remain
+    /// deterministic — listeners fire in subscription (id) order. New
+    /// subscriptions push to the back with a monotonically increasing id, and
+    /// [`unsubscribe`](Self::unsubscribe) removes in place (preserving the
+    /// relative order of the survivors).
+    listeners: Mutex<Vec<(SubscriptionId, GreeksUpdateListener)>>,
+    /// Monotonically increasing counter allocating the next [`SubscriptionId`].
+    next_id: AtomicU64,
     /// Timestamp of the last recalculation in nanoseconds.
     last_recalc_ns: AtomicU64,
     /// Minimum interval between recalculations in nanoseconds.
@@ -241,6 +255,7 @@ impl GreeksEngine {
     pub fn with_throttle(throttle: Duration) -> Self {
         Self {
             listeners: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
             last_recalc_ns: AtomicU64::new(0),
             throttle_interval_ns: throttle.as_nanos() as u64,
         }
@@ -248,18 +263,63 @@ impl GreeksEngine {
 
     /// Registers a listener for Greeks update notifications.
     ///
-    /// Listeners are append-only — there is no unsubscribe.
+    /// Returns a [`SubscriptionId`] handle; pass it to
+    /// [`unsubscribe`](Self::unsubscribe) to stop receiving updates and drop the
+    /// listener (releasing any state it captured). Ids are unique and
+    /// monotonically increasing within a single engine instance; listeners fire
+    /// in id (subscription) order, so the notification order is deterministic.
+    ///
+    /// Mirrors [`IndexPriceFeed::subscribe`](super::IndexPriceFeed::subscribe):
+    /// the returned id is **not** `#[must_use]` — a transient caller that never
+    /// unsubscribes may ignore it.
     ///
     /// A poisoned lock (left by a panic at some other lock site) is recovered
     /// via [`std::sync::PoisonError::into_inner`] rather than silently
     /// swallowed, so a single panicking listener can never permanently disable
     /// subscription.
-    pub fn subscribe(&self, listener: GreeksUpdateListener) {
+    pub fn subscribe(&self, listener: GreeksUpdateListener) -> SubscriptionId {
+        let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut listeners = self.listeners.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("greeks listeners lock poisoned; recovering");
             poisoned.into_inner()
         });
-        listeners.push(listener);
+        listeners.push((id, listener));
+        id
+    }
+
+    /// Removes a previously registered listener by its [`SubscriptionId`].
+    ///
+    /// Returns `true` if a listener with that id was found and removed, `false`
+    /// if the id was not present (e.g. already unsubscribed, or never issued).
+    /// An unsubscribed listener stops receiving updates and is dropped, freeing
+    /// any state it captured.
+    ///
+    /// **Pass only an id returned by this engine's [`subscribe`](Self::subscribe).**
+    /// [`SubscriptionId`] is a bare counter shared with other subscription
+    /// sources (e.g. an [`IndexPriceFeed`](super::IndexPriceFeed)), and each
+    /// source numbers from zero independently, so an id minted elsewhere is not
+    /// interchangeable: it may coincidentally match — and remove — an unrelated
+    /// Greeks listener. Ids are engine-scoped handles, not global.
+    ///
+    /// Removal is in place ([`Vec::remove`]) so the relative order of the
+    /// surviving listeners — and therefore the deterministic notification order
+    /// — is preserved. Mirrors
+    /// [`IndexPriceFeed::unsubscribe`](super::IndexPriceFeed::unsubscribe).
+    ///
+    /// A poisoned lock is recovered via [`std::sync::PoisonError::into_inner`]
+    /// rather than silently swallowed.
+    pub fn unsubscribe(&self, id: SubscriptionId) -> bool {
+        let mut listeners = self.listeners.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("greeks listeners lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        match listeners.iter().position(|(entry_id, _)| *entry_id == id) {
+            Some(pos) => {
+                listeners.remove(pos);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Calculates Greeks for a single option.
@@ -495,12 +555,18 @@ impl GreeksEngine {
     /// rather than silently swallowed.
     fn notify_listeners(&self, update: &GreeksUpdate) {
         // Snapshot under the lock, then drop the guard before invoking anyone.
+        // Only the listener callbacks are needed for delivery; the snapshot
+        // preserves the stored (id) order, so notification order stays
+        // deterministic.
         let listeners: Vec<GreeksUpdateListener> = {
             let guard = self.listeners.lock().unwrap_or_else(|poisoned| {
                 tracing::warn!("greeks listeners lock poisoned; recovering");
                 poisoned.into_inner()
             });
-            guard.clone()
+            guard
+                .iter()
+                .map(|(_, listener)| Arc::clone(listener))
+                .collect()
         };
 
         for listener in &listeners {
@@ -713,6 +779,57 @@ mod tests {
         engine.record_and_notify(50000, greeks.clone(), greeks, GreeksRecalcTrigger::Manual);
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_unsubscribe_stops_one_listener_keeps_other() {
+        let engine = GreeksEngine::new();
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let count_a_clone = Arc::clone(&count_a);
+        let id_a = engine.subscribe(Arc::new(move |_update| {
+            count_a_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let count_b_clone = Arc::clone(&count_b);
+        let _id_b = engine.subscribe(Arc::new(move |_update| {
+            count_b_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let greeks = sample_greek();
+
+        // First notify reaches both listeners.
+        engine.record_and_notify(
+            50000,
+            greeks.clone(),
+            greeks.clone(),
+            GreeksRecalcTrigger::Manual,
+        );
+        assert_eq!(count_a.load(Ordering::SeqCst), 1);
+        assert_eq!(count_b.load(Ordering::SeqCst), 1);
+
+        // Unsubscribe A — synchronous, so no further delivery can reach it.
+        assert!(engine.unsubscribe(id_a));
+
+        // Second notify: only B keeps incrementing; A is frozen.
+        engine.record_and_notify(50000, greeks.clone(), greeks, GreeksRecalcTrigger::Manual);
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "unsubscribed listener must stop"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            2,
+            "remaining listener must keep firing"
+        );
+
+        // Unsubscribing an unknown id is a no-op returning false.
+        assert!(!engine.unsubscribe(SubscriptionId(9999)));
+        // Re-unsubscribing the already-removed id also returns false.
+        assert!(!engine.unsubscribe(id_a));
     }
 
     #[test]
