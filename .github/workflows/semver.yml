@@ -20,6 +20,8 @@ permissions:
 
 env:
   RUST_BACKTRACE: full
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_HTTP_MULTIPLEXING: false
 
 jobs:
   semver:
