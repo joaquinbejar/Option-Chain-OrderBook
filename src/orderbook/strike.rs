@@ -575,35 +575,6 @@ impl StrikeOrderBook {
     pub const fn put_greeks(&self) -> Option<&Greek> {
         self.put_greeks.as_ref()
     }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS publishers to both call and put order books at this strike.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(call_handles, put_handles)` containing the publisher handles
-    /// for each side.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either book's symbol cannot be parsed.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<(
-        super::book::NatsPublisherHandles,
-        super::book::NatsPublisherHandles,
-    )> {
-        let call_handles = self.call.connect_nats(config)?;
-        let put_handles = self.put.connect_nats(config)?;
-        Ok((call_handles, put_handles))
-    }
 }
 
 /// Strike-level mass cancel summary.

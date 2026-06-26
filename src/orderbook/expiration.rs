@@ -524,31 +524,6 @@ impl ExpirationOrderBook {
     pub fn atm_strike(&self, spot: u64) -> Result<u64> {
         self.chain.atm_strike(spot)
     }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS publishers to all strikes in this expiration.
-    ///
-    /// Delegates to the underlying [`OptionChainOrderBook`].
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Returns
-    ///
-    /// The number of option books successfully connected.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered while connecting.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<usize> {
-        self.chain.connect_nats(config)
-    }
 }
 
 /// Manages expiration order books for a single underlying.

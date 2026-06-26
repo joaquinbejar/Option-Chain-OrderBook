@@ -116,9 +116,10 @@ pub use underlying::{
 pub use validation::ValidationConfig;
 
 #[cfg(feature = "nats")]
-pub use book::NatsPublisherHandles;
-#[cfg(feature = "nats")]
-pub use nats::{OptionChainNatsConfig, OptionChainSubjectBuilder};
+pub use nats::{
+    NatsPublisherHandles, OptionChainNatsConfig, OptionChainSubjectBuilder,
+    build_option_order_book_with_nats,
+};
 
 #[cfg(feature = "sequencer")]
 pub use sequencer::{

@@ -49,15 +49,6 @@ pub struct OptionChainOrderBook {
     /// Stored for future use in hierarchy traversal.
     #[allow(dead_code)]
     symbol_index: Option<Arc<SymbolIndex>>,
-    /// Stored NATS publisher handles for lifecycle management.
-    /// Each entry is a `(call_handles, put_handles)` pair per strike.
-    #[cfg(feature = "nats")]
-    nats_handles: std::sync::Mutex<
-        Vec<(
-            super::book::NatsPublisherHandles,
-            super::book::NatsPublisherHandles,
-        )>,
-    >,
 }
 
 impl OptionChainOrderBook {
@@ -78,8 +69,6 @@ impl OptionChainOrderBook {
             id: OrderId::new(),
             registry: None,
             symbol_index: None,
-            #[cfg(feature = "nats")]
-            nats_handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -112,8 +101,6 @@ impl OptionChainOrderBook {
             id: OrderId::new(),
             registry: Some(registry),
             symbol_index: None,
-            #[cfg(feature = "nats")]
-            nats_handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -146,8 +133,6 @@ impl OptionChainOrderBook {
             id: OrderId::new(),
             registry: Some(registry),
             symbol_index: Some(symbol_index),
-            #[cfg(feature = "nats")]
-            nats_handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -583,51 +568,6 @@ impl OptionChainOrderBook {
             strike_count: self.strike_count(),
             total_orders: self.total_order_count(),
         }
-    }
-
-    // ── NATS Integration ─────────────────────────────────────────────────
-
-    /// Connects NATS publishers to all strikes in this chain.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - NATS configuration with JetStream context and subject prefix
-    ///
-    /// # Returns
-    ///
-    /// The number of option books (call + put) successfully connected.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error encountered while connecting strikes.
-    #[cfg(feature = "nats")]
-    pub fn connect_nats(
-        &self,
-        config: &super::nats::OptionChainNatsConfig,
-    ) -> crate::Result<usize> {
-        let mut connected = 0usize;
-        let mut new_handles = Vec::new();
-        for entry in self.strikes.iter() {
-            let (call_handles, put_handles) = entry.value().connect_nats(config)?;
-            new_handles.push((call_handles, put_handles));
-            connected = connected.saturating_add(2); // call + put
-        }
-
-        // Store handles for lifecycle management (shutdown, metrics)
-        if let Ok(mut guard) = self.nats_handles.lock() {
-            guard.extend(new_handles);
-        }
-
-        Ok(connected)
-    }
-
-    /// Returns the number of stored NATS publisher handle pairs.
-    ///
-    /// Each pair represents the call and put publishers for one strike.
-    #[cfg(feature = "nats")]
-    #[must_use]
-    pub fn nats_handle_count(&self) -> usize {
-        self.nats_handles.lock().map(|g| g.len()).unwrap_or(0)
     }
 }
 
@@ -1625,13 +1565,6 @@ mod tests {
         let summary = chain.terminal_order_summary();
         assert_eq!(summary.filled, 2);
         assert_eq!(summary.total(), 2);
-    }
-
-    #[cfg(feature = "nats")]
-    #[test]
-    fn test_nats_handle_count_initially_zero() {
-        let chain = OptionChainOrderBook::new("BTC", test_expiration());
-        assert_eq!(chain.nats_handle_count(), 0);
     }
 
     #[test]
