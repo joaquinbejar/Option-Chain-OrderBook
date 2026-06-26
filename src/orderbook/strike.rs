@@ -924,29 +924,45 @@ impl StrikeOrderBookManager {
     /// [`OptionOrderBook`] is assigned a unique instrument ID and registered
     /// in the reverse index.
     ///
-    /// Uses a check-insert-check pattern: if two threads race to create the
-    /// same strike, only the first insertion's book survives and only that
-    /// book's IDs are registered in the reverse index.
+    /// # Concurrency
+    ///
+    /// This is atomic and idempotent: the fresh call/put pair is built without
+    /// any global side effects (no instrument-ID allocation, no symbol-index
+    /// registration) and published with [`SkipMap::get_or_insert`], which
+    /// inserts only when the key is absent and never evicts an existing entry.
+    /// The first inserter wins and is never orphaned; concurrent losers receive
+    /// the winning handle and drop their fresh pair. The global side effects
+    /// (ID allocation and symbol-index registration) run exactly once, on the
+    /// winning thread only, gated by [`Arc::ptr_eq`].
+    ///
+    /// Because ID assignment is deferred to the winner *after* the strike is
+    /// published, there is a brief eventual-consistency window in which a
+    /// concurrent reader (or a race loser) may observe the new call/put pair
+    /// with [`instrument_id`](OptionOrderBook::instrument_id) still `0` until
+    /// the winner completes registration. Callers that need the assigned IDs
+    /// immediately after creation under contention should resolve them via the
+    /// [`InstrumentRegistry`] / [`SymbolIndex`] once creation has settled rather
+    /// than reading `instrument_id()` synchronously off the returned handle.
     pub fn get_or_create(&self, strike: u64) -> Arc<StrikeOrderBook> {
         if let Some(entry) = self.strikes.get(&strike) {
             return Arc::clone(entry.value());
         }
 
-        // Build the book without allocating IDs yet.
-        let book = self.create_strike_book_without_ids(strike);
-        self.strikes.insert(strike, Arc::clone(&book));
+        // Build the call/put pair WITHOUT allocating instrument IDs or touching
+        // the registry / symbol index. Those are global side effects that must
+        // run exactly once on the winning thread; a race loser's fresh pair is
+        // dropped, so performing them here would leak IDs and index entries.
+        let fresh = self.create_strike_book_without_ids(strike);
 
-        // Re-check: another thread may have inserted first.
-        if let Some(entry) = self.strikes.get(&strike) {
-            let winner = Arc::clone(entry.value());
-            if Arc::ptr_eq(&winner, &book) {
-                // We won the race — allocate and register IDs now.
-                self.assign_instrument_ids(&winner, strike);
-            }
-            winner
-        } else {
-            book
+        // Atomic, idempotent publish: the first inserter wins and is never
+        // evicted (no orphan window); concurrent losers get the winner.
+        let entry = self.strikes.get_or_insert(strike, Arc::clone(&fresh));
+        let winner = Arc::clone(entry.value());
+        if Arc::ptr_eq(&winner, &fresh) {
+            // We won the race — allocate IDs and register symbols exactly once.
+            self.assign_instrument_ids(&winner, strike);
         }
+        winner
     }
 
     /// Internal helper that builds a [`StrikeOrderBook`] with optional
@@ -1223,6 +1239,77 @@ mod tests {
 
         let strikes = manager.strike_prices();
         assert_eq!(strikes, vec![45000, 50000, 55000]);
+    }
+
+    #[test]
+    fn test_strike_get_or_create_returns_same_handle() {
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+
+        let first = manager.get_or_create(50000);
+        let second = manager.get_or_create(50000);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_strike_get_or_create_concurrent_single_id_pair() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Race N threads to create the SAME strike via a barrier for lockstep.
+        // With `get_or_insert` the first inserter wins and is never evicted, and
+        // the global side effects (ID allocation + symbol-index registration)
+        // run exactly once on the winner. Assert: every thread sees one
+        // identical handle, exactly one map entry, and exactly one ID pair (no
+        // orphan, no double-allocation).
+        const N: usize = 16;
+        let registry = Arc::new(InstrumentRegistry::new());
+        let symbol_index = Arc::new(SymbolIndex::new());
+        let manager = Arc::new(StrikeOrderBookManager::new_with_registry_and_index(
+            "BTC",
+            test_expiration(),
+            Arc::clone(&registry),
+            Arc::clone(&symbol_index),
+        ));
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                manager.get_or_create(50000)
+            }));
+        }
+
+        let books: Vec<Arc<StrikeOrderBook>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        // All threads observe the same winning handle.
+        let first = books.first().expect("no books returned");
+        for book in &books {
+            assert!(Arc::ptr_eq(first, book));
+        }
+
+        // Exactly one map entry.
+        assert_eq!(manager.len(), 1);
+
+        // Exactly one instrument-ID pair allocated (call + put): the registry
+        // advanced by exactly 2 and holds 2 entries; the symbol index holds 2.
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.current_id(), 3);
+        assert_eq!(symbol_index.len(), 2);
+
+        // The winning book carries distinct, non-zero IDs.
+        let call_id = first.call().instrument_id();
+        let put_id = first.put().instrument_id();
+        assert_ne!(call_id, 0);
+        assert_ne!(put_id, 0);
+        assert_ne!(call_id, put_id);
     }
 
     #[test]

@@ -979,25 +979,41 @@ impl UnderlyingOrderBookManager {
     /// The shared [`InstrumentRegistry`] is automatically propagated
     /// so that all [`OptionOrderBook`](super::book::OptionOrderBook)
     /// instances created through the hierarchy receive unique IDs.
+    ///
+    /// # Concurrency
+    ///
+    /// This is atomic and idempotent. The fresh underlying book is fully
+    /// configured before it is published, and publishing uses
+    /// [`SkipMap::get_or_insert`], which inserts only when the key is absent and
+    /// never evicts an existing entry. The first inserter wins and is never
+    /// orphaned; concurrent losers receive the winning handle and drop their
+    /// fresh book. Building and configuring the book has no global side effects
+    /// (instrument IDs and symbol-index entries are only allocated lazily at
+    /// strike creation), so a dropped loser leaks nothing.
     pub fn get_or_create(&self, underlying: impl Into<String>) -> Arc<UnderlyingOrderBook> {
         let underlying = underlying.into();
         if let Some(entry) = self.underlyings.get(&underlying) {
             return Arc::clone(entry.value());
         }
-        let book = Arc::new(UnderlyingOrderBook::new_with_registry_and_index(
+        // Build and fully configure the fresh book BEFORE publishing it, so the
+        // winning book is configured-before-visible. Configuration only mutates
+        // the fresh object (no global side effects), so a race loser's book is
+        // dropped harmlessly.
+        let fresh = Arc::new(UnderlyingOrderBook::new_with_registry_and_index(
             &underlying,
             Arc::clone(&self.registry),
             Arc::clone(&self.symbol_index),
         ));
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
-            book.set_stp_mode(stp);
+            fresh.set_stp_mode(stp);
         }
         if let Some(schedule) = self.fee_schedule.get() {
-            book.set_fee_schedule(schedule);
+            fresh.set_fee_schedule(schedule);
         }
-        self.underlyings.insert(underlying, Arc::clone(&book));
-        book
+        // Atomic, idempotent publish: first inserter wins and is never evicted.
+        let entry = self.underlyings.get_or_insert(underlying, fresh);
+        Arc::clone(entry.value())
     }
 
     /// Sets the STP mode for all future underlying books created by this manager.
@@ -1797,6 +1813,62 @@ mod tests {
         drop(manager.get_or_create("SPX"));
 
         assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_underlying_manager_get_or_create_returns_same_handle() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let first = manager.get_or_create("BTC");
+        let second = manager.get_or_create("BTC");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_underlying_manager_get_or_create_concurrent_returns_same_handle() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Race N threads to create the SAME underlying via a barrier for
+        // lockstep. With `get_or_insert` the first inserter wins and is never
+        // evicted, so every thread must observe one identical handle and the
+        // map must hold exactly one entry (no orphan, no split-brain).
+        const N: usize = 16;
+        let manager = Arc::new(UnderlyingOrderBookManager::new());
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                manager.get_or_create("BTC")
+            }));
+        }
+
+        let books: Vec<Arc<UnderlyingOrderBook>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        let first = books.first().expect("no books returned");
+        for book in &books {
+            assert!(Arc::ptr_eq(first, book));
+        }
+        assert_eq!(manager.len(), 1);
+
+        // End-to-end: creating one strike through the winning handle allocates
+        // exactly one instrument-ID pair in the shared registry/index — proving
+        // the whole sub-hierarchy shares a single registry with no orphan.
+        let exp = first.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert_ne!(strike.call().instrument_id(), 0);
+        assert_ne!(strike.put().instrument_id(), 0);
+        assert_ne!(strike.call().instrument_id(), strike.put().instrument_id());
+        assert_eq!(manager.symbol_index().len(), 2);
     }
 
     #[test]
