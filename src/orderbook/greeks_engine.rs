@@ -182,9 +182,13 @@ pub struct GreeksUpdate {
 ///
 /// # Panics
 ///
-/// Listener implementations **must not panic**. If a listener panics during
-/// notification, subsequent listeners in the subscription list will not be
-/// called.
+/// Listener implementations **should not panic**. Listeners are invoked
+/// outside the engine's internal lock (the list is snapshotted under the lock
+/// first), so a panicking listener does **not** poison the engine and does
+/// **not** disable future notifications — a later notification still reaches
+/// healthy listeners. Within the single notification pass in which it panics,
+/// however, listeners ordered after the panicking one are skipped, so keep
+/// listener bodies panic-free.
 pub type GreeksUpdateListener = Arc<dyn Fn(&GreeksUpdate) + Send + Sync>;
 
 // ─── GreeksEngine ────────────────────────────────────────────────────────────
@@ -246,10 +250,17 @@ impl GreeksEngine {
     /// Registers a listener for Greeks update notifications.
     ///
     /// Listeners are append-only — there is no unsubscribe.
+    ///
+    /// A poisoned lock (left by a panic at some other lock site) is recovered
+    /// via [`std::sync::PoisonError::into_inner`] rather than silently
+    /// swallowed, so a single panicking listener can never permanently disable
+    /// subscription.
     pub fn subscribe(&self, listener: GreeksUpdateListener) {
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(listener);
-        }
+        let mut listeners = self
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.push(listener);
     }
 
     /// Calculates Greeks for a single option.
@@ -404,12 +415,34 @@ impl GreeksEngine {
         Ok((call_greeks, put_greeks))
     }
 
-    /// Notifies all listeners of a Greeks update.
+    /// Notifies all registered listeners of a Greeks update.
+    ///
+    /// The listener list is snapshotted under the lock (cheap `Arc` clones)
+    /// and the guard is dropped **before** any listener runs. This guarantees
+    /// the listeners mutex is never held across a callback, so:
+    ///
+    /// - A listener may re-enter the engine (e.g. call
+    ///   [`GreeksEngine::subscribe`]) without deadlocking the non-reentrant
+    ///   `std::sync::Mutex`.
+    /// - An expensive callback (e.g. a NATS publish) never blocks concurrent
+    ///   subscribers.
+    /// - A panicking listener unwinds outside the lock, so it cannot poison
+    ///   the mutex; a later notification still reaches healthy listeners.
+    ///
+    /// A poisoned lock (from a panic at some other lock site) is recovered
+    /// rather than silently swallowed.
     fn notify_listeners(&self, update: &GreeksUpdate) {
-        if let Ok(listeners) = self.listeners.lock() {
-            for listener in listeners.iter() {
-                listener(update);
-            }
+        // Snapshot under the lock, then drop the guard before invoking anyone.
+        let listeners: Vec<GreeksUpdateListener> = {
+            let guard = self
+                .listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.clone()
+        };
+
+        for listener in &listeners {
+            listener(update);
         }
     }
 
@@ -483,7 +516,11 @@ impl std::fmt::Debug for GreeksEngine {
             )
             .field(
                 "listener_count",
-                &self.listeners.lock().map(|l| l.len()).unwrap_or(0),
+                &self
+                    .listeners
+                    .lock()
+                    .map(|l| l.len())
+                    .unwrap_or_else(|p| p.into_inner().len()),
             )
             .finish()
     }
@@ -533,7 +570,26 @@ pub fn calculate_tte_years(expiration: &optionstratlib::ExpirationDate) -> f64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Builds a throwaway `Greek` value for notification tests.
+    fn sample_greek() -> Greek {
+        Greek {
+            delta: dec!(0.5),
+            gamma: dec!(0.01),
+            theta: dec!(-0.05),
+            vega: dec!(0.1),
+            rho: dec!(0.02),
+            rho_d: Decimal::ZERO,
+            alpha: Decimal::ZERO,
+            vanna: Decimal::ZERO,
+            vomma: Decimal::ZERO,
+            veta: Decimal::ZERO,
+            charm: Decimal::ZERO,
+            color: Decimal::ZERO,
+        }
+    }
 
     #[test]
     fn test_flat_vol_surface() {
@@ -757,5 +813,89 @@ mod tests {
         assert_eq!(update.strike, 50000);
         assert_eq!(update.trigger, GreeksRecalcTrigger::PriceChange);
         assert_eq!(update.timestamp_ns, 1234567890);
+    }
+
+    #[test]
+    fn test_notify_listeners_reentrant_subscribe_does_not_deadlock() {
+        // A listener that re-enters the engine via `subscribe` during a
+        // notification must NOT deadlock the non-reentrant `std::sync::Mutex`.
+        // With the snapshot-then-invoke pattern the guard is dropped before
+        // the listener runs, so this completes; with a lock-across-callback
+        // design it would hang forever (and time out the suite).
+        let engine = Arc::new(GreeksEngine::new());
+        let reentered = Arc::new(AtomicBool::new(false));
+
+        let engine_weak = Arc::downgrade(&engine);
+        let reentered_clone = Arc::clone(&reentered);
+        engine.subscribe(Arc::new(move |_update| {
+            if let Some(engine) = engine_weak.upgrade() {
+                // Re-enter: register another listener mid-notification.
+                engine.subscribe(Arc::new(|_| {}));
+                reentered_clone.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        let greeks = sample_greek();
+        engine.record_and_notify(50000, greeks.clone(), greeks, GreeksRecalcTrigger::Manual);
+
+        assert!(
+            reentered.load(Ordering::SeqCst),
+            "reentrant subscribe must complete without deadlock"
+        );
+    }
+
+    #[test]
+    fn test_notify_listeners_panicking_listener_does_not_poison_lock() {
+        // A panicking listener must not permanently disable the engine: the
+        // panic unwinds outside the lock (snapshot-then-invoke), so the mutex
+        // is never poisoned, and poison recovery in `subscribe`/`notify` keeps
+        // later notifications working.
+        let engine = GreeksEngine::new();
+
+        // Panics on its first invocation, benign afterwards.
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_clone = Arc::clone(&armed);
+        engine.subscribe(Arc::new(move |_update| {
+            if armed_clone.swap(false, Ordering::SeqCst) {
+                panic!("listener boom");
+            }
+        }));
+
+        let greeks = sample_greek();
+
+        // First notify: the listener panics. Suppress the backtrace to keep
+        // test output clean and catch the unwind so the suite stays green.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let first = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            engine.record_and_notify(
+                50000,
+                greeks.clone(),
+                greeks.clone(),
+                GreeksRecalcTrigger::Manual,
+            );
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            first.is_err(),
+            "the panicking listener should have unwound out of notify"
+        );
+
+        // The lock must NOT be poison-disabled: subscribe still registers ...
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let healthy_clone = Arc::clone(&healthy_count);
+        engine.subscribe(Arc::new(move |_update| {
+            healthy_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // ... and a later notification still reaches the healthy listener
+        // (the previously-panicking listener is now benign).
+        engine.record_and_notify(50000, greeks.clone(), greeks, GreeksRecalcTrigger::Manual);
+
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            1,
+            "a later notify must reach the healthy listener after a prior panic"
+        );
     }
 }
