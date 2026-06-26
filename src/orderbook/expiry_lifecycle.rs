@@ -288,7 +288,14 @@ impl ExpiryLifecycleManager {
             let settle_dt = to_datetime(exp_date, expiry_config.settlement_time_utc);
             let removal_dt = settle_dt
                 .checked_add_signed(lifecycle_config.retention_period)
-                .ok_or_else(|| Error::configuration("overflow computing removal datetime"))?;
+                .ok_or_else(|| {
+                    tracing::error!(
+                        underlying = %underlying_name,
+                        expiration = %expiration,
+                        "overflow computing removal datetime",
+                    );
+                    Error::configuration("overflow computing removal datetime")
+                })?;
 
             // Check transitions in reverse order (furthest-along state first).
             // Allow catching up: if the scheduler missed ticks, we can jump
@@ -311,7 +318,15 @@ impl ExpiryLifecycleManager {
                     let exp_book = underlying.expirations().get(expiration)?;
                     if *status < InstrumentStatus::Settling {
                         set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
-                        let cancel_result = exp_book.cancel_all()?;
+                        let cancel_result = exp_book.cancel_all().map_err(|e| {
+                            tracing::warn!(
+                                underlying = %underlying_name,
+                                expiration = %expiration,
+                                error = %e,
+                                "cancel-all failed during lifecycle transition",
+                            );
+                            e
+                        })?;
                         let cancelled = cancel_result.total_cancelled();
                         let settling_event = LifecycleEvent::InstrumentSettling {
                             underlying: underlying_name.clone(),
@@ -349,7 +364,15 @@ impl ExpiryLifecycleManager {
                     // could be accepted during cancellation.
                     if *status < InstrumentStatus::Settling {
                         set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
-                        let cancel_result = exp_book.cancel_all()?;
+                        let cancel_result = exp_book.cancel_all().map_err(|e| {
+                            tracing::warn!(
+                                underlying = %underlying_name,
+                                expiration = %expiration,
+                                error = %e,
+                                "cancel-all failed during lifecycle transition",
+                            );
+                            e
+                        })?;
                         let cancelled = cancel_result.total_cancelled();
                         let settling_event = LifecycleEvent::InstrumentSettling {
                             underlying: underlying_name.clone(),
@@ -374,7 +397,15 @@ impl ExpiryLifecycleManager {
                     // Active/Halted/Pending → Settling
                     let exp_book = underlying.expirations().get(expiration)?;
                     set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
-                    let cancel_result = exp_book.cancel_all()?;
+                    let cancel_result = exp_book.cancel_all().map_err(|e| {
+                        tracing::warn!(
+                            underlying = %underlying_name,
+                            expiration = %expiration,
+                            error = %e,
+                            "cancel-all failed during lifecycle transition",
+                        );
+                        e
+                    })?;
                     let cancelled = cancel_result.total_cancelled();
                     let event = LifecycleEvent::InstrumentSettling {
                         underlying: underlying_name.clone(),
@@ -408,11 +439,61 @@ impl ExpiryLifecycleManager {
             underlying.expirations().remove(exp);
         }
 
+        // Cold path: emit one structured INFO per lifecycle transition. Iterated
+        // in push order, which is driven by the ordered expiration traversal
+        // above; the log carries only fields already on each event, so it adds
+        // no clock/RNG read and cannot perturb replay determinism.
+        for event in &result.events {
+            log_lifecycle_event(event);
+        }
+
         Ok(result)
     }
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
+
+/// Emits a structured `tracing` record for a single lifecycle transition.
+///
+/// Cold path — invoked only when an actual state transition occurred, never on
+/// the order-submission or per-quote path. It logs only fields already present
+/// on `event`; it never reads a clock or RNG, so it cannot perturb replay
+/// determinism.
+#[cold]
+#[inline(never)]
+fn log_lifecycle_event(event: &LifecycleEvent) {
+    match event {
+        LifecycleEvent::InstrumentSettling {
+            underlying,
+            expiration,
+            cancelled_orders,
+        } => tracing::info!(
+            underlying = %underlying,
+            expiration = %expiration,
+            cancelled_orders = *cancelled_orders,
+            status = "settling",
+            "expiration settling",
+        ),
+        LifecycleEvent::InstrumentExpired {
+            underlying,
+            expiration,
+        } => tracing::info!(
+            underlying = %underlying,
+            expiration = %expiration,
+            status = "expired",
+            "expiration expired",
+        ),
+        LifecycleEvent::ExpirationRemoved {
+            underlying,
+            expiration,
+        } => tracing::info!(
+            underlying = %underlying,
+            expiration = %expiration,
+            status = "removed",
+            "expiration removed",
+        ),
+    }
+}
 
 /// Returns the **minimum** lifecycle status across every call **and** put book
 /// of every strike in the chain, or `None` if the chain has no strikes.

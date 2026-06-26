@@ -1037,6 +1037,15 @@ impl StrikeOrderBookManager {
                     "instrument-id exhaustion: registry full; strike books left with instrument_id 0",
                 );
             }
+            // Cold path: emitted once, by the insertion winner only — never on
+            // the lookup/return path above, the order-submission path, or the
+            // per-quote read.
+            tracing::info!(
+                underlying = %self.underlying,
+                strike,
+                expiration = %self.expiration,
+                "strike created",
+            );
         }
         winner
     }
@@ -1119,13 +1128,21 @@ impl StrikeOrderBookManager {
         // winner and owns these side effects.
         if let Some(candidate) = &built
             && Arc::ptr_eq(candidate, &winner)
-            && let Err(err) = self.assign_instrument_ids(&winner, strike)
         {
-            tracing::error!(
+            if let Err(err) = self.assign_instrument_ids(&winner, strike) {
+                tracing::error!(
+                    underlying = %self.underlying,
+                    strike,
+                    error = %err,
+                    "instrument-id exhaustion: registry full; strike books left with instrument_id 0",
+                );
+            }
+            // Cold path: emitted once, by the insertion winner only.
+            tracing::info!(
                 underlying = %self.underlying,
                 strike,
-                error = %err,
-                "instrument-id exhaustion: registry full; strike books left with instrument_id 0",
+                expiration = %self.expiration,
+                "strike created",
             );
         }
         winner

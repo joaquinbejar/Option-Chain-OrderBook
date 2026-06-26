@@ -857,6 +857,17 @@ impl ExpirationOrderBookManager {
         // `inserted` is true iff the published value is the book we just built,
         // i.e. this call is the unique `get_or_insert` winner for this key.
         let inserted = Arc::ptr_eq(entry.value(), &candidate);
+        if inserted {
+            // Cold path: emitted once per truly-new expiration (the unique
+            // `get_or_insert` winner), for every creating caller — direct
+            // `get_or_create_expiration` and the expiry scheduler alike. Never on
+            // the order-submission path.
+            tracing::info!(
+                underlying = %self.underlying,
+                expiration = %expiration,
+                "expiration created",
+            );
+        }
         (Arc::clone(entry.value()), inserted)
     }
 
