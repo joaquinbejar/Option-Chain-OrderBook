@@ -7,6 +7,7 @@ use super::instrument_status::InstrumentStatus;
 use super::quote::Quote;
 use super::validation::ValidationConfig;
 use crate::Result;
+use crate::error::Error;
 use optionstratlib::OptionStyle;
 #[cfg(feature = "nats")]
 use orderbook_rs::PriceLevelChangedListener;
@@ -575,23 +576,60 @@ impl OptionOrderBook {
         InstrumentStatus::from_u8(raw).unwrap_or(InstrumentStatus::Halted)
     }
 
-    /// Sets the lifecycle status of this instrument.
+    /// Stores the lifecycle status without validating the transition.
     ///
-    /// # Arguments
-    ///
-    /// * `status` - The new status to set
+    /// Internal raw setter used by the validated [`set_status`](Self::set_status)
+    /// path *after* the transition has been checked against the enforced
+    /// lifecycle state machine. It bypasses that check, so callers are
+    /// responsible for legality.
     #[inline]
-    pub fn set_status(&self, status: InstrumentStatus) {
+    fn store_status(&self, status: InstrumentStatus) {
         self.status.store(status as u8, Ordering::Release);
     }
 
-    /// Atomically compares and sets the lifecycle status.
+    /// Sets the lifecycle status of this instrument, enforcing the lifecycle
+    /// state machine.
     ///
-    /// If the current status equals `expected`, sets it to `new` and returns `true`.
-    /// Otherwise, leaves the status unchanged and returns `false`.
+    /// The transition from the current status to `status` must be a legal edge
+    /// in the state machine documented on [`InstrumentStatus`]. A self-transition
+    /// (`X -> X`) is a legal no-op. Any illegal transition (e.g. reactivating an
+    /// [`Expired`](InstrumentStatus::Expired) book, or pulling a
+    /// [`Settling`](InstrumentStatus::Settling) book back to
+    /// [`Halted`](InstrumentStatus::Halted)) leaves the status unchanged.
     ///
-    /// This provides a thread-safe way to advance status without race conditions,
-    /// ensuring monotonic status progression under concurrent access.
+    /// # Arguments
+    ///
+    /// * `status` - The target status to transition to
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IllegalStatusTransition`]
+    /// if the current status cannot legally transition to `status`.
+    #[inline]
+    pub fn set_status(&self, status: InstrumentStatus) -> Result<()> {
+        let current = self.status();
+        if !current.can_transition(status) {
+            return Err(Error::illegal_status_transition(current, status));
+        }
+        self.store_status(status);
+        Ok(())
+    }
+
+    /// Atomically compares and sets the lifecycle status, validating the target.
+    ///
+    /// If the current status equals `expected` **and** `expected -> new` is a
+    /// legal edge in the lifecycle state machine, sets the status to `new` and
+    /// returns `true`. Otherwise — either the current status differs from
+    /// `expected`, or the transition is illegal — leaves the status unchanged
+    /// and returns `false`.
+    ///
+    /// This provides a thread-safe way to advance status without race
+    /// conditions, ensuring monotonic status progression under concurrent
+    /// access. The expiry lifecycle's CAS-forward setter drives every chain book
+    /// through this method; its only requested edges
+    /// (`{Pending, Active, Halted} -> Settling` and
+    /// `{Pending, Active, Halted, Settling} -> Expired`) are all legal, so the
+    /// added validation never changes its behavior.
     ///
     /// # Arguments
     ///
@@ -600,7 +638,8 @@ impl OptionOrderBook {
     ///
     /// # Returns
     ///
-    /// `true` if the swap succeeded, `false` otherwise.
+    /// `true` if the swap succeeded, `false` otherwise (lost race or illegal
+    /// transition).
     #[inline]
     #[must_use]
     pub fn compare_and_set_status(
@@ -608,6 +647,11 @@ impl OptionOrderBook {
         expected: InstrumentStatus,
         new: InstrumentStatus,
     ) -> bool {
+        // Reject targets that are not a legal edge from `expected`, so a CAS can
+        // never be used to force an illegal transition (e.g. Expired -> Active).
+        if !expected.can_transition(new) {
+            return false;
+        }
         self.status
             .compare_exchange(
                 expected as u8,
@@ -621,16 +665,38 @@ impl OptionOrderBook {
     /// Halts the instrument, preventing new orders from being accepted.
     ///
     /// Existing resting orders are not cancelled. Use [`expire`](Self::expire)
-    /// to both halt and cancel all orders.
+    /// to both halt and cancel all orders. Halting is only legal from
+    /// [`Active`](InstrumentStatus::Active) (or the idempotent `Halted -> Halted`
+    /// no-op).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IllegalStatusTransition`]
+    /// if the instrument cannot legally transition to
+    /// [`Halted`](InstrumentStatus::Halted) from its current status (e.g. it is
+    /// already [`Settling`](InstrumentStatus::Settling) or
+    /// [`Expired`](InstrumentStatus::Expired)).
     #[inline]
-    pub fn halt(&self) {
-        self.set_status(InstrumentStatus::Halted);
+    pub fn halt(&self) -> Result<()> {
+        self.set_status(InstrumentStatus::Halted)
     }
 
     /// Resumes the instrument, allowing new orders to be accepted.
+    ///
+    /// Resuming is legal from [`Halted`](InstrumentStatus::Halted) (the resume
+    /// edge) or [`Pending`](InstrumentStatus::Pending) (activation), plus the
+    /// idempotent `Active -> Active` no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IllegalStatusTransition`]
+    /// if the instrument cannot legally transition to
+    /// [`Active`](InstrumentStatus::Active) from its current status (e.g. it is
+    /// [`Settling`](InstrumentStatus::Settling) or
+    /// [`Expired`](InstrumentStatus::Expired)).
     #[inline]
-    pub fn resume(&self) {
-        self.set_status(InstrumentStatus::Active);
+    pub fn resume(&self) -> Result<()> {
+        self.set_status(InstrumentStatus::Active)
     }
 
     /// Expires the instrument, cancelling all resting orders.
@@ -644,12 +710,24 @@ impl OptionOrderBook {
     /// reset. The status is set first so the book stops accepting new orders
     /// before the sweep runs.
     ///
+    /// Expiry is a terminal sweep: it is a legal transition from every
+    /// non-terminal status and an idempotent no-op from
+    /// [`Expired`](InstrumentStatus::Expired), so in practice it always
+    /// succeeds. The orders are only swept once the transition is accepted.
+    ///
     /// # Returns
     ///
     /// A vector of order IDs that were cancelled, in engine processing order.
-    pub fn expire(&self) -> Vec<OrderId> {
-        self.set_status(InstrumentStatus::Expired);
-        self.book.cancel_all_orders().cancelled_order_ids().to_vec()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IllegalStatusTransition`]
+    /// if the current status cannot legally transition to
+    /// [`Expired`](InstrumentStatus::Expired). No orders are swept when the
+    /// transition is rejected.
+    pub fn expire(&self) -> Result<Vec<OrderId>> {
+        self.set_status(InstrumentStatus::Expired)?;
+        Ok(self.book.cancel_all_orders().cancelled_order_ids().to_vec())
     }
 
     /// Checks that the instrument is accepting orders, returning an error if not.
@@ -2091,19 +2169,105 @@ mod tests {
     }
 
     #[test]
-    fn test_set_status_and_get() {
+    fn test_set_status_walks_legal_path_and_get() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        for &status in &[
-            InstrumentStatus::Pending,
-            InstrumentStatus::Active,
-            InstrumentStatus::Halted,
-            InstrumentStatus::Settling,
-            InstrumentStatus::Expired,
-        ] {
-            book.set_status(status);
-            assert_eq!(book.status(), status);
-        }
+        // Active (default) -> Halted -> Active (resume) -> Settling -> Expired.
+        book.set_status(InstrumentStatus::Halted)
+            .expect("Active -> Halted is legal");
+        assert_eq!(book.status(), InstrumentStatus::Halted);
+
+        book.set_status(InstrumentStatus::Active)
+            .expect("Halted -> Active is legal");
+        assert_eq!(book.status(), InstrumentStatus::Active);
+
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
+        assert_eq!(book.status(), InstrumentStatus::Settling);
+
+        book.set_status(InstrumentStatus::Expired)
+            .expect("Settling -> Expired is legal");
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_set_status_active_to_settling_succeeds() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.set_status(InstrumentStatus::Settling).is_ok());
+        assert_eq!(book.status(), InstrumentStatus::Settling);
+    }
+
+    #[test]
+    fn test_set_status_settling_to_expired_succeeds() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
+        assert!(book.set_status(InstrumentStatus::Expired).is_ok());
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_set_status_self_transition_is_legal_noop() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Active -> Active is an idempotent no-op.
+        assert!(book.set_status(InstrumentStatus::Active).is_ok());
+        assert_eq!(book.status(), InstrumentStatus::Active);
+
+        // Settling -> Settling stays Settling (repeated lifecycle ticks).
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
+        assert!(book.set_status(InstrumentStatus::Settling).is_ok());
+        assert_eq!(book.status(), InstrumentStatus::Settling);
+    }
+
+    #[test]
+    fn test_set_status_expired_to_active_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.expire().expect("Active -> Expired is legal");
+
+        let err = book.set_status(InstrumentStatus::Active);
+        assert!(matches!(
+            err,
+            Err(Error::IllegalStatusTransition {
+                from: InstrumentStatus::Expired,
+                to: InstrumentStatus::Active,
+            })
+        ));
+        // Status is unchanged on rejection.
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_set_status_expired_to_halted_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.expire().expect("Active -> Expired is legal");
+
+        let err = book.set_status(InstrumentStatus::Halted);
+        assert!(matches!(
+            err,
+            Err(Error::IllegalStatusTransition {
+                from: InstrumentStatus::Expired,
+                to: InstrumentStatus::Halted,
+            })
+        ));
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_set_status_settling_to_halted_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
+
+        let err = book.set_status(InstrumentStatus::Halted);
+        assert!(matches!(
+            err,
+            Err(Error::IllegalStatusTransition {
+                from: InstrumentStatus::Settling,
+                to: InstrumentStatus::Halted,
+            })
+        ));
+        assert_eq!(book.status(), InstrumentStatus::Settling);
     }
 
     #[test]
@@ -2111,18 +2275,76 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert_eq!(book.status(), InstrumentStatus::Active);
 
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         assert_eq!(book.status(), InstrumentStatus::Halted);
+    }
+
+    #[test]
+    fn test_halt_settling_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
+
+        let err = book.halt();
+        assert!(matches!(
+            err,
+            Err(Error::IllegalStatusTransition {
+                from: InstrumentStatus::Settling,
+                to: InstrumentStatus::Halted,
+            })
+        ));
+        assert_eq!(book.status(), InstrumentStatus::Settling);
     }
 
     #[test]
     fn test_resume_sets_active() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         assert_eq!(book.status(), InstrumentStatus::Halted);
 
-        book.resume();
+        book.resume().expect("Halted -> Active is legal (resume)");
         assert_eq!(book.status(), InstrumentStatus::Active);
+    }
+
+    #[test]
+    fn test_resume_halted_to_active_succeeds() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt().expect("Active -> Halted is legal");
+        assert!(book.resume().is_ok());
+        assert_eq!(book.status(), InstrumentStatus::Active);
+    }
+
+    #[test]
+    fn test_resume_expired_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.expire().expect("Active -> Expired is legal");
+
+        let err = book.resume();
+        assert!(matches!(
+            err,
+            Err(Error::IllegalStatusTransition {
+                from: InstrumentStatus::Expired,
+                to: InstrumentStatus::Active,
+            })
+        ));
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_compare_and_set_status_allows_legal_forward() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.compare_and_set_status(InstrumentStatus::Active, InstrumentStatus::Settling,));
+        assert_eq!(book.status(), InstrumentStatus::Settling);
+    }
+
+    #[test]
+    fn test_compare_and_set_status_rejects_illegal_target() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.expire().expect("Active -> Expired is legal");
+
+        // Expired -> Active is illegal: the CAS reports failure (no swap).
+        assert!(!book.compare_and_set_status(InstrumentStatus::Expired, InstrumentStatus::Active,));
+        assert_eq!(book.status(), InstrumentStatus::Expired);
     }
 
     #[test]
@@ -2139,7 +2361,7 @@ mod tests {
         }
         assert_eq!(book.order_count(), 2);
 
-        let cancelled = book.expire();
+        let cancelled = book.expire().expect("Active -> Expired is legal");
         assert_eq!(book.status(), InstrumentStatus::Expired);
         assert!(book.is_empty());
         assert_eq!(cancelled.len(), 2);
@@ -2150,7 +2372,7 @@ mod tests {
     #[test]
     fn test_expire_on_empty_book() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let cancelled = book.expire();
+        let cancelled = book.expire().expect("Active -> Expired is legal");
         assert_eq!(book.status(), InstrumentStatus::Expired);
         assert!(cancelled.is_empty());
     }
@@ -2166,7 +2388,7 @@ mod tests {
             .expect("add ask");
         assert_eq!(book.active_order_count(), 2);
 
-        let cancelled = book.expire();
+        let cancelled = book.expire().expect("Active -> Expired is legal");
 
         // All resting orders cancelled and transitioned to a terminal state.
         assert_eq!(cancelled.len(), 2);
@@ -2195,7 +2417,7 @@ mod tests {
     #[test]
     fn test_order_rejected_when_halted() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
@@ -2210,7 +2432,10 @@ mod tests {
     #[test]
     fn test_order_rejected_when_pending() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.set_status(InstrumentStatus::Pending);
+        // Pending is the initial lifecycle state; books default to Active and no
+        // legal edge targets Pending, so seed it with the raw (unvalidated)
+        // setter to exercise the order-rejection path.
+        book.store_status(InstrumentStatus::Pending);
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
@@ -2224,7 +2449,8 @@ mod tests {
     #[test]
     fn test_order_rejected_when_settling() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.set_status(InstrumentStatus::Settling);
+        book.set_status(InstrumentStatus::Settling)
+            .expect("Active -> Settling is legal");
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
@@ -2238,7 +2464,8 @@ mod tests {
     #[test]
     fn test_order_rejected_when_expired() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.set_status(InstrumentStatus::Expired);
+        book.set_status(InstrumentStatus::Expired)
+            .expect("Active -> Expired is legal");
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
@@ -2252,7 +2479,7 @@ mod tests {
     #[test]
     fn test_order_rejected_with_tif_when_not_active() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
 
         let result =
             book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc);
@@ -2268,13 +2495,13 @@ mod tests {
     fn test_orders_accepted_after_resume() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         assert!(
             book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
                 .is_err()
         );
 
-        book.resume();
+        book.resume().expect("Halted -> Active is legal (resume)");
         assert!(
             book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
                 .is_ok()
@@ -2290,7 +2517,7 @@ mod tests {
         }
         assert_eq!(book.order_count(), 1);
 
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         // Existing orders remain
         assert_eq!(book.order_count(), 1);
         assert_eq!(book.best_bid(), Some(100));
@@ -2304,7 +2531,7 @@ mod tests {
         if let Err(err) = book.add_limit_order(oid, Side::Buy, 100, 10) {
             panic!("add order failed: {}", err);
         }
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
 
         // Cancellation should still work on halted instruments
         let cancelled = match book.cancel_order(oid) {
@@ -2557,7 +2784,7 @@ mod tests {
     #[test]
     fn test_add_limit_order_with_user_rejected_when_halted() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         let user = Hash32::from([1u8; 32]);
         let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
         assert!(result.is_err());
@@ -2782,7 +3009,7 @@ mod tests {
     #[test]
     fn test_full_method_rejected_when_halted() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.halt();
+        book.halt().expect("Active -> Halted is legal");
         let result = book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
     }

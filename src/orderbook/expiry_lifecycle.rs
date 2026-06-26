@@ -778,6 +778,42 @@ mod tests {
         assert_eq!(underlying.expirations().len(), 0);
     }
 
+    // ── test_set_all_book_status_legal_forward_edges_succeed ─────────────
+
+    // Issue #71 guard: the lifecycle's CAS-forward setter advances books via
+    // `compare_and_set_status`, which now validates the target against the
+    // enforced state machine. Every per-book edge it requests
+    // (Active -> Settling, Settling -> Expired) must remain legal so the
+    // forward-advance is never blocked by the new validation.
+    #[test]
+    fn test_set_all_book_status_legal_forward_edges_succeed() {
+        let exp = fixed_expiration(2026, 3, 10);
+        let underlying = setup_underlying_with_orders(exp);
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+
+        // Active -> Settling for every call and put book.
+        set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
+        for entry in exp_book.chain().strikes().iter() {
+            assert_eq!(entry.value().call().status(), InstrumentStatus::Settling);
+            assert_eq!(entry.value().put().status(), InstrumentStatus::Settling);
+        }
+
+        // Settling -> Expired for every call and put book.
+        set_all_book_status(exp_book.chain(), InstrumentStatus::Expired);
+        for entry in exp_book.chain().strikes().iter() {
+            assert_eq!(entry.value().call().status(), InstrumentStatus::Expired);
+            assert_eq!(entry.value().put().status(), InstrumentStatus::Expired);
+        }
+
+        // The terminal Expired state is now sticky: a further forward request is
+        // an idempotent no-op (Expired -> Expired) and never regresses.
+        set_all_book_status(exp_book.chain(), InstrumentStatus::Expired);
+        for entry in exp_book.chain().strikes().iter() {
+            assert_eq!(entry.value().call().status(), InstrumentStatus::Expired);
+            assert_eq!(entry.value().put().status(), InstrumentStatus::Expired);
+        }
+    }
+
     // ── test_no_transition_before_expiry ─────────────────────────────────
 
     #[test]
