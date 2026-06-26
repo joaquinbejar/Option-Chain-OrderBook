@@ -16,7 +16,8 @@
 //! ## Algorithm
 //!
 //! 1. For each expiration, compute expiry and settlement datetimes from config
-//! 2. Check current instrument state via the first strike's call book
+//! 2. Derive the chain state as the **minimum** status across every call and put
+//!    book in the chain, so a single lagging book forces the needed transition
 //! 3. Apply the appropriate transition based on `now` vs. the computed times
 //! 4. Emit [`LifecycleEvent`]s and invoke the optional listener
 //!
@@ -416,18 +417,44 @@ impl ExpiryLifecycleManager {
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
-/// Returns the status of the first option book found in the chain, or `None`
-/// if there are no strikes.
+/// Returns the **minimum** lifecycle status across every call **and** put book
+/// of every strike in the chain, or `None` if the chain has no strikes.
 ///
-/// All option books in a chain are expected to be in the same lifecycle state,
-/// so sampling the first one is sufficient.
+/// # Why the minimum (min-based invariant)
+///
+/// A chain's books may briefly disagree: a strike added after settlement began,
+/// or a partial advance, can leave a single book lagging behind the rest (e.g.
+/// every book is [`Settling`](InstrumentStatus::Settling) except one newly-added
+/// put still [`Active`](InstrumentStatus::Active)). Sampling a single book — as
+/// this used to do with the lowest strike's call — would report the chain as
+/// fully advanced, and the manager would skip the transition the lagging book
+/// still needs.
+///
+/// Taking the minimum makes any lagging book pull the reported status back to
+/// its earlier state. [`InstrumentStatus`] orders earlier lifecycle states below
+/// later ones (`Active` < `Halted` < `Settling` < `Expired`), so the minimum is
+/// exactly the least-advanced book. That earlier status forces the manager into
+/// the catch-up branch, which then drives **all** books forward via
+/// [`set_all_book_status`], sweeping up the laggard.
+///
+/// This is sound because book status only ever advances monotonically through
+/// the CAS-forward [`set_all_book_status`]; a book can never regress, so the
+/// minimum can never spuriously under-report a chain that is genuinely ahead.
+///
+/// A `min` over a set is order-invariant, but the chain is still traversed via
+/// the ordered [`SkipMap`](crossbeam_skiplist::SkipMap) so the computation is
+/// deterministic by construction. The empty-chain case returns `None`,
+/// preserving the prior behavior for expirations with no strikes.
 #[inline]
 fn chain_status(chain: &super::chain::OptionChainOrderBook) -> Option<InstrumentStatus> {
     chain
         .strikes()
         .iter()
-        .next()
-        .map(|entry| entry.value().call().status())
+        .flat_map(|entry| {
+            let strike = entry.value();
+            [strike.call().status(), strike.put().status()]
+        })
+        .min()
 }
 
 /// Sets the lifecycle status on all option books (call and put) across every
@@ -1215,6 +1242,119 @@ mod tests {
                 .status(),
             InstrumentStatus::Settling
         );
+    }
+
+    // ── test_lagging_book_forces_transition ───────────────────────────────
+
+    // Regression oracle for issue #61. `chain_status` previously sampled a
+    // SINGLE book (the lowest strike's call). When a strike is added after
+    // settlement began, that newly-added book lags behind the rest of the
+    // chain and the single-sample read misrepresents the chain, so the manager
+    // skips the transition the lagging book still needs.
+    //
+    // Here every book is advanced to `Settling` except one newly-added (higher)
+    // strike whose put is left `Active`. The old single-sample read returns the
+    // lowest strike's call = `Settling`, so the `now >= expiry_dt && status <
+    // Settling` branch is false and NO transition fires — the `Active` put stays
+    // `Active` forever (the bug). The min-based read returns `Active` (the
+    // laggard), forcing the Settling transition that sweeps the lagging put
+    // forward.
+    //
+    // Regression direction: against the old single-sample logic this test fails
+    // (zero events, put stuck at `Active`); against the min-based logic it
+    // passes (one `InstrumentSettling`, lagging put advanced to `Settling`).
+    #[test]
+    fn test_lagging_book_forces_transition() {
+        let exp = fixed_expiration(2026, 3, 10);
+        let underlying = setup_underlying_with_orders(exp);
+        let expiry_config = fixed_expiry_config();
+        let lifecycle_config = lifecycle_config_short();
+
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+
+        // Advance every existing call + put book to Settling.
+        set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
+
+        // A strike added *after* settlement began. It sorts above the generated
+        // range (~45000..=55000), so the lowest strike's call (the old sample)
+        // stays Settling. Advance only its call; leave its put lagging at Active.
+        let lagging_strike_price = 60000_u64;
+        let lagging_strike = exp_book.chain().get_or_create_strike(lagging_strike_price);
+        loop {
+            let current = lagging_strike.call().status();
+            if current >= InstrumentStatus::Settling
+                || lagging_strike
+                    .call()
+                    .compare_and_set_status(current, InstrumentStatus::Settling)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            lagging_strike.put().status(),
+            InstrumentStatus::Active,
+            "newly-added put should still be lagging at Active"
+        );
+
+        // The old single-sample read (lowest strike's call) would report
+        // Settling and skip the transition.
+        let lowest_call_status = exp_book
+            .chain()
+            .strikes()
+            .iter()
+            .next()
+            .unwrap()
+            .value()
+            .call()
+            .status();
+        assert_eq!(
+            lowest_call_status,
+            InstrumentStatus::Settling,
+            "single-sample read would have reported Settling and skipped the transition"
+        );
+
+        // The min-based read reports the lagging Active status.
+        assert_eq!(
+            chain_status(exp_book.chain()),
+            Some(InstrumentStatus::Active),
+            "chain_status must report the lagging (min) status"
+        );
+
+        // Time after expiry (08:00) but before settlement (08:30).
+        let now = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 3, 10)
+                .unwrap()
+                .and_hms_opt(8, 15, 0)
+                .unwrap(),
+        );
+
+        let result = ExpiryLifecycleManager::check_expirations(
+            &underlying,
+            now,
+            &expiry_config,
+            &lifecycle_config,
+            None,
+        )
+        .unwrap();
+
+        // The needed Settling transition is applied (skipped by the old read).
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            &result.events[0],
+            LifecycleEvent::InstrumentSettling { .. }
+        ));
+
+        // The lagging put has been swept forward to Settling.
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+        let lagging = exp_book.chain().get_strike(lagging_strike_price).unwrap();
+        assert_eq!(lagging.put().status(), InstrumentStatus::Settling);
+        assert_eq!(lagging.call().status(), InstrumentStatus::Settling);
+
+        // And every book in the chain is now uniformly Settling.
+        for entry in exp_book.chain().strikes().iter() {
+            assert_eq!(entry.value().call().status(), InstrumentStatus::Settling);
+            assert_eq!(entry.value().put().status(), InstrumentStatus::Settling);
+        }
     }
 
     // ── test_lifecycle_config_default ─────────────────────────────────────
