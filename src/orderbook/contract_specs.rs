@@ -9,6 +9,7 @@
 //! by hierarchy managers to propagate specs to newly created children.
 
 use super::validation::ValidationConfig;
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 
@@ -76,7 +77,8 @@ impl std::fmt::Display for SettlementType {
 ///     .settlement(SettlementType::Cash)
 ///     .exercise_style(ExerciseStyle::European)
 ///     .settlement_currency("USDC")
-///     .build();
+///     .build()
+///     .expect("valid contract specs");
 ///
 /// assert_eq!(specs.tick_size(), 100);
 /// assert_eq!(specs.exercise_style(), ExerciseStyle::European);
@@ -191,6 +193,56 @@ impl ContractSpecs {
             .with_min_order_size(self.min_order_size)
             .with_max_order_size(self.max_order_size)
     }
+
+    /// Validates these specifications, rejecting structurally-broken values.
+    ///
+    /// A zero tick / lot / contract / minimum size is rejected: the upstream
+    /// matching engine treats a zero tick / lot / minimum as "validation
+    /// disabled" (silently discarding an intended constraint), and a zero
+    /// contract size has no economic meaning. An inverted `[min, max]` window
+    /// is rejected because it would reject every order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigurationError`] if:
+    /// - `tick_size` is zero
+    /// - `lot_size` is zero
+    /// - `contract_size` is zero
+    /// - `min_order_size` is zero
+    /// - `max_order_size < min_order_size`
+    pub fn validate(&self) -> Result<()> {
+        if self.tick_size == 0 {
+            return Err(Error::configuration(format!(
+                "tick_size must be at least 1, got {}",
+                self.tick_size
+            )));
+        }
+        if self.lot_size == 0 {
+            return Err(Error::configuration(format!(
+                "lot_size must be at least 1, got {}",
+                self.lot_size
+            )));
+        }
+        if self.contract_size == 0 {
+            return Err(Error::configuration(format!(
+                "contract_size must be at least 1, got {}",
+                self.contract_size
+            )));
+        }
+        if self.min_order_size == 0 {
+            return Err(Error::configuration(format!(
+                "min_order_size must be at least 1, got {}",
+                self.min_order_size
+            )));
+        }
+        if self.max_order_size < self.min_order_size {
+            return Err(Error::configuration(format!(
+                "max_order_size ({}) must be greater than or equal to min_order_size ({})",
+                self.max_order_size, self.min_order_size
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for ContractSpecs {
@@ -223,7 +275,8 @@ impl std::fmt::Display for ContractSpecs {
 /// let specs = ContractSpecs::builder()
 ///     .tick_size(100)
 ///     .settlement(SettlementType::Physical)
-///     .build();
+///     .build()
+///     .expect("valid contract specs");
 ///
 /// assert_eq!(specs.tick_size(), 100);
 /// assert_eq!(specs.settlement(), SettlementType::Physical);
@@ -293,10 +346,17 @@ impl ContractSpecsBuilder {
         self
     }
 
-    /// Consumes the builder and returns the constructed [`ContractSpecs`].
-    #[must_use]
-    pub fn build(self) -> ContractSpecs {
-        self.inner
+    /// Consumes the builder and returns a validated [`ContractSpecs`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigurationError`]
+    /// if the assembled specs are structurally invalid (zero tick / lot /
+    /// contract / minimum size, or an inverted `[min, max]` order-size window);
+    /// see [`ContractSpecs::validate`].
+    pub fn build(self) -> Result<ContractSpecs> {
+        self.inner.validate()?;
+        Ok(self.inner)
     }
 }
 
@@ -386,7 +446,8 @@ mod tests {
             .settlement(SettlementType::Physical)
             .exercise_style(ExerciseStyle::American)
             .settlement_currency("BTC")
-            .build();
+            .build()
+            .expect("valid specs");
 
         assert_eq!(specs.tick_size(), 100);
         assert_eq!(specs.lot_size(), 10);
@@ -400,7 +461,10 @@ mod tests {
 
     #[test]
     fn test_builder_partial_override() {
-        let specs = ContractSpecs::builder().tick_size(500).build();
+        let specs = ContractSpecs::builder()
+            .tick_size(500)
+            .build()
+            .expect("valid specs");
 
         assert_eq!(specs.tick_size(), 500);
         // Rest should be defaults
@@ -417,7 +481,8 @@ mod tests {
             .lot_size(10)
             .min_order_size(5)
             .max_order_size(1000)
-            .build();
+            .build()
+            .expect("valid specs");
 
         let config = specs.to_validation_config();
         assert_eq!(config.tick_size(), Some(100));
@@ -449,7 +514,8 @@ mod tests {
             .settlement(SettlementType::Physical)
             .exercise_style(ExerciseStyle::American)
             .settlement_currency("ETH")
-            .build();
+            .build()
+            .expect("valid specs");
 
         let json = match serde_json::to_string(&specs) {
             Ok(j) => j,
@@ -484,7 +550,8 @@ mod tests {
             .settlement(SettlementType::Cash)
             .exercise_style(ExerciseStyle::European)
             .settlement_currency("USDC")
-            .build();
+            .build()
+            .expect("valid specs");
 
         let display = format!("{specs}");
         assert!(display.contains("tick=100"));
@@ -551,7 +618,8 @@ mod tests {
         let specs = ContractSpecs::builder()
             .tick_size(100)
             .settlement_currency("BTC")
-            .build();
+            .build()
+            .expect("valid specs");
         let cloned = specs.clone();
         assert_eq!(specs, cloned);
     }
@@ -565,7 +633,10 @@ mod tests {
     #[test]
     fn test_shared_contract_specs_set_get() {
         let shared = SharedContractSpecs::new();
-        let specs = ContractSpecs::builder().tick_size(100).build();
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .build()
+            .expect("valid specs");
         shared.set(specs.clone());
         assert_eq!(shared.get(), Some(specs));
     }
@@ -573,8 +644,18 @@ mod tests {
     #[test]
     fn test_shared_contract_specs_overwrite() {
         let shared = SharedContractSpecs::new();
-        shared.set(ContractSpecs::builder().tick_size(100).build());
-        shared.set(ContractSpecs::builder().tick_size(200).build());
+        shared.set(
+            ContractSpecs::builder()
+                .tick_size(100)
+                .build()
+                .expect("valid specs"),
+        );
+        shared.set(
+            ContractSpecs::builder()
+                .tick_size(200)
+                .build()
+                .expect("valid specs"),
+        );
         assert_eq!(shared.get().map(|s| s.tick_size()), Some(200));
     }
 
@@ -590,5 +671,88 @@ mod tests {
         let builder = ContractSpecs::builder().tick_size(100);
         let debug = format!("{builder:?}");
         assert!(debug.contains("ContractSpecsBuilder"));
+    }
+
+    // ========== ContractSpecsBuilder validation tests ==========
+
+    #[test]
+    fn test_contract_specs_builder_default_builds_ok() {
+        let result = ContractSpecs::builder().build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_contract_specs_builder_valid_builds_ok() {
+        let result = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(1)
+            .contract_size(1)
+            .min_order_size(1)
+            .max_order_size(10_000)
+            .build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_contract_specs_builder_zero_tick_rejected() {
+        let result = ContractSpecs::builder().tick_size(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero tick_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("tick_size"));
+        assert!(err.to_string().contains('0'));
+    }
+
+    #[test]
+    fn test_contract_specs_builder_zero_lot_rejected() {
+        let result = ContractSpecs::builder().lot_size(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero lot_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("lot_size"));
+    }
+
+    #[test]
+    fn test_contract_specs_builder_zero_contract_size_rejected() {
+        let result = ContractSpecs::builder().contract_size(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero contract_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("contract_size"));
+    }
+
+    #[test]
+    fn test_contract_specs_builder_zero_min_order_size_rejected() {
+        let result = ContractSpecs::builder().min_order_size(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero min_order_size to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("min_order_size"));
+    }
+
+    #[test]
+    fn test_contract_specs_builder_inverted_order_size_window_rejected() {
+        let result = ContractSpecs::builder()
+            .min_order_size(100)
+            .max_order_size(10)
+            .build();
+        let err = match result {
+            Ok(_) => panic!("expected max < min to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("max_order_size"));
+        assert!(msg.contains("10"));
+        assert!(msg.contains("100"));
+    }
+
+    #[test]
+    fn test_contract_specs_validate_default_ok() {
+        let specs = ContractSpecs::default();
+        assert!(specs.validate().is_ok());
     }
 }

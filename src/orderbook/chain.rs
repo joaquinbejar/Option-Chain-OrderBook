@@ -1640,7 +1640,11 @@ mod tests {
     fn test_manager_set_specs_propagates() {
         let manager = OptionChainOrderBookManager::new("BTC");
 
-        let specs = ContractSpecs::builder().tick_size(100).lot_size(1).build();
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(1)
+            .build()
+            .expect("valid specs");
         manager.set_specs(specs);
 
         let chain = manager.get_or_create(test_expiration());
@@ -1652,7 +1656,11 @@ mod tests {
         let manager = OptionChainOrderBookManager::new("BTC");
         assert!(manager.specs().is_none());
 
-        let specs = ContractSpecs::builder().tick_size(100).lot_size(1).build();
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(1)
+            .build()
+            .expect("valid specs");
         manager.set_specs(specs);
         assert!(manager.specs().is_some());
     }
