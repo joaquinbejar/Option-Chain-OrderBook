@@ -12,7 +12,7 @@ use orderbook_rs::{
     DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, OrderStateTracker,
     OrderStatus, STPMode, Side, TimeInForce, TradeResult,
 };
-use pricelevel::{Hash32, MatchResult};
+use pricelevel::{Hash32, MatchResult, Quantity};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -742,7 +742,10 @@ impl OptionOrderBook {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .unwrap_or_else(|| {
-                TradeResult::new(self.symbol.clone(), MatchResult::new(order_id, quantity))
+                TradeResult::new(
+                    self.symbol.clone(),
+                    MatchResult::new(order_id, Quantity::new(quantity)),
+                )
             })
     }
 
