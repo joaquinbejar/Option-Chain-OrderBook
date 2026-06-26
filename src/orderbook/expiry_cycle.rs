@@ -19,7 +19,7 @@
 
 use super::strike_range::ExpiryType;
 use crate::error::{Error, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use optionstratlib::ExpirationDate;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
@@ -43,7 +43,12 @@ use std::sync::RwLock;
 pub struct CycleRule {
     /// The expiry classification for which to generate dates.
     pub cycle_type: ExpiryType,
-    /// Number of forward cycles to create. Must be ≥ 1.
+    /// Number of forward cycles to create.
+    ///
+    /// Must be ≥ 1 and ≤
+    /// [`ExpiryCycleConfig::MAX_CYCLE_COUNT`](ExpiryCycleConfig::MAX_CYCLE_COUNT);
+    /// values outside that range are rejected by
+    /// [`ExpiryCycleConfig::validate`](ExpiryCycleConfig::validate).
     pub count: usize,
 }
 
@@ -70,10 +75,16 @@ pub struct CycleRule {
 pub struct ExpiryCycleConfig {
     /// The set of cycle rules to apply when generating expiration dates.
     pub cycles: Vec<CycleRule>,
-    /// UTC expiry time as (hour, minute). Must be a valid 24-hour time.
-    pub expiry_time_utc: (u32, u32),
-    /// UTC settlement time as (hour, minute). Must be a valid 24-hour time.
-    pub settlement_time_utc: (u32, u32),
+    /// UTC time of day at which options expire.
+    ///
+    /// Modeled as a [`NaiveTime`] so an out-of-range hour/minute is
+    /// unrepresentable; serialized as an `"HH:MM:SS"` string.
+    pub expiry_time_utc: NaiveTime,
+    /// UTC time of day at which options settle.
+    ///
+    /// Modeled as a [`NaiveTime`] (serialized as `"HH:MM:SS"`). Must be at or
+    /// after [`expiry_time_utc`](Self::expiry_time_utc).
+    pub settlement_time_utc: NaiveTime,
 }
 
 impl Default for ExpiryCycleConfig {
@@ -97,13 +108,44 @@ impl Default for ExpiryCycleConfig {
                     count: 4,
                 },
             ],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            // 08:00:00 / 08:30:00 are statically valid, so `from_hms_opt` returns
+            // `Some` and the `unwrap_or` fallback is never taken (no
+            // `expect`/`unwrap`). The `debug_assert!` catches a future edit to an
+            // invalid constant in debug/test builds rather than silently
+            // defaulting to midnight in release.
+            expiry_time_utc: {
+                let t = NaiveTime::from_hms_opt(8, 0, 0);
+                debug_assert!(
+                    t.is_some(),
+                    "default expiry time must be a valid time of day"
+                );
+                t.unwrap_or(NaiveTime::MIN)
+            },
+            settlement_time_utc: {
+                let t = NaiveTime::from_hms_opt(8, 30, 0);
+                debug_assert!(
+                    t.is_some(),
+                    "default settlement time must be a valid time of day"
+                );
+                t.unwrap_or(NaiveTime::MIN)
+            },
         }
     }
 }
 
 impl ExpiryCycleConfig {
+    /// Maximum number of forward cycles a single [`CycleRule`] may request.
+    ///
+    /// A deserialized `count` flows straight into `Vec::with_capacity(count)`
+    /// during date generation, so an unbounded value (for example `usize::MAX`
+    /// from a corrupt or hostile config) would request an allocation large
+    /// enough to abort the process. This ceiling sits far above any realistic
+    /// listed-expiry horizon: even an aggressive daily-expiry listing spans at
+    /// most ~366 calendar days a year, and weekly/monthly/quarterly cycles are
+    /// an order of magnitude smaller, so 512 leaves generous headroom while
+    /// keeping the pre-allocation safely bounded.
+    pub const MAX_CYCLE_COUNT: usize = 512;
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -111,8 +153,11 @@ impl ExpiryCycleConfig {
     /// Returns `Error::ConfigurationError` if:
     /// - `cycles` is empty
     /// - Any `CycleRule.count` is zero
+    /// - Any `CycleRule.count` exceeds
+    ///   [`MAX_CYCLE_COUNT`](Self::MAX_CYCLE_COUNT)
     /// - Duplicate `cycle_type` values exist
-    /// - `expiry_time_utc` or `settlement_time_utc` has an invalid hour or minute
+    /// - `settlement_time_utc` is before `expiry_time_utc` (settlement must be
+    ///   at or after expiry)
     pub fn validate(&self) -> Result<()> {
         if self.cycles.is_empty() {
             return Err(Error::configuration("cycles must not be empty"));
@@ -125,6 +170,14 @@ impl ExpiryCycleConfig {
                     rule.cycle_type
                 )));
             }
+            if rule.count > Self::MAX_CYCLE_COUNT {
+                return Err(Error::configuration(format!(
+                    "cycle count {} for {:?} exceeds the maximum of {}",
+                    rule.count,
+                    rule.cycle_type,
+                    Self::MAX_CYCLE_COUNT
+                )));
+            }
             if !seen.insert(rule.cycle_type) {
                 return Err(Error::configuration(format!(
                     "duplicate cycle_type {:?} in config",
@@ -132,24 +185,13 @@ impl ExpiryCycleConfig {
                 )));
             }
         }
-        let (eh, em) = self.expiry_time_utc;
-        if eh > 23 || em > 59 {
+        // Settlement must be at or after expiry on the same calendar day.
+        // `NaiveTime` ordering makes this a total comparison; out-of-range
+        // hour/minute values are already unrepresentable.
+        if self.settlement_time_utc < self.expiry_time_utc {
             return Err(Error::configuration(format!(
-                "expiry_time_utc ({eh}:{em:02}) is not a valid 24-hour time"
-            )));
-        }
-        let (sh, sm) = self.settlement_time_utc;
-        if sh > 23 || sm > 59 {
-            return Err(Error::configuration(format!(
-                "settlement_time_utc ({sh}:{sm:02}) is not a valid 24-hour time"
-            )));
-        }
-        // Settlement must be at or after expiry on the same day
-        let expiry_mins = eh * 60 + em;
-        let settle_mins = sh * 60 + sm;
-        if settle_mins < expiry_mins {
-            return Err(Error::configuration(format!(
-                "settlement_time_utc ({sh}:{sm:02}) must be at or after expiry_time_utc ({eh}:{em:02})"
+                "settlement_time_utc ({}) must be at or after expiry_time_utc ({})",
+                self.settlement_time_utc, self.expiry_time_utc
             )));
         }
         Ok(())
@@ -174,12 +216,12 @@ impl ExpiryCycleConfig {
     ///
     /// ```
     /// use option_chain_orderbook::orderbook::{CycleRule, ExpiryType, ExpiryCycleConfig};
-    /// use chrono::Utc;
+    /// use chrono::{NaiveTime, Utc};
     ///
     /// let config = ExpiryCycleConfig {
     ///     cycles: vec![CycleRule { cycle_type: ExpiryType::Daily, count: 3 }],
-    ///     expiry_time_utc: (8, 0),
-    ///     settlement_time_utc: (8, 30),
+    ///     expiry_time_utc: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+    ///     settlement_time_utc: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
     /// };
     /// let dates = config.generate_dates(Utc::now()).expect("should succeed");
     /// assert_eq!(dates.len(), 3);
@@ -187,12 +229,12 @@ impl ExpiryCycleConfig {
     pub fn generate_dates(&self, from: DateTime<Utc>) -> Result<Vec<ExpirationDate>> {
         self.validate()?;
 
-        let (h, m) = self.expiry_time_utc;
+        let time = self.expiry_time_utc;
 
         let mut dates: Vec<ExpirationDate> = Vec::new();
 
         for rule in &self.cycles {
-            let cycle_dates = generate_cycle_dates(from, rule, h, m)?;
+            let cycle_dates = generate_cycle_dates(from, rule, time)?;
             dates.extend(cycle_dates);
         }
 
@@ -211,14 +253,13 @@ impl ExpiryCycleConfig {
 fn generate_cycle_dates(
     from: DateTime<Utc>,
     rule: &CycleRule,
-    hour: u32,
-    minute: u32,
+    time: NaiveTime,
 ) -> Result<Vec<ExpirationDate>> {
     match rule.cycle_type {
-        ExpiryType::Daily => generate_daily(from, rule.count, hour, minute),
-        ExpiryType::Weekly => generate_weekly(from, rule.count, hour, minute),
-        ExpiryType::Monthly => generate_monthly(from, rule.count, hour, minute),
-        ExpiryType::Quarterly => generate_quarterly(from, rule.count, hour, minute),
+        ExpiryType::Daily => generate_daily(from, rule.count, time),
+        ExpiryType::Weekly => generate_weekly(from, rule.count, time),
+        ExpiryType::Monthly => generate_monthly(from, rule.count, time),
+        ExpiryType::Quarterly => generate_quarterly(from, rule.count, time),
     }
 }
 
@@ -226,8 +267,7 @@ fn generate_cycle_dates(
 fn generate_daily(
     from: DateTime<Utc>,
     count: usize,
-    hour: u32,
-    minute: u32,
+    time: NaiveTime,
 ) -> Result<Vec<ExpirationDate>> {
     let base = from.date_naive();
     let mut dates = Vec::with_capacity(count);
@@ -235,7 +275,7 @@ fn generate_daily(
         let day = base
             .checked_add_signed(Duration::days(i as i64))
             .ok_or_else(|| Error::configuration("date overflow generating daily expiry"))?;
-        dates.push(to_expiration(day, hour, minute)?);
+        dates.push(to_expiration(day, time));
     }
     Ok(dates)
 }
@@ -246,13 +286,12 @@ fn generate_daily(
 fn generate_weekly(
     from: DateTime<Utc>,
     count: usize,
-    hour: u32,
-    minute: u32,
+    time: NaiveTime,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
-    let mut friday = next_friday_on_or_after(from, hour, minute)?;
+    let mut friday = next_friday_on_or_after(from, time)?;
     for _ in 0..count {
-        dates.push(to_expiration(friday, hour, minute)?);
+        dates.push(to_expiration(friday, time));
         friday = friday
             .checked_add_signed(Duration::days(7))
             .ok_or_else(|| Error::configuration("date overflow advancing weekly Friday"))?;
@@ -265,8 +304,7 @@ fn generate_weekly(
 fn generate_monthly(
     from: DateTime<Utc>,
     count: usize,
-    hour: u32,
-    minute: u32,
+    time: NaiveTime,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
     let base = from.date_naive();
@@ -275,9 +313,9 @@ fn generate_monthly(
 
     while dates.len() < count {
         let last_fri = last_friday_of_month(year, month)?;
-        let candidate_dt = to_datetime(last_fri, hour, minute)?;
+        let candidate_dt = to_datetime(last_fri, time);
         if candidate_dt > from {
-            dates.push(to_expiration(last_fri, hour, minute)?);
+            dates.push(to_expiration(last_fri, time));
         }
         (year, month) = advance_month(year, month)?;
     }
@@ -289,8 +327,7 @@ fn generate_monthly(
 fn generate_quarterly(
     from: DateTime<Utc>,
     count: usize,
-    hour: u32,
-    minute: u32,
+    time: NaiveTime,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
     let base = from.date_naive();
@@ -299,9 +336,9 @@ fn generate_quarterly(
 
     while dates.len() < count {
         let last_fri = last_friday_of_month(year, q_month)?;
-        let candidate_dt = to_datetime(last_fri, hour, minute)?;
+        let candidate_dt = to_datetime(last_fri, time);
         if candidate_dt > from {
-            dates.push(to_expiration(last_fri, hour, minute)?);
+            dates.push(to_expiration(last_fri, time));
         }
         (year, q_month) = advance_quarter(year, q_month)?;
     }
@@ -314,13 +351,13 @@ fn generate_quarterly(
 ///
 /// If `from` is on a Friday and before the expiry time, returns that Friday.
 /// Otherwise, returns the next Friday.
-fn next_friday_on_or_after(from: DateTime<Utc>, hour: u32, minute: u32) -> Result<NaiveDate> {
+fn next_friday_on_or_after(from: DateTime<Utc>, time: NaiveTime) -> Result<NaiveDate> {
     let date = from.date_naive();
     let weekday_num = date.weekday().num_days_from_monday() as i64;
 
     // If today is Friday (4), check if we're before expiry time
     if weekday_num == 4 {
-        let expiry_dt = to_datetime(date, hour, minute)?;
+        let expiry_dt = to_datetime(date, time);
         if from < expiry_dt {
             return Ok(date);
         }
@@ -406,18 +443,18 @@ fn advance_quarter(year: i32, q_month: u32) -> Result<(i32, u32)> {
     }
 }
 
-/// Converts a `NaiveDate` and time components to a `DateTime<Utc>`.
-pub(crate) fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
-    let naive_dt = date
-        .and_hms_opt(hour, minute, 0)
-        .ok_or_else(|| Error::configuration("invalid time in to_datetime"))?;
-    Ok(Utc.from_utc_datetime(&naive_dt))
+/// Combines a [`NaiveDate`] and a [`NaiveTime`] into a UTC [`DateTime`].
+///
+/// Infallible: a [`NaiveTime`] is always a valid time-of-day, so no
+/// hour/minute validation is needed.
+#[must_use]
+pub(crate) fn to_datetime(date: NaiveDate, time: NaiveTime) -> DateTime<Utc> {
+    Utc.from_utc_datetime(&date.and_time(time))
 }
 
-/// Converts a `NaiveDate` and time components to an `ExpirationDate::DateTime`.
-fn to_expiration(date: NaiveDate, hour: u32, minute: u32) -> Result<ExpirationDate> {
-    let dt = to_datetime(date, hour, minute)?;
-    Ok(ExpirationDate::DateTime(dt))
+/// Combines a [`NaiveDate`] and a [`NaiveTime`] into an `ExpirationDate::DateTime`.
+fn to_expiration(date: NaiveDate, time: NaiveTime) -> ExpirationDate {
+    ExpirationDate::DateTime(to_datetime(date, time))
 }
 
 // ─── SharedExpiryCycleConfig ──────────────────────────────────────────────────
@@ -486,12 +523,16 @@ impl Default for SharedExpiryCycleConfig {
 mod tests {
     use super::super::strike_range::ExpiryType;
     use super::*;
-    use chrono::{DateTime, NaiveDate, TimeZone, Timelike, Utc, Weekday};
+    use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("valid test date")
+    }
+
+    fn time(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).expect("valid test time")
     }
 
     fn dt(y: i32, mo: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
@@ -506,8 +547,8 @@ mod tests {
     fn single_cycle_config(cycle_type: ExpiryType, count: usize) -> ExpiryCycleConfig {
         ExpiryCycleConfig {
             cycles: vec![CycleRule { cycle_type, count }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         }
     }
 
@@ -523,8 +564,8 @@ mod tests {
     fn test_default_config_values() {
         let config = ExpiryCycleConfig::default();
         assert_eq!(config.cycles.len(), 4);
-        assert_eq!(config.expiry_time_utc, (8, 0));
-        assert_eq!(config.settlement_time_utc, (8, 30));
+        assert_eq!(config.expiry_time_utc, time(8, 0));
+        assert_eq!(config.settlement_time_utc, time(8, 30));
 
         let daily = config
             .cycles
@@ -565,8 +606,8 @@ mod tests {
     fn test_validate_empty_cycles() {
         let config = ExpiryCycleConfig {
             cycles: vec![],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         };
         assert!(config.validate().is_err());
     }
@@ -578,10 +619,41 @@ mod tests {
                 cycle_type: ExpiryType::Daily,
                 count: 0,
             }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_over_limit_count() {
+        // A `count` above `MAX_CYCLE_COUNT` must be rejected before it can flow
+        // into `Vec::with_capacity` and request an aborting allocation.
+        let config = ExpiryCycleConfig {
+            cycles: vec![CycleRule {
+                cycle_type: ExpiryType::Daily,
+                count: ExpiryCycleConfig::MAX_CYCLE_COUNT + 1,
+            }],
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
+        };
+        let err = config.validate().expect_err("over-limit count must fail");
+        assert!(matches!(err, Error::ConfigurationError { .. }));
+        assert!(err.to_string().contains("exceeds the maximum"));
+    }
+
+    #[test]
+    fn test_validate_max_limit_count_ok() {
+        // Exactly at the ceiling is still valid (the bound is inclusive).
+        let config = ExpiryCycleConfig {
+            cycles: vec![CycleRule {
+                cycle_type: ExpiryType::Daily,
+                count: ExpiryCycleConfig::MAX_CYCLE_COUNT,
+            }],
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -597,63 +669,44 @@ mod tests {
                     count: 3,
                 },
             ],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
 
     #[test]
-    fn test_validate_invalid_expiry_hour() {
+    fn test_validate_settlement_before_expiry() {
+        // Settlement strictly before expiry must be rejected with the typed
+        // configuration error.
         let config = ExpiryCycleConfig {
             cycles: vec![CycleRule {
                 cycle_type: ExpiryType::Daily,
                 count: 1,
             }],
-            expiry_time_utc: (24, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 30),
+            settlement_time_utc: time(8, 0),
         };
-        assert!(config.validate().is_err());
+        let err = config
+            .validate()
+            .expect_err("settlement before expiry must fail");
+        assert!(matches!(err, Error::ConfigurationError { .. }));
+        assert!(err.to_string().contains("at or after"));
     }
 
     #[test]
-    fn test_validate_invalid_expiry_minute() {
+    fn test_validate_settlement_equals_expiry_ok() {
+        // Settlement at the same instant as expiry is allowed (at-or-after).
         let config = ExpiryCycleConfig {
             cycles: vec![CycleRule {
                 cycle_type: ExpiryType::Daily,
                 count: 1,
             }],
-            expiry_time_utc: (8, 60),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 0),
         };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_invalid_settlement_hour() {
-        let config = ExpiryCycleConfig {
-            cycles: vec![CycleRule {
-                cycle_type: ExpiryType::Daily,
-                count: 1,
-            }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (25, 0),
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_invalid_settlement_minute() {
-        let config = ExpiryCycleConfig {
-            cycles: vec![CycleRule {
-                cycle_type: ExpiryType::Daily,
-                count: 1,
-            }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 61),
-        };
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     // ── last_day_of_month ────────────────────────────────────────────────────
@@ -990,6 +1043,31 @@ mod tests {
     }
 
     #[test]
+    fn test_expiry_cycle_config_naivetime_serde_shape() {
+        // The DTO models the times as `NaiveTime`, which serdes as an
+        // "HH:MM:SS" string (not the old `[hour, minute]` tuple).
+        let config = ExpiryCycleConfig {
+            cycles: vec![CycleRule {
+                cycle_type: ExpiryType::Daily,
+                count: 1,
+            }],
+            expiry_time_utc: time(8, 0),
+            settlement_time_utc: time(8, 30),
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            json.contains("\"expiry_time_utc\":\"08:00:00\""),
+            "expected HH:MM:SS string for expiry_time_utc, got {json}"
+        );
+        assert!(
+            json.contains("\"settlement_time_utc\":\"08:30:00\""),
+            "expected HH:MM:SS string for settlement_time_utc, got {json}"
+        );
+        let decoded: ExpiryCycleConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(config, decoded);
+    }
+
+    #[test]
     fn test_cycle_rule_json_roundtrip() {
         let rule = CycleRule {
             cycle_type: ExpiryType::Quarterly,
@@ -1025,8 +1103,8 @@ mod tests {
                 cycle_type: ExpiryType::Daily,
                 count: 5,
             }],
-            expiry_time_utc: (9, 0),
-            settlement_time_utc: (9, 30),
+            expiry_time_utc: time(9, 0),
+            settlement_time_utc: time(9, 30),
         };
         shared.set(custom.clone());
         assert_eq!(shared.get(), Some(custom));

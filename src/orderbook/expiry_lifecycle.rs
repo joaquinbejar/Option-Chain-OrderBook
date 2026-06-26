@@ -284,11 +284,8 @@ impl ExpiryLifecycleManager {
                 _ => continue,
             };
 
-            let (eh, em) = expiry_config.expiry_time_utc;
-            let (sh, sm) = expiry_config.settlement_time_utc;
-
-            let expiry_dt = to_datetime(exp_date, eh, em)?;
-            let settle_dt = to_datetime(exp_date, sh, sm)?;
+            let expiry_dt = to_datetime(exp_date, expiry_config.expiry_time_utc);
+            let settle_dt = to_datetime(exp_date, expiry_config.settlement_time_utc);
             let removal_dt = settle_dt
                 .checked_add_signed(lifecycle_config.retention_period)
                 .ok_or_else(|| Error::configuration("overflow computing removal datetime"))?;
@@ -503,7 +500,7 @@ fn set_all_book_status(chain: &super::chain::OptionChainOrderBook, status: Instr
 mod tests {
     use super::*;
     use crate::orderbook::{StrikeGenerator, StrikeRangeConfig, UnderlyingOrderBook};
-    use chrono::{Duration, NaiveDate, TimeZone};
+    use chrono::{Duration, NaiveDate, NaiveTime, TimeZone};
     use orderbook_rs::{OrderId, Side};
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -515,8 +512,8 @@ mod tests {
                 cycle_type: ExpiryType::Daily,
                 count: 1,
             }],
-            expiry_time_utc: (8, 0),
-            settlement_time_utc: (8, 30),
+            expiry_time_utc: NaiveTime::from_hms_opt(8, 0, 0).expect("valid time"),
+            settlement_time_utc: NaiveTime::from_hms_opt(8, 30, 0).expect("valid time"),
         }
     }
 
