@@ -14,7 +14,7 @@ use super::stp::SharedSTPMode;
 use super::symbol_index::{SymbolIndex, SymbolRef};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
-use crate::utils::format_expiration_yyyymmdd;
+use crate::utils::{checked_accumulate, format_expiration_yyyymmdd};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -1355,6 +1355,27 @@ impl StrikeOrderBookManager {
     #[must_use]
     pub fn total_order_count(&self) -> usize {
         self.strikes.iter().map(|e| e.value().order_count()).sum()
+    }
+
+    /// Returns the strike count and total order count in a single ordered pass.
+    ///
+    /// Walks the ordered strike [`SkipMap`] exactly once, counting strikes and
+    /// summing each strike's [`order_count`](StrikeOrderBook::order_count). This
+    /// yields a coherent `(strikes, orders)` snapshot from one traversal rather
+    /// than the two independent walks [`len`](Self::len) +
+    /// [`total_order_count`](Self::total_order_count) would perform, and feeds
+    /// the single-pass `stats()` aggregation higher up the hierarchy. Counters
+    /// accumulate with checked addition (capping at `usize::MAX` on the
+    /// structurally unreachable overflow) — never wrapping.
+    #[must_use]
+    pub(crate) fn strike_and_order_counts(&self) -> (usize, usize) {
+        let mut strikes = 0usize;
+        let mut orders = 0usize;
+        for entry in self.strikes.iter() {
+            strikes = checked_accumulate(strikes, 1);
+            orders = checked_accumulate(orders, entry.value().order_count());
+        }
+        (strikes, orders)
     }
 
     /// Returns the ATM (at-the-money) strike closest to the given spot price.

@@ -13,6 +13,7 @@ use super::strike::StrikeOrderBook;
 use super::symbol_index::SymbolIndex;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
+use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
@@ -528,6 +529,15 @@ impl ExpirationOrderBook {
         self.chain.total_order_count()
     }
 
+    /// Returns the strike count and total order count in a single ordered pass.
+    ///
+    /// Delegates to [`OptionChainOrderBook::strike_and_order_counts`], walking
+    /// this expiration's chain once for the single-pass `stats()` aggregation.
+    #[must_use]
+    pub(crate) fn strike_and_order_counts(&self) -> (usize, usize) {
+        self.chain.strike_and_order_counts()
+    }
+
     /// Returns the ATM strike closest to the given spot price.
     ///
     /// # Errors
@@ -917,6 +927,68 @@ impl ExpirationOrderBookManager {
             total_strikes: self.total_strike_count(),
             total_orders: self.total_order_count(),
         }
+    }
+
+    /// Returns a single-pass [`SubtreeStats`] tally for this manager's
+    /// expirations.
+    ///
+    /// Walks the ordered expiration [`SkipMap`] exactly once and, for each
+    /// expiration, walks its strikes exactly once, accumulating the expiration,
+    /// strike, and order counts together. This replaces the three independent
+    /// subtree walks (`len()` + `total_strike_count()` + `total_order_count()`)
+    /// with one, yielding a coherent snapshot for the underlying-level
+    /// `stats()` even under concurrent mutation.
+    #[must_use]
+    pub(crate) fn subtree_stats(&self) -> SubtreeStats {
+        let mut acc = SubtreeStats::default();
+        for entry in self.expirations.iter() {
+            let (strikes, orders) = entry.value().strike_and_order_counts();
+            acc.add_expiration(strikes, orders);
+        }
+        acc
+    }
+}
+
+/// Single-pass tally of an underlying subtree's expiration, strike, and order
+/// counts.
+///
+/// Internal accumulator consumed by the `stats()` methods on
+/// `UnderlyingOrderBook` and `UnderlyingOrderBookManager`. It is filled in ONE
+/// leaf-up traversal of the ordered `SkipMap`s — each expiration is visited
+/// once and its strikes walked once — so the three counts form a coherent
+/// snapshot taken at a single point in the walk, unlike the previous three
+/// independent `expiration_count()` + `total_strike_count()` +
+/// `total_order_count()` passes which could each observe the tree at a
+/// different moment under concurrent mutation. Counters accumulate with checked
+/// addition (capping at `usize::MAX` on the structurally unreachable overflow)
+/// rather than wrapping, keeping the tally monotonic without a panic.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SubtreeStats {
+    /// Number of expirations visited.
+    pub(crate) expirations: usize,
+    /// Total number of strikes across the visited expirations.
+    pub(crate) strikes: usize,
+    /// Total number of resting orders across the visited strikes.
+    pub(crate) orders: usize,
+}
+
+impl SubtreeStats {
+    /// Folds one expiration's `(strikes, orders)` tally into the accumulator,
+    /// incrementing the expiration count by one. Uses checked addition.
+    #[inline]
+    pub(crate) fn add_expiration(&mut self, strikes: usize, orders: usize) {
+        self.expirations = checked_accumulate(self.expirations, 1);
+        self.strikes = checked_accumulate(self.strikes, strikes);
+        self.orders = checked_accumulate(self.orders, orders);
+    }
+
+    /// Folds another subtree tally (e.g. one underlying's) into this one. Uses
+    /// checked addition.
+    #[inline]
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.expirations = checked_accumulate(self.expirations, other.expirations);
+        self.strikes = checked_accumulate(self.strikes, other.strikes);
+        self.orders = checked_accumulate(self.orders, other.orders);
     }
 }
 
