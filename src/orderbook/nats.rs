@@ -39,6 +39,8 @@
 //! ```
 
 use crate::error::Error;
+use crate::utils::SymbolParser;
+use optionstratlib::OptionStyle;
 
 /// Configuration for connecting NATS publishers to the option chain hierarchy.
 ///
@@ -154,7 +156,9 @@ impl OptionChainSubjectBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the symbol does not match the expected format.
+    /// Returns an error if the symbol does not match the expected format, or if
+    /// the (already grammar-valid) underlying contains a NATS subject-reserved
+    /// character (`.`, `*`, `>`).
     ///
     /// # Example
     ///
@@ -168,51 +172,33 @@ impl OptionChainSubjectBuilder {
     /// assert_eq!(builder.option_type(), "C");
     /// ```
     pub fn from_symbol(symbol: &str) -> Result<Self, Error> {
-        let parts: Vec<&str> = symbol.split('-').collect();
-        if parts.len() != 4 {
+        // The `{underlying}-{expiry}-{strike}-{type}` grammar is owned by
+        // `SymbolParser` (the single source of truth): 4 parts, an 8-digit
+        // canonical date, a positive integer strike and a case-insensitive
+        // `C`/`P` type. NATS adds only subject-character escaping on top.
+        let parsed = SymbolParser::parse(symbol)?;
+
+        // The underlying is the only free-form segment that can carry a NATS
+        // subject-reserved character; the expiry (digits) and strike (digits)
+        // are already constrained by `SymbolParser`.
+        let underlying = parsed.underlying();
+        if underlying.contains('.') || underlying.contains('*') || underlying.contains('>') {
             return Err(Error::invalid_symbol(
                 symbol,
-                format!("expected 4 parts, got {}", parts.len()),
+                "underlying contains invalid NATS characters",
             ));
         }
 
-        let option_type = parts[3].to_uppercase();
-        if option_type != "C" && option_type != "P" {
-            return Err(Error::invalid_symbol(
-                symbol,
-                format!("expected C or P, got {}", parts[3]),
-            ));
-        }
-
-        // Validate components for NATS subject rules
-        let underlying = parts[0];
-        let expiry = parts[1];
-        let strike = parts[2];
-
-        for (name, value) in [
-            ("underlying", underlying),
-            ("expiry", expiry),
-            ("strike", strike),
-        ] {
-            if value.is_empty() {
-                return Err(Error::invalid_symbol(
-                    symbol,
-                    format!("{} cannot be empty", name),
-                ));
-            }
-            if value.contains('.') || value.contains('*') || value.contains('>') {
-                return Err(Error::invalid_symbol(
-                    symbol,
-                    format!("{} contains invalid NATS characters", name),
-                ));
-            }
-        }
+        let option_type = match parsed.option_style() {
+            OptionStyle::Call => "C",
+            OptionStyle::Put => "P",
+        };
 
         Ok(Self {
             underlying: underlying.to_string(),
-            expiry: expiry.to_string(),
-            strike: strike.to_string(),
-            option_type,
+            expiry: parsed.expiration_str().to_string(),
+            strike: parsed.strike().to_string(),
+            option_type: option_type.to_string(),
         })
     }
 
@@ -338,6 +324,28 @@ mod tests {
     fn test_subject_builder_invalid_parts() {
         let result = OptionChainSubjectBuilder::from_symbol("BTC-20240329-50000");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_symbol_matches_symbol_parser_parse() {
+        for symbol in [
+            "BTC-20240329-50000-C",
+            "ETH-20240628-3000-P",
+            "BTC-20240329-50000-c",
+        ] {
+            let parsed = SymbolParser::parse(symbol).expect("symbol parser must parse");
+            let builder =
+                OptionChainSubjectBuilder::from_symbol(symbol).expect("from_symbol must parse");
+
+            assert_eq!(builder.underlying(), parsed.underlying());
+            assert_eq!(builder.expiry(), parsed.expiration_str());
+            assert_eq!(builder.strike(), parsed.strike().to_string());
+            let expected_type = match parsed.option_style() {
+                OptionStyle::Call => "C",
+                OptionStyle::Put => "P",
+            };
+            assert_eq!(builder.option_type(), expected_type);
+        }
     }
 
     #[test]

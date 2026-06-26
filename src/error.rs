@@ -177,6 +177,20 @@ pub enum Error {
         symbol: String,
     },
 
+    /// Error when a command's symbol names a different underlying than the book
+    /// it is routed to (e.g. an ETH command submitted to a BTC book).
+    #[error(
+        "underlying mismatch for symbol '{symbol}': parsed underlying '{parsed}' but book is '{expected}'"
+    )]
+    UnderlyingMismatch {
+        /// The offending symbol.
+        symbol: String,
+        /// The underlying parsed from the symbol.
+        parsed: String,
+        /// The underlying the target book belongs to.
+        expected: String,
+    },
+
     /// Error when a journal operation fails.
     #[error("journal error: {message}")]
     JournalError {
@@ -353,6 +367,21 @@ impl Error {
         }
     }
 
+    /// Creates a new underlying mismatch error.
+    #[must_use]
+    #[cold]
+    pub fn underlying_mismatch(
+        symbol: impl Into<String>,
+        parsed: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self::UnderlyingMismatch {
+            symbol: symbol.into(),
+            parsed: parsed.into(),
+            expected: expected.into(),
+        }
+    }
+
     /// Creates a new journal error.
     #[must_use]
     pub fn journal_error(message: impl Into<String>) -> Self {
@@ -514,5 +543,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("symbol not found"));
         assert!(msg.contains("BTC-20260130-50000-C"));
+    }
+
+    #[test]
+    fn test_underlying_mismatch_error() {
+        let err = Error::underlying_mismatch("ETH-20240329-3000-C", "ETH", "BTC");
+        let msg = err.to_string();
+        assert!(msg.contains("underlying mismatch"));
+        assert!(msg.contains("ETH-20240329-3000-C"));
+        assert!(msg.contains("ETH"));
+        assert!(msg.contains("BTC"));
     }
 }

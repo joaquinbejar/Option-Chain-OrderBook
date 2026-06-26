@@ -35,44 +35,22 @@ pub fn format_expiration_yyyymmdd(expiration: &ExpirationDate) -> Result<String>
     Ok(date.format("%Y%m%d").to_string())
 }
 
-/// Parses a YYYYMMDD string into an `ExpirationDate`.
+/// Parses a `YYYYMMDD` string into a canonical [`ExpirationDate`].
+///
+/// Thin wrapper that delegates to [`SymbolParser::parse_yyyymmdd`], the single
+/// source of truth for the symbol-expiry grammar and its canonical time-of-day.
+/// See that method for the exact instant assigned to the date.
 ///
 /// # Arguments
 ///
-/// * `date_str` - The date string in YYYYMMDD format
+/// * `date_str` - The date string in `YYYYMMDD` format
 /// * `symbol` - The original symbol (for error messages)
-///
-/// # Returns
-///
-/// An `ExpirationDate::DateTime` set to 23:59:59 UTC on the parsed date.
 ///
 /// # Errors
 ///
-/// Returns `Error::InvalidSymbol` if the date format is invalid.
+/// Returns [`Error::InvalidSymbol`] if the date format is invalid.
 pub fn parse_yyyymmdd(date_str: &str, symbol: &str) -> Result<ExpirationDate> {
-    if date_str.len() != 8 {
-        return Err(Error::invalid_symbol(
-            symbol,
-            format!("expiration must be 8 digits (YYYYMMDD), got '{}'", date_str),
-        ));
-    }
-
-    if !date_str.chars().all(|c| c.is_ascii_digit()) {
-        return Err(Error::invalid_symbol(
-            symbol,
-            format!("expiration must be numeric, got '{}'", date_str),
-        ));
-    }
-
-    let naive_date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
-        .map_err(|_| Error::invalid_symbol(symbol, format!("invalid date '{}'", date_str)))?;
-
-    let naive_datetime = naive_date.and_hms_opt(23, 59, 59).ok_or_else(|| {
-        Error::invalid_symbol(symbol, "failed to construct expiration time 23:59:59")
-    })?;
-    let datetime = Utc.from_utc_datetime(&naive_datetime);
-
-    Ok(ExpirationDate::DateTime(datetime))
+    SymbolParser::parse_yyyymmdd(date_str, symbol)
 }
 
 /// Returns the current wall-clock time as nanoseconds since Unix epoch.
@@ -89,24 +67,147 @@ pub(crate) fn nanos_since_epoch() -> u64 {
 ///
 /// Represents a decomposed option symbol like `BTC-20260130-50000-C` with all
 /// its components extracted and validated.
+///
+/// # Invariants
+///
+/// All fields are private and the type can only be constructed through
+/// [`ParsedSymbol::try_new`] (or [`SymbolParser::parse`], which delegates to
+/// it). Construction guarantees:
+///
+/// * `underlying` is non-empty,
+/// * `strike` is strictly positive,
+/// * `expiration` is the canonical parse of `expiration_str` (so the two can
+///   never disagree).
+///
+/// Together these guarantee the [`ParsedSymbol::to_symbol`] round-trip: the
+/// reconstructed string always re-parses to an equal `ParsedSymbol`.
+///
+/// # Breaking
+///
+/// The fields are private; construct via [`ParsedSymbol::try_new`] and read
+/// them through the [`ParsedSymbol::underlying`], [`ParsedSymbol::expiration`],
+/// [`ParsedSymbol::expiration_str`], [`ParsedSymbol::strike`], and
+/// [`ParsedSymbol::option_style`] accessors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedSymbol {
     /// Underlying asset (e.g., "BTC").
-    pub underlying: String,
-    /// Expiration date.
-    pub expiration: ExpirationDate,
+    underlying: String,
+    /// Expiration date (canonical parse of `expiration_str`).
+    expiration: ExpirationDate,
     /// Original expiration string (YYYYMMDD format).
-    pub expiration_str: String,
+    expiration_str: String,
     /// Strike price.
-    pub strike: u64,
+    strike: u64,
     /// Option type (Call or Put).
-    pub option_style: OptionStyle,
+    option_style: OptionStyle,
 }
 
 impl ParsedSymbol {
+    /// Builds a validated `ParsedSymbol` from its components.
+    ///
+    /// The `expiration` field is derived from `expiration_str` via the canonical
+    /// [`SymbolParser::parse_yyyymmdd`], so the two can never diverge and the
+    /// [`ParsedSymbol::to_symbol`] round-trip is guaranteed by construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - Underlying asset symbol (must be non-empty)
+    /// * `expiration_str` - Expiration date in `YYYYMMDD` format
+    /// * `strike` - Strike price (must be strictly positive)
+    /// * `option_style` - Call or Put
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSymbol`] if `underlying` is empty, `strike` is
+    /// zero, or `expiration_str` is not a valid `YYYYMMDD` date.
+    pub fn try_new(
+        underlying: impl Into<String>,
+        expiration_str: impl Into<String>,
+        strike: u64,
+        option_style: OptionStyle,
+    ) -> Result<Self> {
+        let underlying = underlying.into();
+        let expiration_str = expiration_str.into();
+        let option_char = match option_style {
+            OptionStyle::Call => "C",
+            OptionStyle::Put => "P",
+        };
+        // Reconstruct the symbol only for error context — the happy path (run
+        // per routed order) must not allocate it.
+        let symbol = || format!("{underlying}-{expiration_str}-{strike}-{option_char}");
+
+        if underlying.is_empty() {
+            return Err(Error::invalid_symbol(
+                symbol(),
+                "underlying cannot be empty",
+            ));
+        }
+        if strike == 0 {
+            return Err(Error::invalid_symbol(
+                symbol(),
+                "strike price must be positive, got 0",
+            ));
+        }
+
+        // `parse_yyyymmdd` only reads its `symbol` argument on the (cold) error
+        // path, so pass an empty placeholder and rebuild the full context with
+        // the original reason if it fails.
+        let expiration =
+            SymbolParser::parse_yyyymmdd(&expiration_str, "").map_err(|e| match e {
+                Error::InvalidSymbol { reason, .. } => Error::invalid_symbol(symbol(), reason),
+                other => other,
+            })?;
+
+        Ok(Self {
+            underlying,
+            expiration,
+            expiration_str,
+            strike,
+            option_style,
+        })
+    }
+
+    /// Returns the underlying asset symbol (e.g., `"BTC"`).
+    #[must_use]
+    #[inline]
+    pub fn underlying(&self) -> &str {
+        &self.underlying
+    }
+
+    /// Returns the canonical expiration date.
+    // Note: `ExpirationDate` is itself `#[must_use]`, so no attribute here
+    // (clippy::double_must_use).
+    #[inline]
+    pub const fn expiration(&self) -> &ExpirationDate {
+        &self.expiration
+    }
+
+    /// Returns the original expiration string in `YYYYMMDD` format.
+    #[must_use]
+    #[inline]
+    pub fn expiration_str(&self) -> &str {
+        &self.expiration_str
+    }
+
+    /// Returns the strike price.
+    #[must_use]
+    #[inline]
+    pub const fn strike(&self) -> u64 {
+        self.strike
+    }
+
+    /// Returns the option style (Call or Put).
+    #[must_use]
+    #[inline]
+    pub const fn option_style(&self) -> OptionStyle {
+        self.option_style
+    }
+
     /// Reconstructs the symbol string from parsed components.
     ///
-    /// This enables round-trip verification: parse → to_symbol → compare.
+    /// This enables round-trip verification: parse → to_symbol → compare. The
+    /// type invariants guarantee the result always re-parses to an equal
+    /// `ParsedSymbol`.
     #[must_use]
     pub fn to_symbol(&self) -> String {
         let option_char = match self.option_style {
@@ -124,6 +225,13 @@ impl ParsedSymbol {
 ///
 /// Parses symbols in the format `{UNDERLYING}-{YYYYMMDD}-{STRIKE}-{C|P}`.
 ///
+/// This is the single source of truth for the `{underlying}-{expiry}-{strike}-
+/// {type}` grammar across the crate: the sequencer's symbol routing and the
+/// NATS subject builder both delegate here so the parsed expiry instant — and
+/// therefore the derived `ExpirationKey` used to key the expiration `SkipMap`s
+/// — is identical everywhere. The option type is accepted case-insensitively
+/// (`C`/`c`, `P`/`p`) and normalized to the canonical uppercase form.
+///
 /// # Examples
 ///
 /// ```rust
@@ -132,14 +240,74 @@ impl ParsedSymbol {
 ///
 /// let parsed = SymbolParser::parse("BTC-20260130-50000-C")
 ///     .expect("valid symbol");
-/// assert_eq!(parsed.underlying, "BTC");
-/// assert_eq!(parsed.strike, 50000);
-/// assert_eq!(parsed.option_style, OptionStyle::Call);
+/// assert_eq!(parsed.underlying(), "BTC");
+/// assert_eq!(parsed.strike(), 50000);
+/// assert_eq!(parsed.option_style(), OptionStyle::Call);
 /// assert_eq!(parsed.to_symbol(), "BTC-20260130-50000-C");
 /// ```
 pub struct SymbolParser;
 
 impl SymbolParser {
+    /// Canonical UTC time-of-day, as `(hour, minute, second)`, assigned to the
+    /// `{YYYYMMDD}` segment of a symbol.
+    ///
+    /// A symbol's date segment names a calendar day, not an instant. The
+    /// contract is considered alive through the whole UTC trading day, so the
+    /// canonical expiry instant is the **end** of that day, `23:59:59 UTC`.
+    ///
+    /// This single choice is load-bearing: the expiration managers key their
+    /// `SkipMap`s on an `ExpirationKey` derived from the absolute
+    /// `DateTime<Utc>`, so two parsers disagreeing on the time-of-day would
+    /// produce different keys and silently split one chain across two map slots
+    /// (an order routed via one parser could not resolve a chain created via
+    /// the other). Keep every parser routed through this constant.
+    const CANONICAL_EXPIRY_HMS: (u32, u32, u32) = (23, 59, 59);
+
+    /// Parses a `YYYYMMDD` string into a canonical [`ExpirationDate`].
+    ///
+    /// The returned value is `ExpirationDate::DateTime` set to the canonical
+    /// expiry time-of-day (`23:59:59 UTC`, see `CANONICAL_EXPIRY_HMS`) on the
+    /// parsed date. This is the single source of truth for the symbol-expiry
+    /// time-of-day across the crate.
+    ///
+    /// # Arguments
+    ///
+    /// * `date_str` - The date string in `YYYYMMDD` format
+    /// * `symbol` - The original symbol (for error messages)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSymbol`] if `date_str` is not 8 digits, is
+    /// non-numeric, or is not a valid calendar date.
+    pub fn parse_yyyymmdd(date_str: &str, symbol: &str) -> Result<ExpirationDate> {
+        if date_str.len() != 8 {
+            return Err(Error::invalid_symbol(
+                symbol,
+                format!("expiration must be 8 digits (YYYYMMDD), got '{}'", date_str),
+            ));
+        }
+
+        if !date_str.chars().all(|c| c.is_ascii_digit()) {
+            return Err(Error::invalid_symbol(
+                symbol,
+                format!("expiration must be numeric, got '{}'", date_str),
+            ));
+        }
+
+        let naive_date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
+            .map_err(|_| Error::invalid_symbol(symbol, format!("invalid date '{}'", date_str)))?;
+
+        let (hour, minute, second) = Self::CANONICAL_EXPIRY_HMS;
+        let naive_datetime = naive_date
+            .and_hms_opt(hour, minute, second)
+            .ok_or_else(|| {
+                Error::invalid_symbol(symbol, "failed to construct canonical expiration time")
+            })?;
+        let datetime = Utc.from_utc_datetime(&naive_datetime);
+
+        Ok(ExpirationDate::DateTime(datetime))
+    }
+
     /// Parses a symbol string into its components.
     ///
     /// # Arguments
@@ -157,7 +325,7 @@ impl SymbolParser {
     /// - The underlying is empty
     /// - The expiration is not a valid YYYYMMDD date
     /// - The strike is not a valid positive integer
-    /// - The option type is not `C` or `P`
+    /// - The option type is not `C`/`c` or `P`/`p`
     pub fn parse(symbol: &str) -> Result<ParsedSymbol> {
         let parts: Vec<&str> = symbol.split('-').collect();
 
@@ -172,12 +340,7 @@ impl SymbolParser {
         }
 
         let underlying = parts[0];
-        if underlying.is_empty() {
-            return Err(Error::invalid_symbol(symbol, "underlying cannot be empty"));
-        }
-
         let expiration_str = parts[1];
-        let expiration = parse_yyyymmdd(expiration_str, symbol)?;
 
         let strike: u64 = parts[2].parse().map_err(|_| {
             Error::invalid_symbol(
@@ -189,16 +352,9 @@ impl SymbolParser {
             )
         })?;
 
-        if strike == 0 {
-            return Err(Error::invalid_symbol(
-                symbol,
-                "strike price must be positive, got 0",
-            ));
-        }
-
         let option_style = match parts[3] {
-            "C" => OptionStyle::Call,
-            "P" => OptionStyle::Put,
+            "C" | "c" => OptionStyle::Call,
+            "P" | "p" => OptionStyle::Put,
             other => {
                 return Err(Error::invalid_symbol(
                     symbol,
@@ -207,13 +363,9 @@ impl SymbolParser {
             }
         };
 
-        Ok(ParsedSymbol {
-            underlying: underlying.to_string(),
-            expiration,
-            expiration_str: expiration_str.to_string(),
-            strike,
-            option_style,
-        })
+        // `try_new` enforces the type invariants (non-empty underlying, positive
+        // strike, canonical expiration derived from `expiration_str`).
+        ParsedSymbol::try_new(underlying, expiration_str, strike, option_style)
     }
 }
 
@@ -254,32 +406,32 @@ mod tests {
     #[test]
     fn test_parse_valid_call_symbol() {
         let parsed = SymbolParser::parse("BTC-20260130-50000-C").expect("should parse");
-        assert_eq!(parsed.underlying, "BTC");
-        assert_eq!(parsed.expiration_str, "20260130");
-        assert_eq!(parsed.strike, 50000);
-        assert_eq!(parsed.option_style, OptionStyle::Call);
+        assert_eq!(parsed.underlying(), "BTC");
+        assert_eq!(parsed.expiration_str(), "20260130");
+        assert_eq!(parsed.strike(), 50000);
+        assert_eq!(parsed.option_style(), OptionStyle::Call);
     }
 
     #[test]
     fn test_parse_valid_put_symbol() {
         let parsed = SymbolParser::parse("ETH-20251222-3000-P").expect("should parse");
-        assert_eq!(parsed.underlying, "ETH");
-        assert_eq!(parsed.expiration_str, "20251222");
-        assert_eq!(parsed.strike, 3000);
-        assert_eq!(parsed.option_style, OptionStyle::Put);
+        assert_eq!(parsed.underlying(), "ETH");
+        assert_eq!(parsed.expiration_str(), "20251222");
+        assert_eq!(parsed.strike(), 3000);
+        assert_eq!(parsed.option_style(), OptionStyle::Put);
     }
 
     #[test]
     fn test_parse_single_char_underlying() {
         let parsed = SymbolParser::parse("E-20260101-100-C").expect("should parse");
-        assert_eq!(parsed.underlying, "E");
-        assert_eq!(parsed.strike, 100);
+        assert_eq!(parsed.underlying(), "E");
+        assert_eq!(parsed.strike(), 100);
     }
 
     #[test]
     fn test_parse_large_strike() {
         let parsed = SymbolParser::parse("BTC-20260130-1000000-P").expect("should parse");
-        assert_eq!(parsed.strike, 1_000_000);
+        assert_eq!(parsed.strike(), 1_000_000);
     }
 
     #[test]
@@ -364,7 +516,7 @@ mod tests {
     #[test]
     fn test_parsed_symbol_expiration_date_correctness() {
         let parsed = SymbolParser::parse("BTC-20260130-50000-C").expect("should parse");
-        let date = parsed.expiration.get_date().expect("should get date");
+        let date = parsed.expiration().get_date().expect("should get date");
         assert_eq!(date.year(), 2026);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 30);
@@ -399,5 +551,69 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("strike price must be positive"));
+    }
+
+    #[test]
+    fn test_parse_canonical_expiry_time_of_day_end_of_day() {
+        use chrono::Timelike;
+        let parsed = SymbolParser::parse("BTC-20260130-50000-C").expect("should parse");
+        let dt = match parsed.expiration() {
+            ExpirationDate::DateTime(dt) => *dt,
+            other => panic!("expected DateTime, got {:?}", other),
+        };
+        assert_eq!((dt.hour(), dt.minute(), dt.second()), (23, 59, 59));
+    }
+
+    #[test]
+    fn test_parse_lowercase_option_type_normalizes_to_uppercase() {
+        let call = SymbolParser::parse("BTC-20260130-50000-c").expect("should parse");
+        assert_eq!(call.option_style(), OptionStyle::Call);
+        assert_eq!(call.to_symbol(), "BTC-20260130-50000-C");
+
+        let put = SymbolParser::parse("BTC-20260130-50000-p").expect("should parse");
+        assert_eq!(put.option_style(), OptionStyle::Put);
+        assert_eq!(put.to_symbol(), "BTC-20260130-50000-P");
+    }
+
+    #[test]
+    fn test_parsed_symbol_try_new_round_trip_reparses_equal() {
+        let built = ParsedSymbol::try_new("BTC", "20260130", 50000, OptionStyle::Call)
+            .expect("valid components");
+        let reparsed = SymbolParser::parse(&built.to_symbol()).expect("to_symbol must re-parse");
+        assert_eq!(built, reparsed);
+    }
+
+    #[test]
+    fn test_parsed_symbol_try_new_rejects_zero_strike() {
+        let result = ParsedSymbol::try_new("BTC", "20260130", 0, OptionStyle::Call);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("strike price must be positive"));
+    }
+
+    #[test]
+    fn test_parsed_symbol_try_new_rejects_empty_underlying() {
+        let result = ParsedSymbol::try_new("", "20260130", 50000, OptionStyle::Call);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("underlying cannot be empty"));
+    }
+
+    #[test]
+    fn test_parsed_symbol_try_new_rejects_invalid_expiration() {
+        let result = ParsedSymbol::try_new("BTC", "2026013", 50000, OptionStyle::Call);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("8 digits"));
+    }
+
+    #[test]
+    fn test_parsed_symbol_try_new_expiration_matches_expiration_str() {
+        let built = ParsedSymbol::try_new("ETH", "20251222", 3000, OptionStyle::Put)
+            .expect("valid components");
+        // The derived expiration must be the canonical parse of the string, so
+        // formatting it back yields the same string (no possible divergence).
+        let formatted = format_expiration_yyyymmdd(built.expiration()).expect("format");
+        assert_eq!(formatted, built.expiration_str());
     }
 }
