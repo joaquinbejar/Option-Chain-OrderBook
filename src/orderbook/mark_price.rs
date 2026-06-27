@@ -582,7 +582,7 @@ impl MarkPriceCalculator {
     /// - `Some(price)` if at least one input price is non-zero
     /// - `None` if all input prices are zero
     #[deprecated(
-        since = "0.5.1",
+        since = "0.5.0",
         note = "mark_price() mutates on read; use current_mark_price() to read or advance_mark() to tick"
     )]
     #[must_use]
