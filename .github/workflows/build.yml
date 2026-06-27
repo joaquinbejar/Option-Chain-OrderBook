@@ -9,6 +9,10 @@ on:
       - main
       - 'release/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -20,8 +24,7 @@ env:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    
+
     strategy:
       matrix:
         include:
@@ -31,17 +34,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # pinned 2026-06-27
         with:
-          profile: minimal
           toolchain: stable
-          override: true
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-cargo-
 
       - name: Install dependencies
         run: |
-          if [ "${{ matrix.container }}" = "archlinux:latest" ]; then
-            pacman -Syu --noconfirm make fontconfig pkgconf gcc
-          elif [ "${{ runner.os }}" = "Linux" ]; then
+          if [ "${{ runner.os }}" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config build-essential
           elif [ "${{ runner.os }}" = "macOS" ]; then
             brew install make fontconfig pkg-config gcc
