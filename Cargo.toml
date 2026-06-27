@@ -49,6 +49,7 @@ sequencer = ["dep:tokio", "orderbook-rs/journal"]
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["html_reports"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
 
 [[test]]
 name = "tests"
