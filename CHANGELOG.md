@@ -1,0 +1,147 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+> **Pre-1.0 note:** while the crate is below `1.0.0`, a minor version bump
+> (`0.x.0`) may carry breaking changes. `0.5.0` is the first release with a
+> changelog and absorbs every breaking change accumulated since the published
+> `0.4.4`. A full upgrade walkthrough lives in
+> [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
+
+## [0.5.0] - 2026-06-27
+
+### ⚠️ Breaking Changes
+
+#### Errors
+
+- `Error` is now `#[non_exhaustive]` — every `match` over an `Error` value must add a wildcard arm. Five new variants ship this release (`OrderBookEngine`, `IllegalStatusTransition`, `UnderlyingMismatch`, `InstrumentIdExhausted`, `NatsSubject`). (#121)
+- Removed the never-constructed `Error` variants `InventoryLimitExceeded`, `RiskLimitBreached`, `HedgingError`, `MarketDataError`, `AdapterError` and their constructors; use `Error::validation`/`configuration`/`pricing`/`no_data` or your own error type instead. (#121)
+
+#### `Quote`
+
+- `Quote::new`/`empty` and the price/size/timestamp accessors now use the `pricelevel` newtypes `Price`/`Quantity`/`TimestampMs` instead of raw integers; wrap inputs with `Price::new`/`Quantity::new`/`TimestampMs::new` and unwrap getters with `as_u128`/`as_u64`. The JSON wire format is unchanged (newtypes are `#[serde(transparent)]`). (#125)
+- `Quote` no longer carries an `id` field or `id()` accessor; newly serialized JSON omits `id` (old JSON containing `id` still deserializes). (#124)
+
+#### Leaf book (`OptionOrderBook`)
+
+- `set_status`, `halt`, and `resume` are now fallible (`-> Result<()>`) and reject illegal lifecycle edges with `Error::IllegalStatusTransition` instead of silently storing the status. (#112, #119)
+- `expire` is now fallible (`-> Result<Vec<OrderId>>`) and returns cancelled ids in engine processing order, not `get_all_orders()` order. (#97, #112)
+- `compare_and_set_status` now returns `false` (no swap) for an illegal target edge even when `expected` matches the current status. (#112)
+- Removed the cached-quote API `update_last_quote`, `last_quote`, and `last_quote_arc`; call `best_quote()` and diff against your own stored `Quote`. This removes the only `&mut self` method on the leaf. (#124)
+- `last_trade_result()` no longer auto-populates on the plain order path; call `arm_trade_capture(true)` first, or use the `*_full` methods / NATS publisher / order-state tracker. (#124)
+
+#### Hierarchy
+
+- `StrikeOrderBook::call_greeks`/`put_greeks` now return an owned `Option<Greek>` (no longer `const`, no longer a borrow). (#111)
+- `OptionChainOrderBookManager::iter` and `ExpirationOrderBookManager::iter` now yield owned `(ExpirationDate, Arc<…>)` tuples in ascending expiration order instead of `crossbeam_skiplist` `Entry` handles. (#90)
+- `books_affected()` on every mass-cancel result type now counts affected leaf call/put books across the whole subtree (a both-legs chain over N strikes reports `2N`, not `N`). (#122)
+
+#### Config / construction
+
+- `ContractSpecsBuilder::build` is now fallible (`-> Result<ContractSpecs>`), rejecting zero tick/lot/contract/min sizes and an inverted `[min,max]` window via `Error::ConfigurationError`. (#110)
+- `InstrumentRegistry::allocate` is now fallible (`-> Result<u32>`), returning `Error::InstrumentIdExhausted` on u32 ID-space exhaustion. (#107)
+- `ParsedSymbol` fields are now private; construct via `ParsedSymbol::try_new(..)?` and read through `underlying()`/`expiration()`/`expiration_str()`/`strike()`/`option_style()`. (#91)
+
+#### Greeks / pricing
+
+- `GreeksEngine::subscribe` now returns a `SubscriptionId` (was `()`); statement-style calls keep compiling. (#133)
+- `GreeksEngine::calculate_greeks`/`calculate_strike_greeks` now reject a non-finite risk-free rate and a non-finite/negative dividend yield with `Error::GreeksError`, drop the silent 5% rate fallback, and price a `0.0` dividend as a true zero (no `0.0001` clamp) — Greeks differ numerically for `dividend_yield == 0.0`. (#100)
+- `MockPriceFeed::set_price` delivery is now asynchronous, per-subscriber, keep-latest: it no longer notifies listeners inline and may coalesce/drop intermediate updates; do not assume a wired `MarkPriceCalculator` has observed an update when `set_price` returns. (#129)
+
+#### NATS (feature `nats`)
+
+- Removed the post-construction `connect_nats` methods across the hierarchy, `OptionChainOrderBook::nats_handle_count`, and the old `book`-module `NatsPublisherHandles` (with its `trade_listener`/`book_listener` fields). Build NATS-enabled books via `build_option_order_book_with_nats` / `build_underlying_manager_with_nats`, which install publishers pre-`Arc`; the reshaped `nats`-module `NatsPublisherHandles` drops the listener fields and adds metrics + async `shutdown()`. (#101, #120)
+- `OptionChainNatsConfig::new` and `OptionChainSubjectBuilder::new` were replaced by fallible `try_new(..) -> Result<…>` that validate subject components and fail with `Error::NatsSubject`. (#103)
+- `OptionChainSubjectBuilder::from_symbol` now parses through `SymbolParser`: expiry must be a valid `YYYYMMDD`, strike a positive integer (normalized via `u64`, leading zeros dropped); invalid input yields `Error::InvalidSymbol`/`Error::NatsSubject`. (#103, #91)
+
+#### Expiry config
+
+- `ExpiryCycleConfig::expiry_time_utc`/`settlement_time_utc` changed from `(u32, u32)` hour/minute tuples to `chrono::NaiveTime`; the JSON wire shape changed from `[hour, minute]` arrays to `"HH:MM:SS"` strings. Persisted 0.4.4 configs must be re-encoded. (#123)
+- `ExpiryCycleConfig::validate` now rejects any `CycleRule.count` greater than `MAX_CYCLE_COUNT` (512). (#123)
+
+#### Sequencer (feature `sequencer`)
+
+- The journaled types `MassCancelScope`, `MassCancelType`, `OptionChainCommand`, `OptionChainResult`, `OptionChainEvent` gained `#[serde(deny_unknown_fields)]`; journal JSON with extra/extension fields no longer decodes (variant tags and field names are unchanged). (#113)
+- `OptionChainCommand` gained `SetInstrumentStatus` and `OptionChainResult` gained `StatusChanged`; neither enum is `#[non_exhaustive]`, so existing exhaustive matches must add arms. (#114)
+- `SequencedUnderlyingOrderBook::submit_add_order` now vivifies the target expiration/strike instead of returning `BookNotFound` for an unlisted contract; only an unparseable symbol yields `BookNotFound`, and a cross-underlying symbol is `Rejected`. (#93)
+
+### Added
+
+#### Crate surface / re-exports
+
+- Every public `orderbook::` item is now also re-exported at the crate root, so each type resolves as both `option_chain_orderbook::X` and `option_chain_orderbook::orderbook::X` (purely additive; no 0.4.4 path removed). (#109)
+- The boundary newtypes `OrderId`, `OrderType`, `Side`, `TimeInForce` (from `orderbook_rs`) and `Price`, `Quantity`, `TimestampMs` (from `pricelevel`) are now re-exported from this crate; consumers no longer need a direct `orderbook_rs`/`pricelevel` dependency to name them. (#109, #125)
+- Under `sequencer`, the command/event/journal/replay types are now also re-exported at the crate root. (#109)
+
+#### Errors
+
+- New `Error` variants, each with a `#[must_use] #[cold]` constructor: `OrderBookEngine(orderbook_rs::prelude::OrderBookError)` wrapping the upstream engine error via `#[from]` and preserving the typed source chain (#108); `IllegalStatusTransition { from, to }` (#112); `UnderlyingMismatch { symbol, parsed, expected }` (#91); `InstrumentIdExhausted` (#107); `NatsSubject { field, reason }` (present unconditionally, not feature-gated) (#103).
+
+#### Leaf book
+
+- `arm_trade_capture(bool)` / `is_trade_capture_armed()` to opt a book into continuous trade capture for `last_trade_result()` (disarmed by default to keep the match hot path allocation-free). (#124)
+- `has_both_sides()`, a cheap top-of-book two-sidedness check used by the strike layer's `is_fully_quoted`. (#124)
+
+#### Hierarchy / instruments
+
+- `ExpirationOrderBookManager::get_or_create_inserted` and `UnderlyingOrderBook::get_or_create_expiration_inserted`, race-free creation helpers returning `(Arc<…>, bool)` where the bool flags the single insert winner. (#115)
+- `InstrumentStatus::can_transition(self, to) -> bool`, the single source of truth for legal lifecycle edges. (#112)
+- `ValidationConfig::validate` / `ContractSpecs::validate` returning `Result<()>` for structurally-broken settings. (#110)
+- `SymbolParser::parse_yyyymmdd`, `ParsedSymbol::try_new`, and the `ParsedSymbol` accessors. (#91)
+- `InstrumentRegistry` now implements `Debug`. (#132)
+
+#### Greeks / pricing
+
+- `MarkPriceCalculator::current_mark_price()` (pure read of the last committed mark, `Option<u64>`) and `advance_mark()` (explicit mutating tick), splitting read from tick. (#99)
+- `GreeksEngine::unsubscribe(id: SubscriptionId) -> bool` to remove a Greeks listener registered via `subscribe`. (#133)
+
+#### NATS (feature `nats`)
+
+- `build_option_order_book_with_nats(symbol, option_style, &config)` and `build_underlying_manager_with_nats(config)` constructors that install publishers pre-`Arc`; both re-exported at the crate root. (#101, #120)
+- `NatsPublisherHandles` metrics — `trade_publish_count`/`trade_error_count`/`book_publish_count`/`book_error_count` (`-> u64`) — and an async `shutdown()`. (#120)
+- `OptionChainSubjectBuilder::option_style() -> OptionStyle`. (#103)
+
+#### Sequencer (feature `sequencer`)
+
+- `SequencedUnderlyingOrderBook::submit_set_instrument_status(symbol, status)`, journaling an `OptionChainCommand::SetInstrumentStatus` into the replayable stream. (#114)
+- `replay()` now reconstructs journaled instrument-status transitions, so a halted/settling/expired strike replays into the same status (and an `AddOrder` the live run rejected stays rejected on replay). (#114)
+
+#### Expiry config
+
+- `ExpiryCycleConfig::MAX_CYCLE_COUNT` (= 512), the inclusive upper bound now enforced by `validate()`. (#123)
+
+### Changed
+
+- `StrikeOrderBook::update_call_greeks`/`update_put_greeks` now take `&self` (interior mutability via `RwLock`); existing callers still compile. (#111)
+- `OptionOrderBook::best_quote` is now an allocation-free bounded top-of-book read (~11.75µs → ~69ns); the returned value is unchanged. (#124)
+- `InstrumentRegistry::iter()` now returns entries sorted ascending by instrument id (was arbitrary `DashMap` shard order); signature unchanged. (#132)
+- `SymbolParser::parse` now accepts lowercase `c`/`p` option-type tokens in addition to `C`/`P`. (#91)
+- `Quote::mid_price`/`spread_bps` now return `None` for a non-finite result (and `spread_bps` additionally requires a positive finite mid). (#125)
+- `SymbolIndex::symbols()` is now `#[must_use]` (documented as an unspecified-order snapshot). (#132)
+- `GlobalStats`/`UnderlyingStats` are now computed in a single coherent traversal with checked accumulation; struct shapes and quiescent-tree values are unchanged. (#126)
+- `MarkPriceCalculator::mark_price` is now `#[deprecated(since = "0.5.0")]` and delegates to `advance_mark()`; migrate to `current_mark_price()` (read) or `advance_mark()` (tick). Builds with `deny(deprecated)`/`deny(warnings)` will fail until callers migrate. (#99)
+- `OptionChainSubjectBuilder::option_type()` now returns `&'static str` and always emits the canonical `C`/`P` token. (#103)
+- Sequencer mass-cancel totals now use `checked_add`, returning `Rejected { reason: "mass-cancel total overflow" }` instead of saturating at `usize::MAX`. (#105)
+- Structured `tracing` was added on cold (non-order, non-quote) paths across the Greeks engine, mark-price, index feed, expiry lifecycle, and scheduler; no global subscriber is installed by the crate. (#128)
+- Internal module reorganization behind unchanged public paths: `NatsPublisherHandles` moved to the `nats` module, and the `IndexPriceFeed` trait + `PriceUpdate`/`PriceUpdateListener`/`SubscriptionId` moved to a new neutral `index_feed` module; the documented `orderbook::` re-export paths are unchanged. (#118, #120)
+- The published-crate `include` list now packages `tests/fixtures/**/*` (packaging-only; no downstream compile effect). (#135)
+
+### Fixed
+
+- `OptionOrderBook::cancel_order` now returns `Ok(false)` for a not-found/no-op cancel (previously `Ok(true)`) and propagates a genuine engine failure as `Err` (previously swallowed as `Ok(false)`). (#95)
+- `OptionOrderBook::clear` (and the sweep inside `expire`) now route through the engine's `cancel_all_orders`, so dropped orders reach the terminal `Cancelled` state, the cancelled counter and order-state tracker advance, book-change listeners fire, and per-account risk state resets. (#97)
+- `StrikeOrderBookManager::atm_strike` now uses `u64::abs_diff` for overflow-safe nearest-strike selection (lower strike wins ties, documented and deterministic); chain/expiration accessors inherit the fix. (#131)
+- `StrikeGenerator::cleanup_empty_strikes` now uses `checked_mul` for the keep-range and returns `Error::ConfigurationError` on overflow instead of saturating to a wrong range; the index slice is also bounds-checked. (#104)
+- The chain and expiration managers now key their SkipMaps on a collision-free, clock-independent `ExpirationKey`, fixing silent key collisions and making get/contains/remove/iter deterministic; stored books still expose the original `ExpirationDate`. (#90)
+- `get_or_create` across all hierarchy managers is now atomic and idempotent (`SkipMap::get_or_insert` with one-time side effects gated to the `ptr_eq` winner), eliminating split-brain books and double ID allocation under concurrent creation. (#92)
+- `GreeksEngine` notification no longer holds the listener lock across callbacks (with poisoned-lock recovery): a listener may re-enter the engine without deadlock, and a panicking listener no longer poisons the mutex or permanently disables future notifications. (#98)
+- `GreeksAggregator::remove_position` now prunes the empty account shell via an atomic `remove_if`, fixing an unbounded-memory leak on repeated open/close cycles on a single-position account. (#127)
+- The sequencer now validates a command's parsed underlying against the book and rejects a mismatch with `Error::UnderlyingMismatch` instead of silently mis-routing (e.g. an `ETH-…` command into a BTC book). (#91)
+- `ExpiryLifecycleManager::check_expirations` now computes a chain's lifecycle state as the minimum status across every call and put book, so a lagging strike no longer causes a skipped transition. (#106)
+- `ExpiryScheduler::refresh_expirations` now derives `is_new` from a single atomic `get_or_create_expiration_inserted`, invoking the `ExpirationCallback` exactly once per date under concurrent refresh. (#115)
+- Sequencer `replay()` now advances the sequence with `checked_add(1)`, failing loudly on a journal at `u64::MAX` instead of the previous `saturating_add(1)` that silently stalled. (#105)
+
+[0.5.0]: https://github.com/joaquinbejar/Option-Chain-OrderBook/releases/tag/v0.5.0
