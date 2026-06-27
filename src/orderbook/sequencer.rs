@@ -1303,8 +1303,12 @@ impl SequencedUnderlyingOrderBook {
     /// inherit the hierarchy's shared configuration (validation / contract specs
     /// / STP mode / fee schedule), so a fresh book configured identically
     /// rebuilds an identical leaf. Registry-assigned instrument ids are NOT
-    /// journaled and need not match across runs; the equality oracle is the
-    /// structural / order state (resting orders + top-of-book), not numeric ids.
+    /// journaled, so they are not preserved when replaying into a non-empty or
+    /// differently-seeded registry. They ARE, however, reconstructed
+    /// deterministically when the same journal is replayed into a FRESH registry:
+    /// strike creation (the sole id-allocation site) runs in the same command
+    /// order on replay as live, so a fresh registry re-derives byte-identical
+    /// ids. The replay==live oracle relies on this fresh-registry determinism.
     ///
     /// The parsed underlying is validated against this book's underlying BEFORE
     /// any materialization — a mismatch is rejected and creates nothing.
@@ -1363,8 +1367,12 @@ impl SequencedUnderlyingOrderBook {
     /// of *structural / order state* — the set of resting orders (carried by id
     /// in each `AddOrder` command) and the top-of-book on each contract.
     /// Registry-assigned instrument ids are allocated at strike creation and are
-    /// NOT journaled, so they are free to differ between the live run and a
-    /// replay; they are not part of the equality contract. For a fresh book to
+    /// NOT journaled. They are therefore not preserved when replaying into a
+    /// non-empty or differently-seeded registry, but they ARE reconstructed
+    /// deterministically when the same journal is replayed into a FRESH registry,
+    /// because strike creation runs in the identical command order on replay as
+    /// live. The replay==live oracle exercises exactly this fresh-registry case
+    /// and so does assert id equality. For a fresh book to
     /// rebuild identical structural state it must be configured identically
     /// (validation / contract specs / STP mode / fee schedule), since those
     /// shared settings are applied to books created during replay.
