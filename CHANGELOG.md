@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.6.0] - 2026-07-10
+
+### ⚠️ Breaking Changes
+
+- **`orderbook-rs` dependency bumped `0.9` → `0.10`.** `orderbook-rs` is a
+  *public* dependency: types re-exported at this crate's root (`TradeResult`,
+  `MassCancelResult`, `OrderStatus`, `OrderStateTracker`, `FeeSchedule`,
+  `STPMode`, `CancelReason`, the boundary newtypes, …) now come from
+  `orderbook-rs 0.10`, so downstream crates that also depend on `orderbook-rs`
+  directly must move their own pin to `0.10` in the same update or the two
+  copies' types will not unify. No code changes are required in this crate's
+  own API — signatures and behavior are unchanged.
+- Migration notes for direct `orderbook-rs` users: `SequencerCommand` /
+  `SequencerResult` are `#[non_exhaustive]` in 0.10 (exhaustive `match`es need
+  a wildcard arm). 0.10 also adds `OrderBook::evict_expired_orders(now_ms)`
+  (host-driven GTD/DAY expiry sweep) — not yet surfaced through this wrapper;
+  tracked in #141.
+
+### Changed
+
+- `pricelevel` floor raised to `0.8.4` (GTD deadline documented as Unix
+  milliseconds + pinning test).
+
 ## [0.5.0] - 2026-06-27
 
 ### ⚠️ Breaking Changes
