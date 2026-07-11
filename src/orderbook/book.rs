@@ -226,27 +226,6 @@ impl std::iter::Sum for TerminalOrderSummary {
     }
 }
 
-/// RAII guard that holds a scoped trade-capture arm for its lifetime.
-///
-/// Constructed by [`OptionOrderBook::arm_capture_scope`] so the `_full` order
-/// methods capture their own trade without leaving the book permanently armed.
-/// It increments a scope refcount on entry and decrements it on drop; capture is
-/// active while the refcount is non-zero (or the book is manually armed). Using a
-/// refcount rather than a save/restore boolean makes overlapping `_full` scopes
-/// on the same book compose correctly — no scope can clobber another's state or
-/// leave the book stuck armed.
-struct CaptureArmGuard<'a> {
-    /// The book's scoped-arm refcount, decremented on drop.
-    scopes: &'a AtomicUsize,
-}
-
-impl Drop for CaptureArmGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        self.scopes.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Internal atomic counters for terminal state tracking via listener.
 pub(crate) struct TerminalCounters {
     filled: AtomicUsize,
@@ -328,28 +307,25 @@ pub struct OptionOrderBook {
     /// Stored as `AtomicU32` so it can be assigned after construction
     /// without requiring `&mut self`.
     instrument_id: AtomicU32,
-    /// Captured trade result from the last order submission.
+    /// Captured trade result from the last order submission, for the opt-in
+    /// continuous-capture accessor [`last_trade_result`](Self::last_trade_result).
     ///
-    /// Populated by the internal trade listener when a matching occurs *and*
-    /// trade capture is armed. Used by the `_full` order methods to return
-    /// [`TradeResult`].
+    /// Populated by the internal trade listener when a match occurs *and*
+    /// continuous trade capture is armed. This is a single-slot, last-write-wins
+    /// poll and is **not** used by the `_full` order methods, which attribute
+    /// their fills per-call from the engine's
+    /// `add_*_with_result` return value (no shared slot).
     last_trade_result: Arc<Mutex<Option<TradeResult>>>,
-    /// Cheap armed flag gating the trade-capture clone+lock on the match hot
-    /// path.
+    /// Cheap armed flag gating the continuous-capture clone+lock on the match
+    /// hot path.
     ///
     /// Disarmed by default: the always-installed trade listener performs a
     /// single relaxed atomic load and returns without cloning the
-    /// [`TradeResult`] or taking the capture lock. The `_full` order methods arm
-    /// it for the duration of their own submission so they still observe the
-    /// trade; [`arm_trade_capture`](Self::arm_trade_capture) opts a book into
-    /// continuous capture for [`last_trade_result`](Self::last_trade_result).
+    /// [`TradeResult`] or taking the capture lock.
+    /// [`arm_trade_capture`](Self::arm_trade_capture) opts a book into continuous
+    /// capture for [`last_trade_result`](Self::last_trade_result). The `_full`
+    /// order methods never touch this flag.
     trade_capture_armed: Arc<AtomicBool>,
-    /// Refcount of active `_full` capture scopes. Capture is also active while
-    /// this is non-zero, so overlapping `_full` calls on the same book compose
-    /// correctly (each scope increments on entry and decrements on drop) without
-    /// clobbering each other's armed state or the manual `trade_capture_armed`
-    /// flag.
-    trade_capture_scopes: Arc<AtomicUsize>,
     /// Cumulative terminal order counters maintained by the state listener.
     ///
     /// `None` when state tracking is disabled via `BookConfig`.
@@ -387,20 +363,20 @@ impl OptionOrderBook {
             book.set_fee_schedule(Some(schedule));
         }
 
-        // Install trade-capture listener so `_full` methods can return TradeResult.
-        // The clone+lock is gated behind two cheap relaxed atomics — the manual
-        // `armed` flag and the `_full` scope refcount — so the common
-        // (non-`_full`, unarmed) match path pays only the atomic loads and never
-        // clones the TradeResult or takes the lock.
+        // Install the continuous-capture listener backing the opt-in
+        // `arm_trade_capture` / `last_trade_result` accessor. The clone+lock is
+        // gated behind a single cheap relaxed atomic (`armed`), so the common
+        // (unarmed) match path pays only the atomic load and never clones the
+        // TradeResult or takes the lock. This slot is independent of the `_full`
+        // order methods, which attribute their fills per-call from the engine's
+        // `add_*_with_result` return value.
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
         let armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-        let scopes: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let capture_clone = Arc::clone(&capture);
         let armed_clone = Arc::clone(&armed);
-        let scopes_clone = Arc::clone(&scopes);
         let capture_listener: TradeListener = Arc::new(move |tr: &TradeResult| {
-            // Capture when manually armed OR inside at least one `_full` scope.
-            if !armed_clone.load(Ordering::Relaxed) && scopes_clone.load(Ordering::Relaxed) == 0 {
+            // Record only while continuous capture is armed.
+            if !armed_clone.load(Ordering::Relaxed) {
                 return;
             }
             let mut guard = capture_clone
@@ -460,7 +436,6 @@ impl OptionOrderBook {
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
             trade_capture_armed: armed,
-            trade_capture_scopes: scopes,
             terminal_counters,
         }
     }
@@ -683,19 +658,20 @@ impl OptionOrderBook {
     ///
     /// Trade capture is **disarmed by default** to keep the per-match hot path
     /// allocation-free: the internal listener only records a [`TradeResult`]
-    /// when the book is armed. The `_full` order methods arm capture for the
-    /// duration of their own submission, so they always observe their trade
-    /// regardless of this setting. To populate this accessor from the plain
-    /// (non-`_full`) order path, call
+    /// when the book is armed. To populate this accessor, call
     /// [`arm_trade_capture(true)`](Self::arm_trade_capture) first; with capture
     /// disarmed this returns `None` (or the last value captured while armed).
     ///
+    /// This accessor is **independent of the `_full` order methods**, which
+    /// return their own [`TradeResult`] per-call and never read this slot.
+    ///
     /// **Note:** concurrent calls to order methods on the same book may
     /// overwrite this value before it is read — it is a single-slot,
-    /// last-write-wins poll, never a per-fill feed. For a reliable real-time
-    /// trade/fill stream use the NATS trade publisher (feature `nats`) or the
-    /// `_full` order methods' return values; for risk/PnL counters use the
-    /// order-state tracker. All three are independent of this arm flag.
+    /// last-write-wins poll, never a per-fill feed. For per-submission
+    /// attribution use the `_full` order methods' return values; for a reliable
+    /// real-time trade/fill stream use the NATS trade publisher (feature
+    /// `nats`); for risk/PnL counters use the order-state tracker. All are
+    /// independent of this arm flag.
     ///
     /// **Changed in 0.5.0:** trade capture is now disarmed by default, so the
     /// plain order path no longer auto-populates this accessor. Pre-0.5.0 code
@@ -718,15 +694,16 @@ impl OptionOrderBook {
     /// default), the listener short-circuits on a single relaxed atomic load,
     /// adding no clone or lock cost to the match path.
     ///
-    /// The `_full` order methods arm capture internally for their own
-    /// submission, so this toggle is only needed to observe trades made through
-    /// the plain (non-`_full`) order methods.
+    /// This toggle only affects the [`last_trade_result`](Self::last_trade_result)
+    /// poll accessor. The `_full` order methods do not use it: they return their
+    /// own [`TradeResult`] per-call from the engine's `add_*_with_result`
+    /// primitive, so they observe their trade regardless of this setting.
     ///
-    /// Intended for a single controller: the `_full` methods save and restore
-    /// the prior arm state around their own submission, so interleaving a manual
-    /// `arm_trade_capture(true)` with concurrent `_full` calls on the same book
-    /// can race (a `_full` that captured the pre-arm `false` will restore it on
-    /// drop). Arm from one owner, not concurrently with `_full` traffic.
+    /// Intended for a single controller. The slot is single-value and
+    /// last-write-wins, so arming it while multiple threads submit crossing
+    /// orders to the same book yields a last-writer value that may not
+    /// correspond to any one submission — for per-submission attribution under
+    /// concurrency, use the `_full` order methods' return values instead.
     #[inline]
     pub fn arm_trade_capture(&self, armed: bool) {
         self.trade_capture_armed.store(armed, Ordering::Relaxed);
@@ -1090,61 +1067,48 @@ impl OptionOrderBook {
 
     // ── Full order methods (return TradeResult) ─────────────────────────
 
-    /// Arms trade capture for the lifetime of the returned guard, restoring the
-    /// scope refcount on drop.
+    /// Builds an empty [`TradeResult`] (no trades, zero fees) for a `_full`
+    /// submission that rested on the book without matching.
     ///
-    /// Used by the `_full` order methods so a trade is captured even when the
-    /// book is not under continuous capture. Incrementing a refcount (rather than
-    /// saving/restoring a boolean) means overlapping `_full` scopes on the same
-    /// book compose correctly: capture stays active until the last scope exits,
-    /// and the manual [`arm_trade_capture`](Self::arm_trade_capture) flag is left
-    /// untouched.
-    fn arm_capture_scope(&self) -> CaptureArmGuard<'_> {
-        self.trade_capture_scopes.fetch_add(1, Ordering::Relaxed);
-        CaptureArmGuard {
-            scopes: &self.trade_capture_scopes,
-        }
-    }
-
-    /// Clears the captured trade result before submitting an order.
-    fn clear_trade_capture(&self) {
-        let mut guard = self
-            .last_trade_result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
-    }
-
-    /// Extracts the captured [`TradeResult`], or creates an empty one
-    /// (no trades, zero fees) when the order rested without matching.
+    /// The engine's per-call `add_*_with_result` primitives return `None` for
+    /// the trade component when an order rests without producing fills; the
+    /// `_full` methods map that `None` onto this empty result so callers always
+    /// receive a `TradeResult` carrying their own taker order id.
     #[must_use]
-    fn extract_trade_result(&self, order_id: OrderId, quantity: u64) -> TradeResult {
-        self.last_trade_result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .unwrap_or_else(|| {
-                TradeResult::new(
-                    self.symbol.clone(),
-                    MatchResult::new(order_id, Quantity::new(quantity)),
-                )
-            })
+    fn empty_trade_result(&self, order_id: OrderId, quantity: u64) -> TradeResult {
+        TradeResult::new(
+            self.symbol.clone(),
+            MatchResult::new(order_id, Quantity::new(quantity)),
+        )
     }
 
     /// Adds a limit order and returns the full [`TradeResult`] including fees.
     ///
     /// Unlike [`add_limit_order`](Self::add_limit_order), this method returns
     /// the trade result with maker/taker fee fields populated according to
-    /// the configured [`FeeSchedule`].
+    /// the configured [`FeeSchedule`]. When the order rests without matching, an
+    /// empty [`TradeResult`] (no trades, zero fees) carrying `order_id` is
+    /// returned.
     ///
-    /// **Concurrency note:** concurrent `_full` calls on the same book are
-    /// not guaranteed to return the correct result for each caller. Use the
-    /// regular `add_limit_order` methods for concurrent workloads.
+    /// # Attribution
+    ///
+    /// The returned [`TradeResult`] is built from *this* call's own match
+    /// outcome via the engine's per-call `add_limit_order_with_result` primitive
+    /// — never from shared capture state — so concurrent submits to the same
+    /// book each receive exactly their own fills, with no cross-attribution and
+    /// no lost fills.
     ///
     /// # Errors
     ///
-    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
-    /// [`Active`](InstrumentStatus::Active).
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
+    ///
+    /// On an error-after-fills path (an unfillable IOC remainder, or a
+    /// self-trade-prevention taker-cancel after earlier non-self fills) the
+    /// typed `Err` is returned and the executed fills reach only the installed
+    /// trade listener (and thus the NATS publisher / order-state tracker), not
+    /// this return value.
     pub fn add_limit_order_full(
         &self,
         order_id: OrderId,
@@ -1153,20 +1117,29 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        let _capture = self.arm_capture_scope();
-        self.clear_trade_capture();
-        self.book
-            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
-        Ok(self.extract_trade_result(order_id, quantity))
+        let (_order, trade) = self.book.add_limit_order_with_result(
+            order_id,
+            price,
+            quantity,
+            side,
+            TimeInForce::Gtc,
+            None,
+        )?;
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
     }
 
     /// Adds a limit order with time-in-force and returns the full [`TradeResult`].
+    ///
+    /// Per-call attribution and the error-after-fills caveat are identical to
+    /// [`add_limit_order_full`](Self::add_limit_order_full): the result comes
+    /// from this call's own outcome, never a shared slot.
     ///
     /// # Errors
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
+    ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_full(
         &self,
         order_id: OrderId,
@@ -1176,20 +1149,24 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        let _capture = self.arm_capture_scope();
-        self.clear_trade_capture();
-        self.book
-            .add_limit_order(order_id, price, quantity, side, tif, None)?;
-        Ok(self.extract_trade_result(order_id, quantity))
+        let (_order, trade) = self
+            .book
+            .add_limit_order_with_result(order_id, price, quantity, side, tif, None)?;
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
     }
 
     /// Adds a limit order with user identity and returns the full [`TradeResult`].
+    ///
+    /// Per-call attribution and the error-after-fills caveat are identical to
+    /// [`add_limit_order_full`](Self::add_limit_order_full): the result comes
+    /// from this call's own outcome, never a shared slot.
     ///
     /// # Errors
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
+    ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_user_full(
         &self,
         order_id: OrderId,
@@ -1199,9 +1176,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        let _capture = self.arm_capture_scope();
-        self.clear_trade_capture();
-        self.book.add_limit_order_with_user(
+        let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id,
             price,
             quantity,
@@ -1210,17 +1185,22 @@ impl OptionOrderBook {
             user_id,
             None,
         )?;
-        Ok(self.extract_trade_result(order_id, quantity))
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
     }
 
     /// Adds a limit order with time-in-force, user identity, and returns
     /// the full [`TradeResult`].
     ///
+    /// Per-call attribution and the error-after-fills caveat are identical to
+    /// [`add_limit_order_full`](Self::add_limit_order_full): the result comes
+    /// from this call's own outcome, never a shared slot.
+    ///
     /// # Errors
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
+    ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_and_user_full(
         &self,
         order_id: OrderId,
@@ -1231,11 +1211,10 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        let _capture = self.arm_capture_scope();
-        self.clear_trade_capture();
-        self.book
-            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
-        Ok(self.extract_trade_result(order_id, quantity))
+        let (_order, trade) = self.book.add_limit_order_with_user_and_result(
+            order_id, price, quantity, side, tif, user_id, None,
+        )?;
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
     }
 
     /// Cancels an order by its ID.
@@ -2010,71 +1989,104 @@ mod tests {
     }
 
     #[test]
-    fn test_full_order_captures_regardless_of_arm_state() {
-        // The _full methods arm capture internally and restore the prior state,
-        // so they return a TradeResult even when the book is disarmed.
+    fn test_full_order_returns_result_independent_of_capture_arm_state() {
+        // The _full methods attribute fills per-call from the engine's
+        // add_*_with_result primitive, so they return a populated TradeResult
+        // regardless of the continuous-capture arm state — and without ever
+        // touching the last_trade_result slot.
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(!book.is_trade_capture_armed());
 
         book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
             .expect("add ask");
+        let taker = OrderId::new();
         let result = book
-            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order_full(taker, Side::Buy, 100, 10)
             .expect("full buy");
-        // The crossing buy fully consumed the resting ask.
+        // The crossing buy fully consumed the resting ask, attributed to its
+        // own taker order id.
         assert_eq!(result.symbol, "BTC-20240329-50000-C");
+        assert_eq!(result.match_result.order_id(), taker);
+        assert!(result.match_result.is_complete());
         assert_eq!(book.order_count(), 0);
-        // Arm state restored to disarmed after the _full call.
+        // Continuous capture stayed disarmed, and the _full path never wrote the
+        // last_trade_result slot.
         assert!(!book.is_trade_capture_armed());
+        assert!(book.last_trade_result().is_none());
     }
 
     #[test]
-    fn test_capture_scopes_refcount_composes() {
-        // Overlapping `_full` scopes must compose via the refcount: capture stays
-        // active until the LAST scope exits, the manual flag is never touched, and
-        // the book is not left stuck-armed once all scopes drop.
-        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        assert!(!book.is_trade_capture_armed());
+    fn test_full_concurrent_attribution_no_cross_or_lost_fills() {
+        // Regression for the per-book capture-slot race: many threads submit
+        // crossing buys to the SAME book via `add_limit_order_full`, and each
+        // thread must receive the TradeResult for its OWN order id — never
+        // another thread's (cross-attribution) and never an empty one (lost
+        // fills).
+        //
+        // Determinism: the book is pre-seeded with exactly one resting sell per
+        // buy, all at the same price and quantity, so every crossing buy fully
+        // consumes exactly one sell regardless of thread scheduling. Which sell a
+        // given buy matches is irrelevant to the assertions — each buy's own
+        // taker id and its complete fill of QTY are invariant under any
+        // interleaving.
+        use std::sync::Barrier;
+        use std::thread;
 
-        let outer = book.arm_capture_scope();
-        let inner = book.arm_capture_scope();
-        // Two scopes active: a plain matching order is captured.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
-            .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
-            .expect("add crossing buy");
-        assert!(
-            book.last_trade_result().is_some(),
-            "capture active while a scope is held"
-        );
+        const THREADS: usize = 8;
+        const QTY: u64 = 10;
+        const PRICE: u128 = 100;
 
-        // Dropping one scope leaves capture active (refcount still 1); the manual
-        // flag was never set, so this is not a stuck-armed state.
-        drop(inner);
-        assert!(!book.is_trade_capture_armed());
-        book.clear_trade_capture();
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 3)
-            .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 3)
-            .expect("add crossing buy");
-        assert!(
-            book.last_trade_result().is_some(),
-            "capture still active with one scope remaining"
-        );
+        let book = Arc::new(OptionOrderBook::new(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+        ));
 
-        // Dropping the last scope returns to disarmed: a later plain match is not
-        // captured, and the manual flag remains false (no stuck-armed leak).
-        drop(outer);
-        assert!(!book.is_trade_capture_armed());
-        book.clear_trade_capture();
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 2)
-            .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 2)
-            .expect("add crossing buy");
-        assert!(
-            book.last_trade_result().is_none(),
-            "capture disarmed once all scopes drop"
-        );
+        // One resting sell per aggressive buy.
+        for _ in 0..THREADS {
+            book.add_limit_order(OrderId::new(), Side::Sell, PRICE, QTY)
+                .expect("seed resting sell");
+        }
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let book = Arc::clone(&book);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let my_id = OrderId::new();
+                // Release all submissions as close to simultaneously as possible
+                // to maximize contention on the shared book.
+                barrier.wait();
+                let result = book
+                    .add_limit_order_full(my_id, Side::Buy, PRICE, QTY)
+                    .expect("full buy");
+                (my_id, result)
+            }));
+        }
+
+        for handle in handles {
+            let (my_id, result) = handle.join().expect("thread join");
+            // No cross-attribution: the returned result is attributed to THIS
+            // thread's own taker order id.
+            assert_eq!(
+                result.match_result.order_id(),
+                my_id,
+                "each thread must receive the TradeResult for its own order id"
+            );
+            // No lost fills: this buy fully crossed one resting sell.
+            assert!(
+                result.match_result.is_complete(),
+                "each concurrent buy must report its own complete fill"
+            );
+            assert_eq!(
+                result.match_result.remaining_quantity(),
+                Quantity::new(0),
+                "a fully filled buy must leave no remainder"
+            );
+        }
+
+        // Every resting sell was consumed by exactly one buy.
+        assert_eq!(book.order_count(), 0);
     }
 
     #[test]
