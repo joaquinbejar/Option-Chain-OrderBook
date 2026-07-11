@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.6.1] - 2026-07-11
+
+### Fixed
+
+- `OptionOrderBook`'s `*_full` submit methods (`add_limit_order_full`,
+  `add_limit_order_with_tif_full`, `add_limit_order_with_user_full`,
+  `add_limit_order_with_tif_and_user_full`) now attribute fills **per-call**:
+  each returns the `TradeResult` built from its own submission via the engine's
+  `add_limit_order_with_result` / `add_limit_order_with_user_and_result`
+  primitives (`orderbook-rs` 0.10), instead of reading a per-book capture slot
+  populated by a trade listener. Concurrent submits to the same book no longer
+  cross-attribute (a caller reading another submission's result) or lose fills
+  (a caller reading `None`). The internal per-book capture slot the `*_full`
+  methods used for attribution — its scope-refcount arming and the
+  clear/extract helpers — is removed; the opt-in continuous-capture accessor
+  (`arm_trade_capture` / `last_trade_result` / `is_trade_capture_armed`) is
+  unchanged. Public signatures are unchanged (no API break). On an
+  error-after-fills path (an unfillable IOC remainder, or a self-trade-prevention
+  taker-cancel after earlier non-self fills) the `*_full` methods return the
+  typed `Err` and the executed fills reach only the trade listener — now
+  documented on the `*_full` surface. (#140)
+
 ## [0.6.0] - 2026-07-10
 
 ### ⚠️ Breaking Changes
