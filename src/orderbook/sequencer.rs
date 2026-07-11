@@ -31,7 +31,7 @@ use crate::orderbook::underlying::UnderlyingOrderBook;
 use crate::utils::{SymbolParser, nanos_since_epoch};
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
-use pricelevel::Hash32;
+use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,12 +96,29 @@ pub enum MassCancelType {
 /// This is a journaled (on-disk) type: variant tags are pinned to `PascalCase`,
 /// struct-variant fields to `snake_case`, and unknown fields are rejected so a
 /// renamed/dropped field can never silently corrupt replay.
+///
+/// This enum is `#[non_exhaustive]`: new commands are added over time, so
+/// downstream `match` expressions must include a wildcard arm. This makes future
+/// variant additions source-compatible; wire compatibility is preserved
+/// separately by only ever appending variants (existing bincode variant indices
+/// never shift, and externally-tagged JSON addresses variants by name).
+///
+/// Wire forward-compat is asymmetric under
+/// [`deny_unknown_fields`](https://serde.rs/container-attrs.html#deny_unknown_fields):
+/// a **new** binary decodes an **old** journal (the old variants are unchanged),
+/// but an **old** binary decoding a **new** journal that carries a variant it
+/// does not know fails to decode — expected, and the same precedent as
+/// `orderbook-rs`'s `SequencerCommand`. `deny_unknown_fields` only rejects
+/// unknown *fields within a known variant*; an unknown *variant tag* is rejected
+/// regardless. Neither is weakened by `#[non_exhaustive]`, which is a Rust
+/// source-level attribute with no effect on the serde wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
     rename_all = "PascalCase",
     rename_all_fields = "snake_case"
 )]
+#[non_exhaustive]
 pub enum OptionChainCommand {
     /// Add a limit order to a specific option book.
     AddOrder {
@@ -151,18 +168,51 @@ pub enum OptionChainCommand {
         /// The lifecycle status to transition the instrument to.
         status: InstrumentStatus,
     },
+    /// Evict every resting order across the underlying whose time-in-force has
+    /// expired as of `now_ms` (Unix milliseconds), in the hierarchy's
+    /// deterministic sweep order. Ferries through
+    /// [`UnderlyingOrderBook::evict_expired_orders`] on both live execution and
+    /// replay (the #141 surface).
+    ///
+    /// The journaled `now_ms` is the sole deterministic input: replay MUST apply
+    /// the journaled value rather than read the replay clock, so the sweep
+    /// reproduces the exact set of evictions on every run. `now_ms` is a
+    /// [`TimestampMs`], which is `#[serde(transparent)]` over `u64`, so the field
+    /// encodes to the same bytes a bare millisecond count would in both JSON and
+    /// bincode. The sweep is idempotent, so a duplicate replay evicts nothing.
+    ///
+    /// Wire-compatible addition: this variant is appended after every prior one,
+    /// so existing journals replay unchanged and their bincode variant indices
+    /// are unaffected. A journal carrying `EvictExpiredOrders` fails to decode
+    /// against an older binary that predates the variant — expected, and the same
+    /// precedent as `orderbook-rs`'s
+    /// [`SequencerCommand::EvictExpiredOrders`](orderbook_rs::SequencerCommand).
+    EvictExpiredOrders {
+        /// Caller-supplied cutoff in Unix milliseconds. Every resting order whose
+        /// time-in-force has expired at `now_ms` is evicted: `Gtd(deadline)` when
+        /// `now_ms >= deadline`, and `Day` when `now_ms >=` the book's configured
+        /// market close.
+        now_ms: TimestampMs,
+    },
 }
 
 /// Result of executing an option chain command.
 ///
 /// Journaled (on-disk) type: variant tags are pinned to `PascalCase`,
 /// struct-variant fields to `snake_case`, and unknown fields are rejected.
+///
+/// Like [`OptionChainCommand`], this enum is `#[non_exhaustive]`: new result
+/// shapes accompany new commands, so downstream `match` expressions must include
+/// a wildcard arm. Variants are only ever appended, so the journal wire format is
+/// forward-compatible in the same asymmetric sense documented on
+/// [`OptionChainCommand`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
     rename_all = "PascalCase",
     rename_all_fields = "snake_case"
 )]
+#[non_exhaustive]
 pub enum OptionChainResult {
     /// An order was successfully added.
     OrderAdded {
@@ -195,6 +245,21 @@ pub enum OptionChainResult {
     BookNotFound {
         /// The symbol that was not found.
         symbol: String,
+    },
+    /// An expiry sweep evicted the carried orders.
+    ///
+    /// The outcome of an [`OptionChainCommand::EvictExpiredOrders`]. `evicted_ids`
+    /// lists every evicted order across the underlying, flattened in the
+    /// hierarchy's deterministic sweep order (expirations by key, strikes
+    /// ascending, call book before put, and within each leaf the engine's
+    /// eviction order: bids then asks, ascending price, oldest first within a
+    /// level). The list mirrors the id-centric shape of the leaf
+    /// [`OptionOrderBook::evict_expired_orders`](crate::orderbook::OptionOrderBook::evict_expired_orders);
+    /// the evicted count is `evicted_ids.len()`. An empty list is a successful
+    /// no-op sweep, not an error.
+    ExpiredEvicted {
+        /// Evicted order identifiers in the sweep's deterministic order.
+        evicted_ids: Vec<OrderId>,
     },
 }
 
@@ -863,6 +928,30 @@ impl SequencedUnderlyingOrderBook {
         self.submit(command)
     }
 
+    /// Submits an expiry-sweep command across the whole underlying.
+    ///
+    /// Journals the sweep as an [`OptionChainCommand::EvictExpiredOrders`] so
+    /// replay reproduces the exact evictions by re-applying the journaled
+    /// `now_ms` (never the replay clock). The receipt's
+    /// [`OptionChainResult::ExpiredEvicted`] carries the evicted order ids in the
+    /// hierarchy's deterministic sweep order.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff. An order whose
+    ///   time-in-force has expired at `now_ms` is evicted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit_evict_expired_orders(
+        &self,
+        now_ms: TimestampMs,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::EvictExpiredOrders { now_ms };
+        self.submit(command)
+    }
+
     // ── Command Execution ────────────────────────────────────────────────
 
     /// Executes a command against the underlying order book.
@@ -883,6 +972,9 @@ impl SequencedUnderlyingOrderBook {
             }
             OptionChainCommand::SetInstrumentStatus { symbol, status } => {
                 self.execute_set_instrument_status(symbol, *status)
+            }
+            OptionChainCommand::EvictExpiredOrders { now_ms } => {
+                self.execute_evict_expired_orders(*now_ms)
             }
         }
     }
@@ -1244,6 +1336,35 @@ impl SequencedUnderlyingOrderBook {
         OptionChainResult::MassCancelled { cancelled_count }
     }
 
+    /// Executes an expiry sweep across the whole underlying.
+    ///
+    /// Ferries through [`UnderlyingOrderBook::evict_expired_orders`] (the #141
+    /// surface) with the journaled `now_ms`, then flattens the per-expiration /
+    /// per-strike / per-book tree into a single id list in the hierarchy's
+    /// deterministic sweep order. The sweep reads no clock, so it is a pure
+    /// function of `now_ms` and the resting books and replays identically.
+    fn execute_evict_expired_orders(&self, now_ms: TimestampMs) -> OptionChainResult {
+        let result = self.inner.evict_expired_orders(now_ms);
+
+        // Flatten in the container-nested deterministic order the sweep already
+        // walked: expirations by key, strikes ascending, call book then put, and
+        // within each leaf the engine's eviction order. Each level's `per_child`
+        // / `per_book` vector preserves that traversal order, so a plain
+        // concatenation is the deterministic, replay-stable id stream.
+        let mut evicted_ids = Vec::with_capacity(result.total_evicted());
+        for (_, expiration) in &result.per_child {
+            for (_, chain) in &expiration.per_child {
+                for (_, strike) in &chain.per_child {
+                    for (_, book_ids) in &strike.per_book {
+                        evicted_ids.extend_from_slice(book_ids);
+                    }
+                }
+            }
+        }
+
+        OptionChainResult::ExpiredEvicted { evicted_ids }
+    }
+
     /// Finds an option book by symbol.
     ///
     /// The symbol grammar is parsed by [`SymbolParser`], the single source of
@@ -1399,6 +1520,13 @@ impl SequencedUnderlyingOrderBook {
     /// or the expiry-lifecycle manager advancing books on its own schedule — are
     /// not journaled `OptionChainCommand`s, so replay does not reproduce them.
     /// Route status changes through the sequencer to keep replay faithful.
+    ///
+    /// **Expiry sweeps are reconstructed when journaled.** An
+    /// [`OptionChainCommand::EvictExpiredOrders`] (via
+    /// [`submit_evict_expired_orders`](Self::submit_evict_expired_orders))
+    /// re-applies the journaled `now_ms` — never the replay clock — so the sweep
+    /// evicts exactly the orders it evicted live; the sweep is idempotent, so a
+    /// duplicate replay is a no-op.
     ///
     /// Returns the number of events replayed.
     ///
@@ -2168,6 +2296,220 @@ mod tests {
         assert_eq!(deserialized.timestamp_ns, 1_000_000);
     }
 
+    // ── Expiry sweep command (issue #144) ─────────────────────────────────
+
+    // Far-future GTD deadline (Unix ms): admission reads the real wall clock and
+    // accepts it, while the sweep — driven purely by the caller-supplied
+    // `now_ms` — treats it as expired at `now_ms == GTD_EXPIRED`.
+    const GTD_EXPIRED: u64 = 10_000_000_000_000;
+
+    /// Seeds GTD orders across two strikes (call + put) of one expiration so the
+    /// flatten walks multiple leaves. Returns the evicted-id order the sweep MUST
+    /// produce: expirations by key, strikes ascending, call book before put, and
+    /// within each leaf bids-ascending then asks.
+    fn seed_expiring_orders(underlying: &UnderlyingOrderBook) -> Vec<OrderId> {
+        let expiry = SymbolParser::parse_yyyymmdd("20240329", "BTC-20240329-50000-C")
+            .expect("canonical expiry");
+        let exp_book = underlying.get_or_create_expiration(expiry);
+
+        // Strike 50000: call has a bid (100) and an ask (110); put has a bid (50).
+        let s50 = exp_book.get_or_create_strike(50000);
+        let c50_bid = OrderId::sequential(1001);
+        let c50_ask = OrderId::sequential(1002);
+        let p50_bid = OrderId::sequential(1003);
+        s50.call()
+            .add_limit_order_with_tif(
+                c50_bid,
+                Side::Buy,
+                100,
+                10,
+                crate::TimeInForce::Gtd(GTD_EXPIRED),
+            )
+            .expect("seed 50c bid");
+        s50.call()
+            .add_limit_order_with_tif(
+                c50_ask,
+                Side::Sell,
+                110,
+                5,
+                crate::TimeInForce::Gtd(GTD_EXPIRED),
+            )
+            .expect("seed 50c ask");
+        s50.put()
+            .add_limit_order_with_tif(
+                p50_bid,
+                Side::Buy,
+                50,
+                8,
+                crate::TimeInForce::Gtd(GTD_EXPIRED),
+            )
+            .expect("seed 50p bid");
+
+        // Strike 55000: call has a single bid (120).
+        let s55 = exp_book.get_or_create_strike(55000);
+        let c55_bid = OrderId::sequential(1004);
+        s55.call()
+            .add_limit_order_with_tif(
+                c55_bid,
+                Side::Buy,
+                120,
+                4,
+                crate::TimeInForce::Gtd(GTD_EXPIRED),
+            )
+            .expect("seed 55c bid");
+
+        // Deterministic sweep order: strike 50000 (call bids-then-asks, then put),
+        // then strike 55000.
+        vec![c50_bid, c50_ask, p50_bid, c55_bid]
+    }
+
+    #[test]
+    fn test_evict_expired_orders_command_reports_deterministic_ids() {
+        let underlying = UnderlyingOrderBook::new("BTC");
+        let expected = seed_expiring_orders(&underlying);
+
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::from_underlying_with_journal(
+            underlying,
+            Arc::clone(&journal),
+        );
+        assert_eq!(book.total_order_count(), 4, "four GTD orders seeded");
+
+        let receipt = book
+            .submit_evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("submit evict");
+        assert!(receipt.result.is_success());
+
+        // The command reports every evicted id in the hierarchy's deterministic
+        // sweep order — not insertion order.
+        match &receipt.result {
+            OptionChainResult::ExpiredEvicted { evicted_ids } => {
+                assert_eq!(*evicted_ids, expected, "evicted ids out of sweep order");
+            }
+            other => panic!("expected ExpiredEvicted, got {other:?}"),
+        }
+        assert_eq!(book.total_order_count(), 0, "all GTD orders evicted");
+
+        // The journaled event carries the same result shape.
+        let events = journal.read_from(0).expect("read");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].command,
+            OptionChainCommand::EvictExpiredOrders { .. }
+        ));
+        match &events[0].result {
+            OptionChainResult::ExpiredEvicted { evicted_ids } => {
+                assert_eq!(*evicted_ids, expected);
+            }
+            other => panic!("expected journaled ExpiredEvicted, got {other:?}"),
+        }
+
+        // Idempotent: a second sweep at the same instant evicts nothing.
+        let again = book
+            .submit_evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("submit evict again");
+        match &again.result {
+            OptionChainResult::ExpiredEvicted { evicted_ids } => assert!(evicted_ids.is_empty()),
+            other => panic!("expected empty ExpiredEvicted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_evict_expired_orders_matches_live_and_payload_roundtrips() {
+        // Probe structural state of one contract: top-of-book both sides and the
+        // resting-order count. This is the replay-equality oracle.
+        fn probe(
+            book: &SequencedUnderlyingOrderBook,
+            symbol: &str,
+        ) -> (Option<u128>, Option<u128>, usize) {
+            let leaf = book
+                .find_book_by_symbol(symbol)
+                .expect("contract must resolve");
+            (leaf.best_bid(), leaf.best_ask(), leaf.order_count())
+        }
+
+        // GTC survivors that bracket the sweep; the GTD orders are seeded
+        // out-of-band (they model resting state a checkpoint already held, since
+        // AddOrder journals only GTC) and are recreated identically on replay.
+        let sym_gtc_before = "BTC-20240329-60000-C";
+        let sym_gtc_after = "BTC-20240329-65000-P";
+        let oid_before = OrderId::new();
+        let oid_after = OrderId::new();
+
+        // ── Live run: seed GTD, then journal add / evict / add ──
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let live_underlying = UnderlyingOrderBook::new("BTC");
+        let expected_evicted = seed_expiring_orders(&live_underlying);
+        let live = SequencedUnderlyingOrderBook::from_underlying_with_journal(
+            live_underlying,
+            Arc::clone(&journal),
+        );
+
+        live.submit_add_order(sym_gtc_before, oid_before, Side::Buy, 100, 10)
+            .expect("gtc add before");
+        let evict_receipt = live
+            .submit_evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("evict");
+        live.submit_add_order(sym_gtc_after, oid_after, Side::Sell, 200, 5)
+            .expect("gtc add after");
+
+        // The evict receipt reports the seeded GTD orders in deterministic order.
+        match &evict_receipt.result {
+            OptionChainResult::ExpiredEvicted { evicted_ids } => {
+                assert_eq!(*evicted_ids, expected_evicted);
+            }
+            other => panic!("expected ExpiredEvicted, got {other:?}"),
+        }
+
+        // Contracts to compare: the swept ones (now empty) and the GTC survivors.
+        let symbols = [
+            "BTC-20240329-50000-C",
+            "BTC-20240329-50000-P",
+            "BTC-20240329-55000-C",
+            sym_gtc_before,
+            sym_gtc_after,
+        ];
+
+        // ── Replay: seed the SAME GTD state, then replay the journal ──
+        let replay_underlying = UnderlyingOrderBook::new("BTC");
+        let _ = seed_expiring_orders(&replay_underlying);
+        let replay = SequencedUnderlyingOrderBook::from_underlying_with_journal(
+            replay_underlying,
+            Arc::clone(&journal),
+        );
+        let replayed = replay.replay(0).expect("replay");
+        assert_eq!(replayed, 3, "three journaled events: add, evict, add");
+
+        // Final state equality: the journaled EvictExpiredOrders re-applied the
+        // same `now_ms`, so replay evicted the same GTD orders and kept the GTCs.
+        for sym in symbols {
+            assert_eq!(
+                probe(&live, sym),
+                probe(&replay, sym),
+                "replayed contract {sym} diverged from live"
+            );
+        }
+        assert_eq!(live.total_order_count(), replay.total_order_count());
+        assert_eq!(live.total_order_count(), 2, "two GTC survivors remain");
+
+        // ── The evicted-ids payload round-trips byte-identically ──
+        let events = journal.read_from(0).expect("read");
+        let evict_event = events
+            .iter()
+            .find(|e| matches!(e.command, OptionChainCommand::EvictExpiredOrders { .. }))
+            .expect("evict event journaled");
+        let json = serde_json::to_string(&evict_event.result).expect("serialize");
+        let back: OptionChainResult = serde_json::from_str(&json).expect("deserialize");
+        let json2 = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(json, json2, "evicted-ids payload changed across round-trip");
+        match back {
+            OptionChainResult::ExpiredEvicted { evicted_ids } => {
+                assert_eq!(evicted_ids, expected_evicted);
+            }
+            other => panic!("expected ExpiredEvicted after round-trip, got {other:?}"),
+        }
+    }
+
     // ── Journal format pinning (deny_unknown_fields + back-compat) ──────────
 
     /// Builds one representative `OptionChainEvent` per command variant and per
@@ -2272,6 +2614,18 @@ mod tests {
                 result: OptionChainResult::StatusChanged {
                     symbol: "BTC-20240329-50000-C".to_string(),
                     status: InstrumentStatus::Halted,
+                },
+            },
+            // EvictExpiredOrders + ExpiredEvicted (0.7.0 breaking release;
+            // appended after every prior variant, absent from the v0.5.0 fixture).
+            OptionChainEvent {
+                sequence_num: 8,
+                timestamp_ns: 1_700_000_000_000_000_007,
+                command: OptionChainCommand::EvictExpiredOrders {
+                    now_ms: TimestampMs::new(10_000_000_000_000),
+                },
+                result: OptionChainResult::ExpiredEvicted {
+                    evicted_ids: vec![OrderId::sequential(42), OrderId::sequential(43)],
                 },
             },
         ]
@@ -2404,6 +2758,85 @@ mod tests {
         assert!(
             serde_json::from_str::<MassCancelScope>(in_scope).is_err(),
             "unknown field inside the Strike scope variant must be rejected"
+        );
+
+        // Extra field inside the 0.7.0 EvictExpiredOrders command struct-variant.
+        let in_evict_command = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "EvictExpiredOrders": { "now_ms": 10000000000000, "extra": 1 } },
+            "result": { "ExpiredEvicted": { "evicted_ids": [] } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_evict_command).is_err(),
+            "unknown field inside EvictExpiredOrders must be rejected"
+        );
+
+        // Extra field inside the 0.7.0 ExpiredEvicted result struct-variant.
+        let in_evict_result = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "EvictExpiredOrders": { "now_ms": 10000000000000 } },
+            "result": { "ExpiredEvicted": { "evicted_ids": ["42"], "extra": 1 } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_evict_result).is_err(),
+            "unknown field inside ExpiredEvicted must be rejected"
+        );
+    }
+
+    /// Pins the 0.7.0 wire format of the appended `EvictExpiredOrders` /
+    /// `ExpiredEvicted` variants, and proves the forward-compat asymmetry
+    /// [`deny_unknown_fields`](https://serde.rs/container-attrs.html#deny_unknown_fields)
+    /// creates for journaled payloads:
+    ///
+    /// - **New binary reads old journal → OK.** A journal written before this
+    ///   variant existed carries only known tags, so it still decodes (covered
+    ///   directly by [`test_journal_event_v0_5_0_fixture_decodes_and_is_stable`],
+    ///   whose fixture predates this variant).
+    /// - **Old binary reads new journal → hard error.** A journal carrying the
+    ///   new tag fails to decode against a binary that predates it. `serde`
+    ///   rejects an unknown *variant tag* independently of
+    ///   `deny_unknown_fields` (which governs unknown *fields*), so the failure is
+    ///   guaranteed. This test simulates that binary by decoding the frozen
+    ///   `EvictExpiredOrders` bytes into an enum whose `EvictExpiredOrders` arm is
+    ///   renamed away, and asserting the decode fails.
+    #[test]
+    fn test_evict_expired_orders_wire_format_pinned() {
+        // Exact on-the-wire shape (PascalCase tag, snake_case fields, TimestampMs
+        // transparent over u64, ids as strings). A rename/recasing breaks this.
+        let event = OptionChainEvent {
+            sequence_num: 9,
+            timestamp_ns: 42,
+            command: OptionChainCommand::EvictExpiredOrders {
+                now_ms: TimestampMs::new(10_000_000_000_000),
+            },
+            result: OptionChainResult::ExpiredEvicted {
+                evicted_ids: vec![OrderId::sequential(7), OrderId::sequential(8)],
+            },
+        };
+        let value = serde_json::to_value(&event).expect("serialize");
+        let expected = serde_json::json!({
+            "sequence_num": 9,
+            "timestamp_ns": 42,
+            "command": { "EvictExpiredOrders": { "now_ms": 10_000_000_000_000_u64 } },
+            "result": { "ExpiredEvicted": { "evicted_ids": ["7", "8"] } }
+        });
+        assert_eq!(value, expected, "EvictExpiredOrders wire format drifted");
+
+        // Old-binary-reads-new-journal: an enum missing the EvictExpiredOrders arm
+        // must reject the journaled bytes (unknown variant tag).
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        #[allow(dead_code)]
+        enum OldCommand {
+            AddOrder,
+            CancelOrder,
+        }
+        let cmd_bytes = r#"{ "EvictExpiredOrders": { "now_ms": 10000000000000 } }"#;
+        assert!(
+            serde_json::from_str::<OldCommand>(cmd_bytes).is_err(),
+            "a binary predating EvictExpiredOrders must reject the new variant tag"
         );
     }
 
