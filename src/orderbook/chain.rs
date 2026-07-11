@@ -7,14 +7,16 @@ use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
 use super::instrument_registry::InstrumentRegistry;
 use super::shared::Shared;
-use super::strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+use super::strike::{
+    StrikeEvictExpiredResult, StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager,
+};
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
-use pricelevel::Hash32;
+use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -442,6 +444,59 @@ impl OptionChainOrderBook {
         Ok(ChainMassCancelResult { per_child })
     }
 
+    /// Evicts expired `GTD` / `DAY` orders across every strike in the chain.
+    ///
+    /// # Description
+    ///
+    /// Runs the host-driven expiry sweep across all strikes and returns the
+    /// aggregated per-strike results. `now_ms` is a caller-supplied
+    /// Unix-milliseconds cutoff; the sweep reads no clock, so it is a pure
+    /// function of `now_ms` and the resting books and replays identically.
+    /// Strikes are walked in ascending strike-price order (the `SkipMap`'s
+    /// natural key order — the same order [`cancel_all`](Self::cancel_all)
+    /// uses), and within each leaf book the evicted ids follow the engine's
+    /// deterministic eviction order.
+    ///
+    /// Expiry is realized only when the sweep runs: an order past its deadline
+    /// that has not yet been swept still rests and remains matchable.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff.
+    ///
+    /// # Returns
+    ///
+    /// A [`ChainEvictExpiredResult`] containing per-strike results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionChainOrderBook;
+    /// use option_chain_orderbook::TimestampMs;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = chain.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> ChainEvictExpiredResult {
+        let mut per_child = Vec::with_capacity(self.strikes.len());
+
+        for entry in self.strikes.iter() {
+            let strike_key = entry.key().to_string();
+            let result = entry.value().evict_expired_orders(now_ms);
+            per_child.push((strike_key, result));
+        }
+
+        ChainEvictExpiredResult { per_child }
+    }
+
     // ── Order Lifecycle Queries ────────────────────────────────────────────
 
     /// Finds an order anywhere in this chain's strikes.
@@ -723,6 +778,103 @@ impl ChainMassCancelResult {
         self.per_child
             .iter()
             .map(|(_, result)| result.total_cancelled())
+            .sum()
+    }
+}
+
+/// Aggregated result of an expiry sweep across every strike in a chain.
+///
+/// The eviction analogue of [`ChainMassCancelResult`]: `per_child` carries the
+/// per-strike [`StrikeEvictExpiredResult`] keyed by strike price, in ascending
+/// strike order. The aggregate accessors report the leaf-contract-book unit,
+/// identical to the mass-cancel counterpart.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::ChainEvictExpiredResult;
+///
+/// let result = ChainEvictExpiredResult { per_child: Vec::new() };
+/// assert_eq!(result.total_evicted(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ChainEvictExpiredResult {
+    /// Per-strike eviction results keyed by strike price.
+    pub per_child: Vec<(String, StrikeEvictExpiredResult)>,
+}
+
+impl ChainEvictExpiredResult {
+    /// Returns the number of leaf option books with evicted orders.
+    ///
+    /// # Description
+    ///
+    /// Drills into each per-strike result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree (a chain
+    /// spanning `N` strikes with both legs touched reports `2N`). This is NOT a
+    /// count of affected strikes.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of leaf option books affected (call/put contract books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ChainEvictExpiredResult;
+    ///
+    /// let result = ChainEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.books_affected())
+            .sum()
+    }
+
+    /// Returns the total number of evicted orders across the chain.
+    ///
+    /// # Description
+    ///
+    /// Sums evicted orders across every strike in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total evicted orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ChainEvictExpiredResult;
+    ///
+    /// let result = ChainEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_evicted(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_evicted())
             .sum()
     }
 }
@@ -1666,6 +1818,50 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         let purged = chain.purge_terminal_states(Duration::from_millis(1));
         assert_eq!(purged, 2);
+    }
+
+    #[test]
+    fn test_chain_evict_expired_orders_walks_strikes_ascending() {
+        use orderbook_rs::TimeInForce;
+        // Far-future GTD deadline so admission (wall clock) accepts it while the
+        // caller-driven sweep controls expiry.
+        const GTD_EXPIRED: u64 = 10_000_000_000_000;
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        // Create strikes out of order to prove the sweep walks them ascending.
+        let id_high = OrderId::new();
+        chain
+            .get_or_create_strike(51000)
+            .call()
+            .add_limit_order_with_tif(id_high, Side::Buy, 100, 1, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add high strike gtd");
+        let id_low = OrderId::new();
+        chain
+            .get_or_create_strike(50000)
+            .put()
+            .add_limit_order_with_tif(id_low, Side::Buy, 90, 1, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add low strike gtd");
+        // A GTC survivor the sweep must not touch.
+        chain
+            .get_or_create_strike(50000)
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 130, 2)
+            .expect("add gtc survivor");
+
+        let result = chain.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(result.total_evicted(), 2);
+
+        // Strikes are keyed and walked in ascending price order (50000 then
+        // 51000), so the low-strike put eviction precedes the high-strike call.
+        let flat: Vec<OrderId> = result
+            .per_child
+            .iter()
+            .flat_map(|(_, strike)| strike.per_book.iter())
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        assert_eq!(flat, vec![id_low, id_high]);
     }
 
     // ── OptionChainOrderBook accessor coverage ───────────────────────────
