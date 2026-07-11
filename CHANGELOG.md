@@ -13,6 +13,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.1] - 2026-07-11
 
+### Added
+
+- Host-driven GTD/DAY expiry sweep surfaced through the whole hierarchy, wrapping
+  `orderbook-rs` 0.10's `OrderBook::evict_expired_orders(now_ms)`. `now_ms` is a
+  caller-supplied Unix-milliseconds cutoff (the sweep reads no clock, so it is a
+  pure function of `now_ms` and the resting book and replays identically), the
+  boundary is inclusive (an order whose deadline equals `now_ms` is evicted), and
+  expiry is realized only when the sweep runs — an order past its deadline that
+  has not yet been swept still rests and remains matchable until the next call.
+  - `OptionOrderBook::evict_expired_orders(now_ms) -> Vec<OrderId>` on the leaf
+    book, returning the evicted ids in the engine's deterministic order (bids then
+    asks, ascending price, oldest first within a level) — matching the id-centric
+    shape of `expire()` and the mass-cancel pass-throughs.
+  - Aggregated variants mirroring the `*MassCancelResult` pattern:
+    `StrikeOrderBook::evict_expired_orders`,
+    `OptionChainOrderBook::evict_expired_orders`,
+    `ExpirationOrderBook::evict_expired_orders`,
+    `UnderlyingOrderBook::evict_expired_orders`, and
+    `UnderlyingOrderBookManager::evict_expired_across_underlyings`, returning the
+    new `StrikeEvictExpiredResult` / `ChainEvictExpiredResult` /
+    `ExpirationEvictExpiredResult` / `UnderlyingEvictExpiredResult` /
+    `GlobalEvictExpiredResult` types. Each exposes `books_affected()` (leaf
+    contract-book unit, identical semantics to the mass-cancel counterpart) and
+    `total_evicted()`, and walks the tree in each container's deterministic order
+    (expirations by key, strikes ascending, underlyings by symbol).
+  - Not journaled as a wrapper-level sequencer command: `OptionChainCommand` is
+    not `#[non_exhaustive]`, so adding a variant would be a breaking change
+    (rejected by `cargo-semver-checks` and incompatible with a patch release).
+    The engine journals the sweep at its own layer via
+    `SequencerCommand::EvictExpiredOrders` (`orderbook-rs`). (#141)
+
 ### Fixed
 
 - `OptionOrderBook`'s `*_full` submit methods (`add_limit_order_full`,

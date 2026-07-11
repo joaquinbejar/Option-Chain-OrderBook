@@ -3,7 +3,7 @@
 //! This module provides the [`ExpirationOrderBook`] and [`ExpirationOrderBookManager`]
 //! for managing all expirations for a single underlying asset.
 
-use super::chain::{ChainMassCancelResult, OptionChainOrderBook};
+use super::chain::{ChainEvictExpiredResult, ChainMassCancelResult, OptionChainOrderBook};
 use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
 use super::instrument_registry::InstrumentRegistry;
@@ -16,7 +16,7 @@ use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
-use pricelevel::Hash32;
+use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -375,6 +375,54 @@ impl ExpirationOrderBook {
         Ok(ExpirationMassCancelResult {
             per_child: vec![(self.expiration.to_string(), result)],
         })
+    }
+
+    /// Evicts expired `GTD` / `DAY` orders across this expiration's chain.
+    ///
+    /// # Description
+    ///
+    /// Runs the host-driven expiry sweep across the expiration's chain and
+    /// returns the aggregated result. `now_ms` is a caller-supplied
+    /// Unix-milliseconds cutoff; the sweep reads no clock, so it is a pure
+    /// function of `now_ms` and the resting books and replays identically. The
+    /// chain is walked in ascending strike order and each leaf book in the
+    /// engine's deterministic eviction order — the same traversal
+    /// [`cancel_all`](Self::cancel_all) uses.
+    ///
+    /// Expiry is realized only when the sweep runs: an order past its deadline
+    /// that has not yet been swept still rests and remains matchable.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff.
+    ///
+    /// # Returns
+    ///
+    /// An [`ExpirationEvictExpiredResult`] containing per-chain results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationOrderBook;
+    /// use option_chain_orderbook::TimestampMs;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let book = ExpirationOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = book.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> ExpirationEvictExpiredResult {
+        let result = self.chain.evict_expired_orders(now_ms);
+
+        ExpirationEvictExpiredResult {
+            per_child: vec![(self.expiration.to_string(), result)],
+        }
     }
 
     // ── Order Lifecycle Queries ────────────────────────────────────────────
@@ -1135,6 +1183,102 @@ impl ExpirationMassCancelResult {
         self.per_child
             .iter()
             .map(|(_, result)| result.total_cancelled())
+            .sum()
+    }
+}
+
+/// Aggregated result of an expiry sweep across an expiration's chain.
+///
+/// The eviction analogue of [`ExpirationMassCancelResult`]: `per_child` carries
+/// the single per-chain [`ChainEvictExpiredResult`] keyed by expiration. The
+/// aggregate accessors report the leaf-contract-book unit, identical to the
+/// mass-cancel counterpart.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::ExpirationEvictExpiredResult;
+///
+/// let result = ExpirationEvictExpiredResult { per_child: Vec::new() };
+/// assert_eq!(result.total_evicted(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ExpirationEvictExpiredResult {
+    /// Per-chain eviction results keyed by expiration.
+    pub per_child: Vec<(String, ChainEvictExpiredResult)>,
+}
+
+impl ExpirationEvictExpiredResult {
+    /// Returns the number of leaf option books with evicted orders.
+    ///
+    /// # Description
+    ///
+    /// Drills into each per-chain result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree. This is
+    /// NOT a count of affected chains.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of leaf option books affected (call/put contract books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationEvictExpiredResult;
+    ///
+    /// let result = ExpirationEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.books_affected())
+            .sum()
+    }
+
+    /// Returns the total number of evicted orders across the expiration.
+    ///
+    /// # Description
+    ///
+    /// Sums evicted orders across the expiration's chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total evicted orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationEvictExpiredResult;
+    ///
+    /// let result = ExpirationEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_evicted(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_evicted())
             .sum()
     }
 }

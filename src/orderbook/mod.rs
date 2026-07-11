@@ -89,12 +89,13 @@ pub mod sequencer;
 // Re-export all public types
 pub use book::{OptionOrderBook, TerminalOrderSummary};
 pub use chain::{
-    ChainMassCancelResult, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
+    ChainEvictExpiredResult, ChainMassCancelResult, OptionChainOrderBook,
+    OptionChainOrderBookManager, OptionChainStats,
 };
 pub use contract_specs::{ContractSpecs, ContractSpecsBuilder, ExerciseStyle, SettlementType};
 pub use expiration::{
-    ExpirationManagerStats, ExpirationMassCancelResult, ExpirationOrderBook,
-    ExpirationOrderBookManager,
+    ExpirationEvictExpiredResult, ExpirationManagerStats, ExpirationMassCancelResult,
+    ExpirationOrderBook, ExpirationOrderBookManager,
 };
 pub use expiry_cycle::{CycleRule, ExpiryCycleConfig};
 pub use expiry_lifecycle::{
@@ -118,13 +119,15 @@ pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use mark_price::{MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder};
 pub use quote::{Quote, QuoteUpdate};
-pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+pub use strike::{
+    StrikeEvictExpiredResult, StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager,
+};
 pub use strike_generator::{CleanupResult, StrikeGenerator};
 pub use strike_range::{ExpiryType, StrikeRangeConfig, StrikeRangeConfigBuilder};
 pub use symbol_index::{SymbolIndex, SymbolRef};
 pub use underlying::{
-    GlobalMassCancelResult, GlobalStats, UnderlyingMassCancelResult, UnderlyingOrderBook,
-    UnderlyingOrderBookManager, UnderlyingStats,
+    GlobalEvictExpiredResult, GlobalMassCancelResult, GlobalStats, UnderlyingEvictExpiredResult,
+    UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
 };
 pub use validation::ValidationConfig;
 

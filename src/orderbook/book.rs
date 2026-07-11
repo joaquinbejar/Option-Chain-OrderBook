@@ -1368,6 +1368,94 @@ impl OptionOrderBook {
         Ok(self.book.cancel_orders_by_user(user_id))
     }
 
+    /// Evicts resting `GTD` / `DAY` orders whose deadline has passed as of
+    /// `now_ms`.
+    ///
+    /// # Description
+    ///
+    /// Host-driven, deterministic expiry sweep. Pass-through to the engine's
+    /// [`OrderBook::evict_expired_orders`](orderbook_rs::OrderBook::evict_expired_orders):
+    /// every resting order whose time-in-force is expired at `now_ms` is
+    /// removed through the same single-order cancel path as an ordinary cancel
+    /// (so the price-level cache, depth statistics, order indices, risk state,
+    /// and the order-state tracker all stay consistent), tagged with
+    /// [`CancelReason::TimeInForceExpired`](orderbook_rs::CancelReason). The
+    /// engine returns the evicted orders as `Arc<OrderType>`; this wrapper
+    /// narrows them to their identifiers, matching the id-centric shape of
+    /// [`expire`](Self::expire) and the mass-cancel pass-throughs.
+    ///
+    /// Unlike [`expire`](Self::expire), this does **not** change the
+    /// instrument's lifecycle status and does not require the book to be
+    /// active: it is a routine maintenance sweep the host runs on its own
+    /// cadence, not a terminal transition.
+    ///
+    /// # Timestamp and determinism
+    ///
+    /// `now_ms` is a **caller-supplied Unix-milliseconds** timestamp — the
+    /// engine reads no clock, so the sweep is a pure function of `now_ms` and
+    /// the resting book, and replays identically. The boundary is inclusive:
+    /// an order with deadline exactly `now_ms` is evicted (the same
+    /// `tif_expired_at` definition admission uses, so a just-admitted order can
+    /// never be swept at the same instant it was accepted).
+    ///
+    /// Evicted ids are returned in the engine's fixed, replay-stable order:
+    /// bids first then asks, price levels ascending within a side, and
+    /// ascending insertion sequence (oldest first) within a level.
+    ///
+    /// # Caveat
+    ///
+    /// Expiry is realized **only when the sweep runs**. An order whose deadline
+    /// has passed but which has not yet been swept still rests and remains
+    /// matchable until the next `evict_expired_orders` call; driving the sweep
+    /// cadence is the host's responsibility.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff. Orders expired at
+    ///   or before this instant are evicted.
+    ///
+    /// # Returns
+    ///
+    /// The identifiers of the evicted orders, in the deterministic order
+    /// described above. Empty when nothing was expired. A second sweep at the
+    /// same `now_ms` returns an empty vector (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, TimeInForce, TimestampMs};
+    /// use optionstratlib::OptionStyle;
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// let gtd = OrderId::new();
+    /// // A resting GTD order that expires at t = 10_000_000_000_000 ms.
+    /// if let Err(err) =
+    ///     book.add_limit_order_with_tif(gtd, Side::Buy, 100, 1, TimeInForce::Gtd(10_000_000_000_000))
+    /// {
+    ///     panic!("add order failed: {}", err);
+    /// }
+    /// // Nothing expired one millisecond before the deadline.
+    /// assert!(
+    ///     book.evict_expired_orders(TimestampMs::new(9_999_999_999_999))
+    ///         .is_empty()
+    /// );
+    /// // At the deadline the order is evicted.
+    /// let evicted = book.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(evicted, vec![gtd]);
+    /// ```
+    #[must_use]
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> Vec<OrderId> {
+        self.book
+            .evict_expired_orders(now_ms)
+            .into_iter()
+            .map(|order| order.id())
+            .collect()
+    }
+
     // ── Order Lifecycle Queries ────────────────────────────────────────────
 
     /// Returns the current lifecycle status of an order.
@@ -2218,6 +2306,118 @@ mod tests {
         assert_eq!(result.cancelled_count(), 1);
         assert_eq!(book.order_count(), 1);
         assert!(book.best_ask().is_some());
+    }
+
+    // Far-future GTD deadlines (Unix ms) so admission — which reads the real
+    // wall clock — accepts them, while the sweep, which is driven purely by the
+    // caller-supplied `now_ms`, controls whether they are treated as expired.
+    const GTD_EXPIRED: u64 = 10_000_000_000_000;
+    const GTD_LATER: u64 = 20_000_000_000_000;
+
+    #[test]
+    fn test_evict_expired_orders_evicts_gtd_and_leaves_unexpired_and_gtc() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let expired = OrderId::new();
+        let later = OrderId::new();
+        let gtc = OrderId::new();
+
+        if let Err(err) = book.add_limit_order_with_tif(
+            expired,
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_EXPIRED),
+        ) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            book.add_limit_order_with_tif(later, Side::Buy, 99, 5, TimeInForce::Gtd(GTD_LATER))
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order_with_tif(gtc, Side::Sell, 105, 7, TimeInForce::Gtc) {
+            panic!("add order failed: {}", err);
+        }
+
+        // One millisecond before the earliest deadline nothing is expired.
+        assert!(
+            book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED - 1))
+                .is_empty()
+        );
+        assert_eq!(book.order_count(), 3);
+
+        // At the deadline only the matching GTD order is swept (inclusive
+        // boundary); the later GTD and the GTC order are untouched.
+        let evicted = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        assert_eq!(evicted, vec![expired]);
+        assert_eq!(book.order_count(), 2);
+        assert_eq!(book.get_order_status(later), Some(OrderStatus::Open));
+        assert_eq!(book.get_order_status(gtc), Some(OrderStatus::Open));
+    }
+
+    #[test]
+    fn test_evict_expired_orders_is_idempotent() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let expired = OrderId::new();
+        if let Err(err) = book.add_limit_order_with_tif(
+            expired,
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_EXPIRED),
+        ) {
+            panic!("add order failed: {}", err);
+        }
+
+        let first = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        assert_eq!(first, vec![expired]);
+
+        // A second sweep at the same instant evicts nothing: the order is gone.
+        let second = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn test_evict_expired_orders_empty_book() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(
+            book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_evict_expired_orders_deterministic_order() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let bid_low = OrderId::new();
+        let bid_high = OrderId::new();
+        let ask = OrderId::new();
+
+        // Add out of the documented order to prove the sweep, not insertion,
+        // dictates the result order: bids ascending price, then asks.
+        if let Err(err) =
+            book.add_limit_order_with_tif(ask, Side::Sell, 105, 1, TimeInForce::Gtd(GTD_EXPIRED))
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order_with_tif(
+            bid_high,
+            Side::Buy,
+            100,
+            1,
+            TimeInForce::Gtd(GTD_EXPIRED),
+        ) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            book.add_limit_order_with_tif(bid_low, Side::Buy, 99, 1, TimeInForce::Gtd(GTD_EXPIRED))
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        let evicted = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        // Bids ascending price (99 then 100), then asks.
+        assert_eq!(evicted, vec![bid_low, bid_high, ask]);
     }
 
     #[test]

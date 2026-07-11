@@ -18,7 +18,7 @@ use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
-use pricelevel::Hash32;
+use pricelevel::{Hash32, TimestampMs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -457,6 +457,64 @@ impl StrikeOrderBook {
         })
     }
 
+    /// Evicts expired `GTD` / `DAY` orders across the call and put books.
+    ///
+    /// # Description
+    ///
+    /// Runs the host-driven expiry sweep
+    /// ([`OptionOrderBook::evict_expired_orders`](super::book::OptionOrderBook::evict_expired_orders))
+    /// on the call book, then the put book, and returns the aggregated
+    /// per-book evicted identifiers. `now_ms` is a caller-supplied
+    /// Unix-milliseconds cutoff; the sweep reads no clock, so it is a pure
+    /// function of `now_ms` and the resting books and replays identically.
+    /// Within each leaf book the evicted ids follow the engine's deterministic
+    /// order (bids then asks, ascending price, oldest first within a level);
+    /// the two books are walked call-first, then put — the same order
+    /// [`cancel_all`](Self::cancel_all) uses.
+    ///
+    /// Expiry is realized only when the sweep runs: an order past its deadline
+    /// that has not yet been swept still rests and remains matchable.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff.
+    ///
+    /// # Returns
+    ///
+    /// A [`StrikeEvictExpiredResult`] containing per-book evicted ids plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeOrderBook;
+    /// use option_chain_orderbook::TimestampMs;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let strike = StrikeOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)), 50000);
+    /// let result = strike.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> StrikeEvictExpiredResult {
+        StrikeEvictExpiredResult {
+            per_book: vec![
+                (
+                    self.call.symbol().to_string(),
+                    self.call.evict_expired_orders(now_ms),
+                ),
+                (
+                    self.put.symbol().to_string(),
+                    self.put.evict_expired_orders(now_ms),
+                ),
+            ],
+        }
+    }
+
     // ── Order Lifecycle Queries ────────────────────────────────────────────
 
     /// Finds an order anywhere in this strike's call or put book.
@@ -745,6 +803,100 @@ impl StrikeMassCancelResult {
             .iter()
             .map(|(_, result)| result.cancelled_count())
             .sum()
+    }
+}
+
+/// Aggregated result of an expiry sweep across a strike's call and put books.
+///
+/// The eviction analogue of [`StrikeMassCancelResult`]: `per_book` carries the
+/// evicted order identifiers for each leaf option book (in the engine's
+/// deterministic eviction order), and the aggregate accessors report the same
+/// leaf-contract-book unit used everywhere else in the hierarchy.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::StrikeEvictExpiredResult;
+///
+/// let result = StrikeEvictExpiredResult { per_book: Vec::new() };
+/// assert_eq!(result.total_evicted(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct StrikeEvictExpiredResult {
+    /// Per-option-book evicted order identifiers keyed by option symbol.
+    pub per_book: Vec<(String, Vec<OrderId>)>,
+}
+
+impl StrikeEvictExpiredResult {
+    /// Returns the number of leaf option books with evicted orders.
+    ///
+    /// # Description
+    ///
+    /// Counts how many leaf [`OptionOrderBook`]s
+    /// (call/put contract books) evicted at least one order. This is the leaf
+    /// base case of `books_affected`: every higher level drills down and sums
+    /// these, so the unit is a leaf contract book at every level and the counts
+    /// aggregate cleanly up the tree — identical semantics to
+    /// [`StrikeMassCancelResult::books_affected`].
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of leaf option books affected (call/put contract books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeEvictExpiredResult;
+    ///
+    /// let result = StrikeEvictExpiredResult { per_book: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_book
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .count()
+    }
+
+    /// Returns the total number of evicted orders across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Sums evicted orders across every option book for this strike.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total evicted orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeEvictExpiredResult;
+    ///
+    /// let result = StrikeEvictExpiredResult { per_book: Vec::new() };
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_evicted(&self) -> usize {
+        self.per_book.iter().map(|(_, ids)| ids.len()).sum()
     }
 }
 
@@ -2414,5 +2566,49 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         let purged = strike.purge_terminal_states(Duration::from_millis(1));
         assert_eq!(purged, 2);
+    }
+
+    #[test]
+    fn test_strike_evict_expired_orders_aggregates_call_and_put() {
+        use orderbook_rs::TimeInForce;
+        // Far-future GTD deadline so admission (wall clock) accepts it while the
+        // caller-driven sweep controls expiry.
+        const GTD_EXPIRED: u64 = 10_000_000_000_000;
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        let call_gtd = OrderId::new();
+        let put_gtd = OrderId::new();
+        // A GTC survivor on the call leg that the sweep must not touch.
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 105, 3)
+            .expect("add call gtc");
+        strike
+            .call()
+            .add_limit_order_with_tif(call_gtd, Side::Buy, 100, 10, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add call gtd");
+        strike
+            .put()
+            .add_limit_order_with_tif(put_gtd, Side::Buy, 90, 5, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add put gtd");
+
+        let result = strike.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+
+        // Both leaf books contributed one eviction each; the unit is the leaf
+        // contract book.
+        assert_eq!(result.per_book.len(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(result.total_evicted(), 2);
+
+        // per_book is call-first then put, keyed by option symbol, and each
+        // leaf's ids come back in the engine's deterministic order.
+        assert_eq!(result.per_book[0].0, strike.call().symbol());
+        assert_eq!(result.per_book[0].1, vec![call_gtd]);
+        assert_eq!(result.per_book[1].0, strike.put().symbol());
+        assert_eq!(result.per_book[1].1, vec![put_gtd]);
+
+        // GTC survivor untouched; expired GTDs gone.
+        assert_eq!(strike.call().order_count(), 1);
+        assert_eq!(strike.put().order_count(), 0);
     }
 }

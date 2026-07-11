@@ -5,7 +5,8 @@
 
 use super::contract_specs::ContractSpecs;
 use super::expiration::{
-    ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager, SubtreeStats,
+    ExpirationEvictExpiredResult, ExpirationMassCancelResult, ExpirationOrderBook,
+    ExpirationOrderBookManager, SubtreeStats,
 };
 use super::expiry_cycle::ExpiryCycleConfig;
 use super::index_feed::IndexPriceFeed;
@@ -19,7 +20,7 @@ use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
-use pricelevel::Hash32;
+use pricelevel::{Hash32, TimestampMs};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -169,6 +170,103 @@ impl UnderlyingMassCancelResult {
         self.per_child
             .iter()
             .map(|(_, result)| result.total_cancelled())
+            .sum()
+    }
+}
+
+/// Aggregated result of an expiry sweep across an underlying's expirations.
+///
+/// The eviction analogue of [`UnderlyingMassCancelResult`]: `per_child` carries
+/// the per-expiration [`ExpirationEvictExpiredResult`] keyed by expiration, in
+/// the manager's deterministic order. The aggregate accessors report the
+/// leaf-contract-book unit, identical to the mass-cancel counterpart.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::UnderlyingEvictExpiredResult;
+///
+/// let result = UnderlyingEvictExpiredResult { per_child: Vec::new() };
+/// assert_eq!(result.total_evicted(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct UnderlyingEvictExpiredResult {
+    /// Per-expiration eviction results keyed by expiration.
+    pub per_child: Vec<(String, ExpirationEvictExpiredResult)>,
+}
+
+impl UnderlyingEvictExpiredResult {
+    /// Returns the number of leaf option books with evicted orders.
+    ///
+    /// # Description
+    ///
+    /// Drills into each per-expiration result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so results aggregate cleanly up the tree and match
+    /// the same count read at the expiration / global levels. This is NOT a count
+    /// of affected expirations.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of leaf option books affected (call/put contract books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::UnderlyingEvictExpiredResult;
+    ///
+    /// let result = UnderlyingEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.books_affected())
+            .sum()
+    }
+
+    /// Returns the total number of evicted orders across the underlying.
+    ///
+    /// # Description
+    ///
+    /// Sums evicted orders across every expiration for this underlying.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total evicted orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::UnderlyingEvictExpiredResult;
+    ///
+    /// let result = UnderlyingEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_evicted(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_evicted())
             .sum()
     }
 }
@@ -734,6 +832,58 @@ impl UnderlyingOrderBook {
         }
 
         Ok(UnderlyingMassCancelResult { per_child })
+    }
+
+    /// Evicts expired `GTD` / `DAY` orders across every expiration.
+    ///
+    /// # Description
+    ///
+    /// Runs the host-driven expiry sweep across all expirations for this
+    /// underlying and returns the aggregated per-expiration results. `now_ms`
+    /// is a caller-supplied Unix-milliseconds cutoff; the sweep reads no clock,
+    /// so it is a pure function of `now_ms` and the resting books and replays
+    /// identically. Expirations are walked in the manager's deterministic
+    /// expiration-key order (the same order
+    /// [`cancel_all`](Self::cancel_all) uses), each chain in ascending
+    /// strike order, and each leaf book in the engine's deterministic eviction
+    /// order.
+    ///
+    /// Expiry is realized only when the sweep runs: an order past its deadline
+    /// that has not yet been swept still rests and remains matchable.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff.
+    ///
+    /// # Returns
+    ///
+    /// An [`UnderlyingEvictExpiredResult`] containing per-expiration results
+    /// plus aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::UnderlyingOrderBook;
+    /// use option_chain_orderbook::TimestampMs;
+    ///
+    /// let book = UnderlyingOrderBook::new("BTC");
+    /// let result = book.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> UnderlyingEvictExpiredResult {
+        let mut per_child = Vec::with_capacity(self.expirations.len());
+
+        for (expiration, book) in self.expirations.iter() {
+            let expiration_key = expiration.to_string();
+            let result = book.evict_expired_orders(now_ms);
+            per_child.push((expiration_key, result));
+        }
+
+        UnderlyingEvictExpiredResult { per_child }
     }
 
     // ── Order Lifecycle Queries ────────────────────────────────────────────
@@ -1365,6 +1515,66 @@ impl UnderlyingOrderBookManager {
         Ok(GlobalMassCancelResult { per_child })
     }
 
+    /// Evicts expired `GTD` / `DAY` orders across every underlying.
+    ///
+    /// # Description
+    ///
+    /// Runs the host-driven expiry sweep across the entire hierarchy — every
+    /// underlying, expiration, strike, and leaf book — and returns the
+    /// aggregated per-underlying results. This is the wrapper analogue of the
+    /// engine's manager-level
+    /// [`BookManagerStd::evict_expired_across_books`](orderbook_rs::orderbook::manager::BookManagerStd::evict_expired_across_books),
+    /// projected onto the option hierarchy. `now_ms` is a caller-supplied
+    /// Unix-milliseconds cutoff; the sweep reads no clock, so it is a pure
+    /// function of `now_ms` and the resting books and replays identically.
+    /// Underlyings are walked in ascending symbol order (the `SkipMap`'s natural
+    /// key order — the same order
+    /// [`cancel_all_across_underlyings`](Self::cancel_all_across_underlyings)
+    /// uses); each subtree is walked in its own documented deterministic order.
+    /// Complexity is O(U × E × S) where U is the number of underlyings, E
+    /// expirations per underlying, and S strikes per expiration.
+    ///
+    /// Expiry is realized only when the sweep runs: an order past its deadline
+    /// that has not yet been swept still rests and remains matchable.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - Caller-supplied Unix-milliseconds cutoff.
+    ///
+    /// # Returns
+    ///
+    /// A [`GlobalEvictExpiredResult`] containing per-underlying results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
+    /// use option_chain_orderbook::TimestampMs;
+    ///
+    /// let manager = UnderlyingOrderBookManager::new();
+    /// let result = manager.evict_expired_across_underlyings(TimestampMs::new(10_000_000_000_000));
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    pub fn evict_expired_across_underlyings(
+        &self,
+        now_ms: TimestampMs,
+    ) -> GlobalEvictExpiredResult {
+        let mut per_child = Vec::with_capacity(self.underlyings.len());
+
+        for entry in self.underlyings.iter() {
+            let underlying_key = entry.key().clone();
+            let result = entry.value().evict_expired_orders(now_ms);
+            per_child.push((underlying_key, result));
+        }
+
+        GlobalEvictExpiredResult { per_child }
+    }
+
     // ── Order Lifecycle Queries ────────────────────────────────────────────
 
     /// Finds an order anywhere across all underlyings.
@@ -1718,6 +1928,103 @@ impl GlobalMassCancelResult {
     }
 }
 
+/// Aggregated result of an expiry sweep across every underlying in the system.
+///
+/// The eviction analogue of [`GlobalMassCancelResult`]: `per_child` carries the
+/// per-underlying [`UnderlyingEvictExpiredResult`] keyed by underlying symbol,
+/// in ascending symbol order. The aggregate accessors report the
+/// leaf-contract-book unit, identical to the mass-cancel counterpart.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::GlobalEvictExpiredResult;
+///
+/// let result = GlobalEvictExpiredResult { per_child: Vec::new() };
+/// assert_eq!(result.total_evicted(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct GlobalEvictExpiredResult {
+    /// Per-underlying eviction results keyed by underlying symbol.
+    pub per_child: Vec<(String, UnderlyingEvictExpiredResult)>,
+}
+
+impl GlobalEvictExpiredResult {
+    /// Returns the number of leaf option books with evicted orders.
+    ///
+    /// # Description
+    ///
+    /// Drills into each per-underlying result and sums its affected leaf
+    /// [`OptionOrderBook`](super::book::OptionOrderBook)s (call/put contract
+    /// books). The unit is a leaf contract book — identical to the unit reported
+    /// at every other level — so the global total equals the sum of the
+    /// per-underlying / per-expiration / per-chain leaf counts. This is NOT a
+    /// count of affected underlyings.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of leaf option books affected (call/put contract books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::GlobalEvictExpiredResult;
+    ///
+    /// let result = GlobalEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.books_affected())
+            .sum()
+    }
+
+    /// Returns the total number of evicted orders across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Sums evicted orders across every underlying in the hierarchy.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total evicted orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::GlobalEvictExpiredResult;
+    ///
+    /// let result = GlobalEvictExpiredResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_evicted(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_evicted(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_evicted())
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,6 +2134,139 @@ mod tests {
             .cancel_all_across_underlyings()
             .expect("global cancel");
         assert_eq!(global_result.books_affected(), expected);
+    }
+
+    #[test]
+    fn test_evict_expired_orders_aggregates_across_the_tree() {
+        use orderbook_rs::TimeInForce;
+        // Far-future GTD deadlines so admission (wall clock) accepts them while
+        // the caller-driven sweep controls expiry.
+        const GTD_EXPIRED: u64 = 10_000_000_000_000;
+        const GTD_LATER: u64 = 20_000_000_000_000;
+        let exp_a = test_expiration();
+        let exp_b = ExpirationDate::Days(pos_or_panic!(60.0));
+
+        let book = UnderlyingOrderBook::new("BTC");
+
+        // exp_a / strike 50000: call GTD (evicts) + a GTC survivor on the call.
+        let a_call = book
+            .get_or_create_expiration(exp_a)
+            .get_or_create_strike(50000);
+        let id_a_call = OrderId::new();
+        a_call
+            .call()
+            .add_limit_order_with_tif(id_a_call, Side::Buy, 100, 10, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add a call gtd");
+        a_call
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 120, 3)
+            .expect("add a call gtc");
+
+        // exp_a / strike 51000: put GTD (evicts) + a later GTD survivor on the put.
+        let a_put = book
+            .get_or_create_expiration(exp_a)
+            .get_or_create_strike(51000);
+        let id_a_put = OrderId::new();
+        a_put
+            .put()
+            .add_limit_order_with_tif(id_a_put, Side::Buy, 90, 5, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add a put gtd");
+        a_put
+            .put()
+            .add_limit_order_with_tif(
+                OrderId::new(),
+                Side::Buy,
+                80,
+                2,
+                TimeInForce::Gtd(GTD_LATER),
+            )
+            .expect("add a put later gtd");
+
+        // exp_b / strike 52000: call GTD (evicts).
+        let b_call = book
+            .get_or_create_expiration(exp_b)
+            .get_or_create_strike(52000);
+        let id_b_call = OrderId::new();
+        b_call
+            .call()
+            .add_limit_order_with_tif(id_b_call, Side::Buy, 70, 1, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add b call gtd");
+
+        assert_eq!(book.total_order_count(), 5);
+
+        // Sweep the whole underlying at the cutoff.
+        let result = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+
+        // Three leaf books contributed one eviction each; the later GTD and the
+        // GTC survivor are untouched.
+        assert_eq!(result.books_affected(), 3);
+        assert_eq!(result.total_evicted(), 3);
+        assert_eq!(book.total_order_count(), 2);
+
+        // Flattening the tree in walk order yields the evicted ids in the fixed
+        // deterministic order: expirations ascending (exp_a before exp_b),
+        // strikes ascending within a chain (50000 before 51000), call-before-put
+        // within a strike.
+        let flat: Vec<OrderId> = result
+            .per_child
+            .iter()
+            .flat_map(|(_, exp)| exp.per_child.iter())
+            .flat_map(|(_, chain)| chain.per_child.iter())
+            .flat_map(|(_, strike)| strike.per_book.iter())
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        assert_eq!(flat, vec![id_a_call, id_a_put, id_b_call]);
+
+        // Idempotent: a second sweep at the same instant evicts nothing.
+        let again = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        assert_eq!(again.total_evicted(), 0);
+        assert_eq!(again.books_affected(), 0);
+    }
+
+    #[test]
+    fn test_evict_expired_across_underlyings_aggregates_and_is_deterministic() {
+        use orderbook_rs::TimeInForce;
+        const GTD_EXPIRED: u64 = 10_000_000_000_000;
+
+        let manager = UnderlyingOrderBookManager::new();
+
+        // Two underlyings, each with one expiring GTD on a leaf book. Insert ETH
+        // before BTC to prove the walk order is by symbol, not insertion.
+        let eth = manager.get_or_create("ETH");
+        let id_eth = OrderId::new();
+        eth.get_or_create_expiration(test_expiration())
+            .get_or_create_strike(3000)
+            .call()
+            .add_limit_order_with_tif(id_eth, Side::Buy, 100, 1, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add eth gtd");
+
+        let btc = manager.get_or_create("BTC");
+        let id_btc = OrderId::new();
+        btc.get_or_create_expiration(test_expiration())
+            .get_or_create_strike(50000)
+            .put()
+            .add_limit_order_with_tif(id_btc, Side::Buy, 90, 1, TimeInForce::Gtd(GTD_EXPIRED))
+            .expect("add btc gtd");
+
+        let result = manager.evict_expired_across_underlyings(TimestampMs::new(GTD_EXPIRED));
+
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(result.total_evicted(), 2);
+
+        // Underlyings are keyed and ordered by symbol (BTC before ETH).
+        let keys: Vec<&str> = result.per_child.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["BTC", "ETH"]);
+
+        let flat: Vec<OrderId> = result
+            .per_child
+            .iter()
+            .flat_map(|(_, u)| u.per_child.iter())
+            .flat_map(|(_, exp)| exp.per_child.iter())
+            .flat_map(|(_, chain)| chain.per_child.iter())
+            .flat_map(|(_, strike)| strike.per_book.iter())
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        assert_eq!(flat, vec![id_btc, id_eth]);
     }
 
     #[test]
