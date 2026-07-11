@@ -11,6 +11,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.7.0] - 2026-07-11
+
+### ⚠️ Breaking Changes
+
+- **`OptionChainCommand` and `OptionChainResult` are now `#[non_exhaustive]`.**
+  Every downstream `match` over either enum must add a wildcard (`_ =>`) arm.
+  This is a one-time source break: future command/result variants are additive
+  and source-compatible once the wildcard arm is present, matching the precedent
+  set by `orderbook-rs` 0.10's `SequencerCommand` / `SequencerResult`. The
+  attribute is Rust-source only — it does not change the serde/journal wire
+  format. `OptionChainEvent` and `OptionChainReceipt` are structs and are left
+  exhaustive. A full walkthrough lives in
+  [`MIGRATING-0.7.0.md`](./MIGRATING-0.7.0.md). (#144)
+
+### Added
+
+- **`OptionChainCommand::EvictExpiredOrders { now_ms }`** journals a host-driven
+  GTD/DAY expiry sweep across the whole underlying at the wrapper's sequencer
+  layer — the piece #141 could not add under 0.6.1's additive-only gate. It is
+  submitted via `SequencedUnderlyingOrderBook::submit_evict_expired_orders(now_ms)`,
+  ferries through `UnderlyingOrderBook::evict_expired_orders` (the #141 surface)
+  on both live execution and replay, and re-applies the journaled `now_ms` (never
+  the replay clock) so replay reproduces the exact evictions; the sweep is
+  idempotent. The variant is appended after every prior one, so bincode variant
+  indices are unaffected and existing journals replay unchanged. (#144)
+- **`OptionChainResult::ExpiredEvicted { evicted_ids }`** reports the sweep's
+  evicted order ids flattened in the hierarchy's deterministic order (expirations
+  by key, strikes ascending, call book before put, and within each leaf the
+  engine's eviction order: bids then asks, ascending price, oldest first within a
+  level) — the id-centric shape of the leaf
+  `OptionOrderBook::evict_expired_orders`. An empty list is a successful no-op
+  sweep. (#144)
+- Replay coverage for the sweep: a journaled add / `EvictExpiredOrders` / add
+  session replays into a fresh instance with byte-identical final state, and the
+  `ExpiredEvicted` payload round-trips byte-identically. (#144)
+
+### Journal forward-compatibility (`deny_unknown_fields`)
+
+- The journal enums keep `#[serde(deny_unknown_fields, …)]`. Adding the appended
+  variant makes forward-compat **asymmetric**, which is the intended and
+  documented behavior:
+  - **New binary reads old journal → OK.** Journals written before this release
+    carry only known tags and still decode (pinned by the frozen
+    `journal_event_v0.5.0.json` fixture test, which predates the new variant).
+  - **Old binary reads new journal → hard decode error.** A journal carrying
+    `EvictExpiredOrders` / `ExpiredEvicted` fails to decode against a binary that
+    predates the variant. `serde` rejects an unknown *variant tag* independently
+    of `deny_unknown_fields` (which governs unknown *fields within a known
+    variant*), so the failure is guaranteed and loud rather than a silent replay
+    corruption. This matches the `orderbook-rs` `SequencerCommand` precedent.
+  - `#[non_exhaustive]` does not weaken either guarantee; it is a source-level
+    attribute with no effect on the wire format. New journal-format pinning tests
+    cover the new variant's exact wire shape, the unknown-field rejection, and
+    the unknown-variant-tag rejection.
+
 ## [0.6.1] - 2026-07-11
 
 ### Added
