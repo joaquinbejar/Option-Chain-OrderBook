@@ -39,7 +39,7 @@ use option_chain_orderbook::orderbook::{
     MassCancelType, OptionChainJournal, OptionOrderBook, SequencedUnderlyingOrderBook, SymbolIndex,
 };
 use optionstratlib::OptionStyle;
-use orderbook_rs::{OrderId, Side};
+use orderbook_rs::{Clock, OrderId, Side, StubClock, TimeInForce};
 use std::sync::Arc;
 
 // ── Deterministic test inputs ──────────────────────────────────────────────
@@ -550,4 +550,217 @@ fn test_replay_into_empty_book_then_resume_is_consistent() {
     assert_eq!(journal.len(), submitted + 1);
     // 10 rebuilt resting orders + 1 new.
     assert_eq!(resumed.total_order_count(), 11);
+}
+
+// ── Concurrent submit: gate ordering + replay-under-load oracle ─────────────
+
+/// Number of worker threads used by the concurrent-load helper.
+const CONCURRENT_THREADS: u64 = 8;
+/// Number of `AddOrder` commands each worker submits.
+const CONCURRENT_PER_THREAD: u64 = 25;
+
+/// Drives a concurrent `AddOrder` load through the sequencer.
+///
+/// Spawns [`CONCURRENT_THREADS`] workers that each submit
+/// [`CONCURRENT_PER_THREAD`] orders to a per-thread-distinct symbol, released in
+/// lockstep by a [`Barrier`](std::sync::Barrier) so the submissions genuinely
+/// contend for the sequencer gate rather than running one after another.
+/// Distinct strikes keep the workers from matching against each other, and the
+/// absolute `YYYYMMDD` date makes every derived symbol replay-stable. Returns
+/// the total number of commands submitted.
+fn drive_concurrent_add_load(book: &Arc<SequencedUnderlyingOrderBook>) -> usize {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let barrier = Arc::new(Barrier::new(CONCURRENT_THREADS as usize));
+    let mut handles = Vec::with_capacity(CONCURRENT_THREADS as usize);
+    for t in 0..CONCURRENT_THREADS {
+        let book = Arc::clone(book);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let symbol = format!("BTC-20240329-{}-C", 50000 + t * 1000);
+            barrier.wait();
+            for i in 0..CONCURRENT_PER_THREAD {
+                // Order ids are offset by 1 so no worker ever submits id 0, and
+                // the per-thread 1000-stride keeps them globally distinct.
+                book.submit_add_order(
+                    &symbol,
+                    oid(1 + t * 1000 + i),
+                    Side::Buy,
+                    100 + u128::from(i),
+                    10,
+                )
+                .expect("concurrent add must succeed");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker thread must not panic");
+    }
+    (CONCURRENT_THREADS * CONCURRENT_PER_THREAD) as usize
+}
+
+#[test]
+fn test_submit_concurrent_journal_order_matches_sequence_order() {
+    // The submit gate serializes assign→execute→journal-append, so even under a
+    // concurrent load the journal is appended in sequence order.
+    let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+    let book = Arc::new(SequencedUnderlyingOrderBook::with_journal(
+        "BTC",
+        Arc::clone(&journal),
+    ));
+
+    let total = drive_concurrent_add_load(&book);
+    assert_eq!(total, 200);
+
+    // Journal insertion order equals sequence order: reading from 0 yields
+    // sequence numbers 0..200, strictly ascending by exactly +1, in the order
+    // they were appended.
+    let events = journal.read_from(0).expect("read journal");
+    assert_eq!(
+        events.len(),
+        200,
+        "every concurrent submit must be journaled exactly once"
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.sequence_num, index as u64,
+            "journal entry at position {index} must carry sequence {index} \
+             (insertion order == sequence order)"
+        );
+    }
+
+    // Each submit records exactly one outcome (success or reject).
+    assert_eq!(
+        book.success_count() + book.reject_count(),
+        200,
+        "each of the 200 submits records exactly one outcome"
+    );
+}
+
+#[test]
+fn test_submit_concurrent_replay_equals_live_full_state_oracle() {
+    // Under a concurrent load the gate makes strike creation — and therefore
+    // registry-id allocation — happen in sequence order across threads, so
+    // replay (which re-runs the journal in that same order into a fresh book)
+    // rebuilds an identical hierarchy AND identical registry ids. This exercises
+    // the full-state oracle against a concurrently-produced journal.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+
+    let live = Arc::new(fresh_book(&journal));
+    let submitted = drive_concurrent_add_load(&live);
+    assert_eq!(
+        journal.len(),
+        submitted,
+        "every concurrent command must be journaled"
+    );
+
+    let live_snapshot = snapshot(&live);
+
+    // Replay into a fresh, identically-configured book and compare.
+    let replay = fresh_book(&journal);
+    let replayed = replay.replay(0).expect("replay");
+    assert_eq!(
+        replayed, submitted,
+        "replay must re-run every journaled command"
+    );
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed state must equal live state after a concurrent load"
+    );
+}
+
+// ── Injected clock: leaf vivification + replay determinism ──────────────────
+
+// A GTD deadline (Unix ms) a fresh `StubClock` near 0 admits, but the wall-clock
+// default rejects on admission.
+const GTD_ADMIT_DEADLINE: u64 = 10_000;
+
+/// Resolves the call leaf for `symbol` inside a sequenced book, or `None` if the
+/// hierarchy has not vivified it yet.
+fn call_leaf(
+    book: &SequencedUnderlyingOrderBook,
+    symbol: &str,
+) -> Option<Arc<option_chain_orderbook::orderbook::StrikeOrderBook>> {
+    let parsed = SymbolParser::parse(symbol).expect("parse symbol");
+    let exp = book.underlying().get_expiration(parsed.expiration()).ok()?;
+    exp.get_strike(parsed.strike()).ok()
+}
+
+#[test]
+fn test_sequenced_set_clock_applies_to_leaves_vivified_by_submit() {
+    // The sequencer's `AddOrder` is Gtc-hardcoded today, so the injected clock is
+    // observable through TIF admission on a leaf vivified BY a submit: set the
+    // stub clock, submit a (Gtc) order that vivifies the leaf, then add a GTD
+    // directly on the leaf handle. Under the stub the GTD is admitted; the
+    // control without an injected clock rejects it against the wall clock.
+    let symbol = "BTC-20240329-50000-C";
+
+    let with_clock = SequencedUnderlyingOrderBook::new("BTC");
+    with_clock.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    with_clock
+        .submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf under the stub clock");
+
+    let leaf = call_leaf(&with_clock, symbol).expect("leaf vivified by submit");
+    let admitted = leaf.call().add_limit_order_with_tif(
+        oid(2),
+        Side::Buy,
+        99,
+        5,
+        TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+    );
+    assert!(
+        admitted.is_ok(),
+        "GTD admitted on a leaf vivified after set_clock: {admitted:?}"
+    );
+
+    // Control: no injected clock, so the leaf keeps the wall clock and rejects.
+    let without_clock = SequencedUnderlyingOrderBook::new("BTC");
+    without_clock
+        .submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf under the default clock");
+    let control_leaf = call_leaf(&without_clock, symbol).expect("control leaf vivified");
+    let rejected = control_leaf.call().add_limit_order_with_tif(
+        oid(2),
+        Side::Buy,
+        99,
+        5,
+        TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+    );
+    assert!(
+        rejected.is_err(),
+        "GTD rejected on a leaf using the default wall clock"
+    );
+}
+
+#[test]
+fn test_replay_with_injected_stub_clock_equals_live() {
+    // Injecting a fresh `StubClock` into BOTH the live and the replay instance
+    // before driving / replaying must preserve the full-state oracle equality:
+    // a deterministic clock keeps replay byte-identical to live. Each instance
+    // gets its OWN fresh `StubClock` with the same start/step so their logical
+    // time streams behave identically.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+
+    let live = fresh_book(&journal);
+    live.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    let submitted = drive_command_prefix(&live);
+    let live_snapshot = snapshot(&live);
+
+    let replay = fresh_book(&journal);
+    replay.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    let replayed = replay.replay(0).expect("replay under injected stub clock");
+    assert_eq!(
+        replayed, submitted,
+        "replay must re-run every journaled command"
+    );
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed state under a fresh StubClock must equal live state under its own fresh StubClock"
+    );
 }

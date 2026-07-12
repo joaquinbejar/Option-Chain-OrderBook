@@ -17,7 +17,7 @@ use crate::utils::{checked_accumulate, format_expiration_yyyymmdd};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
+use orderbook_rs::{Clock, FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -923,6 +923,10 @@ pub struct StrikeOrderBookManager {
     stp_mode: Shared<STPMode>,
     /// Fee schedule applied to newly created option books.
     fee_schedule: Shared<Option<FeeSchedule>>,
+    /// Engine clock applied to newly created option books. `None` keeps the
+    /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` (e.g.
+    /// `StubClock`) makes time-in-force admission deterministic for replay.
+    clock: Shared<Option<Arc<dyn Clock>>>,
     /// Per-contract NATS listener factory propagated from the top of the
     /// hierarchy. When present, each lazily created call/put book installs its
     /// own publishers pre-`Arc` in the [`get_or_create`](Self::get_or_create)
@@ -950,6 +954,7 @@ impl StrikeOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -981,6 +986,7 @@ impl StrikeOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1011,6 +1017,7 @@ impl StrikeOrderBookManager {
             symbol_index: Some(symbol_index),
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1091,6 +1098,37 @@ impl StrikeOrderBookManager {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
+    }
+
+    /// Sets the engine clock for all future option books created by this manager.
+    ///
+    /// Applies to option books created *after* this call via
+    /// [`get_or_create`](Self::get_or_create); existing books are unaffected
+    /// (same semantics as fees / STP). The `Arc<dyn Clock>` is shared, not
+    /// deep-cloned, so every future book stamps orders from the same clock —
+    /// inject a `StubClock` to make time-in-force admission deterministic for
+    /// replay.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.clock.set(Some(clock));
+    }
+
+    /// Clears the engine clock so future option books use the upstream default
+    /// `MonotonicClock` (wall-clock time).
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.clock.set(None);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.clock.get()
     }
 
     /// Stores the per-contract NATS listener factory propagated from the top of
@@ -1241,6 +1279,7 @@ impl StrikeOrderBookManager {
             validation: self.validation_config.get(),
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
+            clock: self.clock.get(),
             ..BookConfig::default()
         };
 
@@ -1368,6 +1407,7 @@ impl StrikeOrderBookManager {
             validation: self.validation_config.get(),
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
+            clock: self.clock.get(),
             nats_listeners: listeners,
             ..BookConfig::default()
         }
@@ -2610,5 +2650,73 @@ mod tests {
         // GTC survivor untouched; expired GTDs gone.
         assert_eq!(strike.call().order_count(), 1);
         assert_eq!(strike.put().order_count(), 0);
+    }
+
+    // A GTD deadline (Unix ms) a fresh `StubClock` near 0 admits, but the
+    // wall-clock default rejects on admission.
+    const GTD_ADMIT_DEADLINE: u64 = 10_000;
+
+    #[test]
+    fn test_strike_manager_set_clock_gtd_admission_uses_injected_clock() {
+        use orderbook_rs::{StubClock, TimeInForce};
+
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+        manager.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+
+        let strike = manager.get_or_create(50000);
+        let admitted = strike.call().add_limit_order_with_tif(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+        );
+        assert!(
+            admitted.is_ok(),
+            "GTD order should be admitted under the injected StubClock: {admitted:?}"
+        );
+        assert_eq!(strike.call().order_count(), 1);
+    }
+
+    #[test]
+    fn test_strike_manager_set_clock_applies_only_to_future_books() {
+        use orderbook_rs::{StubClock, TimeInForce};
+
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+        // Book A is vivified BEFORE the clock is injected: it keeps the default
+        // wall clock and must reject the already-expired GTD.
+        let strike_a = manager.get_or_create(50000);
+
+        manager.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+
+        // Book B is vivified AFTER the injection: it stamps orders from the stub
+        // and must admit the same GTD.
+        let strike_b = manager.get_or_create(51000);
+
+        let rejected = strike_a.call().add_limit_order_with_tif(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+        );
+        assert!(
+            rejected.is_err(),
+            "book created before set_clock keeps the wall clock and rejects the GTD"
+        );
+        assert_eq!(strike_a.call().order_count(), 0);
+
+        let admitted = strike_b.call().add_limit_order_with_tif(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+        );
+        assert!(
+            admitted.is_ok(),
+            "book created after set_clock uses the stub and admits the GTD: {admitted:?}"
+        );
+        assert_eq!(strike_b.call().order_count(), 1);
     }
 }

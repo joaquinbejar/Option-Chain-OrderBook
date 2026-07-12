@@ -150,7 +150,7 @@ pub use sequencer::{
 // are re-exported here so downstream consumers need no direct `orderbook_rs` /
 // `pricelevel` dependency to use this crate's public surface.
 pub use orderbook_rs::{
-    CancelReason, FeeSchedule, MassCancelResult, OrderId, OrderStateTracker, OrderStatus,
-    OrderType, STPMode, Side, TimeInForce, TradeResult,
+    CancelReason, Clock, FeeSchedule, MassCancelResult, MonotonicClock, OrderId, OrderStateTracker,
+    OrderStatus, OrderType, STPMode, Side, StubClock, TimeInForce, TradeResult,
 };
 pub use pricelevel::{Hash32, Price, Quantity, TimestampMs};

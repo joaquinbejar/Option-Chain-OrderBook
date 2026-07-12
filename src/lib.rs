@@ -152,6 +152,17 @@
 //! - **Mark price is a derived, non-journaled value.** It is computed from
 //!   current inputs and is not part of the `sequencer` journal; replay
 //!   reconstructs order-book state, not historical mark prices.
+//! - **Trade IDs are not replay-stable.** The upstream engine mints each
+//!   book's trade-ID namespace with a random `Uuid::new_v4()` and exposes no
+//!   injection seam, so trade IDs differ between a live run and its replay
+//!   even on identical command streams; the replay oracle compares book
+//!   state and excludes trade IDs (tracked upstream as OrderBook-rs#199).
+//! - **Time-in-force replay determinism requires an injected clock.** `GTD` /
+//!   `Day` admission is decided by each leaf's engine clock. Inject a
+//!   deterministic clock (e.g. [`orderbook::StubClock`]) via the hierarchy's
+//!   `set_clock` before the first order, and configure the replaying instance
+//!   with an identically-behaving clock; otherwise leaves stamp and admit
+//!   against the wall clock.
 //! - **Pricing inputs are supplied by the integrator.** The crate ships only a
 //!   trivial [`orderbook::FlatVolSurface`] and mock / static index feeds
 //!   ([`orderbook::MockPriceFeed`], [`orderbook::StaticPriceFeed`]); a
@@ -324,7 +335,7 @@ pub use error::{Error, Result};
 // from `orderbook_rs` / `pricelevel`.
 pub use orderbook::{
     AggregatedGreeks, CancelReason, ChainEvictExpiredResult, ChainMassCancelResult, CleanupResult,
-    ContractSpecs, ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback,
+    Clock, ContractSpecs, ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback,
     ExpirationEvictExpiredResult, ExpirationManagerStats, ExpirationMassCancelResult,
     ExpirationOrderBook, ExpirationOrderBookManager, ExpiryCycleConfig, ExpiryLifecycleManager,
     ExpiryScheduler, ExpiryType, FeeSchedule, FlatVolSurface, GlobalEvictExpiredResult,
@@ -332,15 +343,15 @@ pub use orderbook::{
     GreeksUpdate, GreeksUpdateListener, Hash32, IndexPriceFeed, InstrumentInfo, InstrumentRegistry,
     InstrumentStatus, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
     MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MassCancelResult, MockPriceFeed,
-    OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats, OptionOrderBook, OrderId,
-    OrderStateTracker, OrderStatus, OrderType, Position, Price, PriceUpdate, PriceUpdateListener,
-    Quantity, Quote, QuoteUpdate, RefreshResult, STPMode, SettlementType, Side, StaticPriceFeed,
-    StrikeEvictExpiredResult, StrikeGenerator, StrikeMassCancelResult, StrikeOrderBook,
-    StrikeOrderBookManager, StrikeRangeConfig, StrikeRangeConfigBuilder, SubscriptionId,
-    SymbolIndex, SymbolRef, TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult,
-    UnderlyingEvictExpiredResult, UnderlyingMassCancelResult, UnderlyingOrderBook,
-    UnderlyingOrderBookManager, UnderlyingStats, ValidationConfig, VolSurface, calculate_tte_years,
-    wire_feed_to_calculator,
+    MonotonicClock, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
+    OptionOrderBook, OrderId, OrderStateTracker, OrderStatus, OrderType, Position, Price,
+    PriceUpdate, PriceUpdateListener, Quantity, Quote, QuoteUpdate, RefreshResult, STPMode,
+    SettlementType, Side, StaticPriceFeed, StrikeEvictExpiredResult, StrikeGenerator,
+    StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager, StrikeRangeConfig,
+    StrikeRangeConfigBuilder, StubClock, SubscriptionId, SymbolIndex, SymbolRef,
+    TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingEvictExpiredResult,
+    UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
+    ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
 };
 
 #[cfg(feature = "nats")]

@@ -12,8 +12,8 @@ use optionstratlib::OptionStyle;
 #[cfg(feature = "nats")]
 use orderbook_rs::PriceLevelChangedListener;
 use orderbook_rs::{
-    DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, OrderStateTracker,
-    OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
+    Clock, DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId,
+    OrderStateTracker, OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
 };
 use pricelevel::{Hash32, MatchResult, Price, Quantity, TimestampMs};
 use std::collections::hash_map::DefaultHasher;
@@ -146,6 +146,12 @@ pub(crate) struct BookConfig {
     /// due to status recording. For extreme low-latency scenarios where every
     /// microsecond matters, set this to `false` to disable tracking entirely.
     pub enable_state_tracking: bool,
+    /// Engine clock installed on the inner book before it is frozen in `Arc`.
+    ///
+    /// `None` keeps the upstream default `MonotonicClock` (wall-clock time).
+    /// Inject a deterministic clock (e.g. `StubClock`) to make time-in-force
+    /// admission (`GTD`/`Day`) reproducible for sequencer replay.
+    pub clock: Option<Arc<dyn Clock>>,
     /// Pre-built NATS publisher listeners installed before the inner book is
     /// wrapped in `Arc` (feature `nats`). `None` for every non-NATS path.
     #[cfg(feature = "nats")]
@@ -159,7 +165,8 @@ impl std::fmt::Debug for BookConfig {
             .field("validation", &self.validation)
             .field("stp_mode", &self.stp_mode)
             .field("fee_schedule", &self.fee_schedule)
-            .field("enable_state_tracking", &self.enable_state_tracking);
+            .field("enable_state_tracking", &self.enable_state_tracking)
+            .field("clock", &self.clock);
         // The NATS listeners are boxed closures and carry no `Debug`; surface
         // only whether they are present so the impl stays informative.
         #[cfg(feature = "nats")]
@@ -176,6 +183,7 @@ impl Default for BookConfig {
             stp_mode: STPMode::None,
             fee_schedule: None,
             enable_state_tracking: true,
+            clock: None,
             #[cfg(feature = "nats")]
             nats_listeners: None,
         }
@@ -361,6 +369,13 @@ impl OptionOrderBook {
         }
         if let Some(schedule) = config.fee_schedule {
             book.set_fee_schedule(Some(schedule));
+        }
+        // Install the injected engine clock (if any) while the book is still
+        // owned mutably, before it is frozen in `Arc`. This works for both
+        // constructor branches above (STP and non-STP). `None` keeps the
+        // upstream default `MonotonicClock`.
+        if let Some(clock) = config.clock.clone() {
+            book.set_clock(clock);
         }
 
         // Install the continuous-capture listener backing the opt-in
@@ -3385,6 +3400,70 @@ mod tests {
         );
     }
 
+    // A GTD deadline (Unix ms) that a fresh `StubClock` near 0 sees as still in
+    // the future (admitted), while the wall-clock `MonotonicClock` — in the year
+    // 2026, ~1.7e12 ms — sees as long expired (rejected on admission).
+    const GTD_ADMIT_DEADLINE: u64 = 10_000;
+
+    #[test]
+    fn test_book_config_clock_applies_to_both_ctor_branches() {
+        use orderbook_rs::StubClock;
+
+        // For each STP branch of `new_with_config` (None takes the plain `new`
+        // ctor, non-None takes `with_stp_mode`), an injected `StubClock` must
+        // admit a GTD order whose deadline is only "future" relative to the
+        // stub, and the control without a clock must reject it against the wall
+        // clock. A non-zero user id is supplied so the STP branch does not
+        // reject on `MissingUserId` before the TIF admission check runs.
+        let user = Hash32::from([9u8; 32]);
+        for stp in [STPMode::None, STPMode::CancelTaker] {
+            let with_clock = OptionOrderBook::new_with_config(
+                "BTC-20240329-50000-C",
+                OptionStyle::Call,
+                BookConfig {
+                    stp_mode: stp,
+                    clock: Some(Arc::new(StubClock::new()) as Arc<dyn Clock>),
+                    ..BookConfig::default()
+                },
+            );
+            let admitted = with_clock.add_limit_order_with_tif_and_user(
+                OrderId::new(),
+                Side::Buy,
+                100,
+                10,
+                TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+                user,
+            );
+            assert!(
+                admitted.is_ok(),
+                "GTD order should be admitted under the injected StubClock (stp={stp:?}): {admitted:?}"
+            );
+            assert_eq!(with_clock.order_count(), 1);
+
+            let without_clock = OptionOrderBook::new_with_config(
+                "BTC-20240329-50000-C",
+                OptionStyle::Call,
+                BookConfig {
+                    stp_mode: stp,
+                    ..BookConfig::default()
+                },
+            );
+            let rejected = without_clock.add_limit_order_with_tif_and_user(
+                OrderId::new(),
+                Side::Buy,
+                100,
+                10,
+                TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+                user,
+            );
+            assert!(
+                rejected.is_err(),
+                "GTD order should be rejected under the default wall clock (stp={stp:?})"
+            );
+            assert_eq!(without_clock.order_count(), 0);
+        }
+    }
+
     #[test]
     fn test_add_limit_order_with_user() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
@@ -3557,6 +3636,7 @@ mod tests {
                 stp_mode: STPMode::CancelTaker,
                 fee_schedule: Some(schedule),
                 enable_state_tracking: true,
+                clock: None,
                 #[cfg(feature = "nats")]
                 nats_listeners: None,
             },
