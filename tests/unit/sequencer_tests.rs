@@ -36,10 +36,12 @@
 use option_chain_orderbook::SymbolParser;
 use option_chain_orderbook::orderbook::{
     InMemoryOptionChainJournal, InstrumentRegistry, InstrumentStatus, MassCancelScope,
-    MassCancelType, OptionChainJournal, OptionOrderBook, SequencedUnderlyingOrderBook, SymbolIndex,
+    MassCancelType, OptionChainEvent, OptionChainJournal, OptionChainResult, OptionOrderBook,
+    SequencedUnderlyingOrderBook, SymbolIndex,
 };
 use optionstratlib::OptionStyle;
 use orderbook_rs::{Clock, OrderId, Side, StubClock, TimeInForce};
+use pricelevel::Hash32;
 use std::sync::Arc;
 
 // ── Deterministic test inputs ──────────────────────────────────────────────
@@ -157,8 +159,49 @@ fn drive_command_prefix(book: &SequencedUnderlyingOrderBook) -> usize {
     )
     .expect("mass cancel b60 strike sell");
 
-    // 15 adds + 2 cancels + 1 halt + 1 rejected add + 2 mass cancels.
-    21
+    // ── #148 behaviors on a fresh expiration C (kept off A/B so the existing
+    //    per-contract spot-checks are undisturbed): a crossing add that fills, an
+    //    IOC add, an add with a nonzero user identity, a replace that rematches
+    //    at a crossing level, and a replace of an unknown id (rejected). All are
+    //    deterministic, so replay rebuilds identical state. ──
+    let c45c = "BTC-20240927-45000-C";
+    let c50c = "BTC-20240927-50000-C";
+    let user_x = Hash32::from([3u8; 32]);
+
+    // c45c: a resting sell owned by a nonzero user; a marketable buy then crosses
+    // it and executes a partial fill, leaving the sell resting at reduced size.
+    book.submit_add_order_with(c45c, oid(20), Side::Sell, 500, 5, TimeInForce::Gtc, user_x)
+        .expect("add c45c sell (nonzero user)");
+    book.submit_add_order(c45c, oid(21), Side::Buy, 500, 3)
+        .expect("add c45c crossing buy (fills)");
+    // An IOC buy below the resting ask crosses nothing and does not rest: a
+    // deterministic no-op on resting state.
+    book.submit_add_order_with(
+        c45c,
+        oid(22),
+        Side::Buy,
+        400,
+        4,
+        TimeInForce::Ioc,
+        Hash32::zero(),
+    )
+    .expect("add c45c ioc buy");
+
+    // c50c: a resting sell and a resting buy below it; re-pricing the buy up to
+    // the ask makes the replacement rematch and clear both orders.
+    book.submit_add_order(c50c, oid(23), Side::Sell, 600, 5)
+        .expect("add c50c sell");
+    book.submit_add_order(c50c, oid(24), Side::Buy, 580, 5)
+        .expect("add c50c buy below ask");
+    book.submit_replace_order(c50c, oid(24), 600, 5, Side::Buy)
+        .expect("replace c50c buy up to crossing level");
+    // A replace of an id that is not resting is a deterministic rejection.
+    book.submit_replace_order(c50c, oid(999), 100, 1, Side::Buy)
+        .expect("replace unknown id (rejected)");
+
+    // 15 adds + 2 cancels + 1 halt + 1 rejected add + 2 mass cancels (expirations
+    // A/B) plus the 7 #148 commands on expiration C (5 adds + 2 replaces).
+    28
 }
 
 // ── Comparable full-state snapshot (the oracle) ────────────────────────────
@@ -400,10 +443,12 @@ fn test_replay_equals_live_full_state_oracle() {
 
     // Spot-check the live structure so the prefix's intent is explicit and a
     // silently-rejected order would be caught before the oracle runs.
-    // The halted a55c keeps its 3 resting orders; the rejected add rested
-    // nothing, so the total is unchanged at 10.
-    assert_eq!(live.expiration_count(), 2);
-    assert_eq!(live.total_order_count(), 10);
+    // Expirations A/B leave 10 resting orders (the halted a55c keeps its 3; the
+    // rejected add rested nothing). The #148 expiration C adds one net resting
+    // order (c45c's partially-filled sell; c50c is cleared by its replace
+    // rematch), for 11 total across three expirations.
+    assert_eq!(live.expiration_count(), 3);
+    assert_eq!(live.total_order_count(), 11);
     let exp_a = live
         .underlying()
         .get_expiration(
@@ -499,8 +544,9 @@ fn test_replay_registry_ids_match_live() {
             "instrument symbol diverged for id {live_id}"
         );
     }
-    // Six leaf books: 3 strikes × (call + put).
-    assert_eq!(live_ids.len(), 6);
+    // Ten leaf books: 5 strikes × (call + put) — A 50000/55000, B 60000, and the
+    // #148 expiration C 45000/50000.
+    assert_eq!(live_ids.len(), 10);
 }
 
 #[test]
@@ -548,8 +594,8 @@ fn test_replay_into_empty_book_then_resume_is_consistent() {
         .submit_add_order("BTC-20240329-50000-C", new_oid, Side::Buy, 101, 2)
         .expect("post-replay add");
     assert_eq!(journal.len(), submitted + 1);
-    // 10 rebuilt resting orders + 1 new.
-    assert_eq!(resumed.total_order_count(), 11);
+    // 11 rebuilt resting orders + 1 new.
+    assert_eq!(resumed.total_order_count(), 12);
 }
 
 // ── Concurrent submit: gate ordering + replay-under-load oracle ─────────────
@@ -762,5 +808,179 @@ fn test_replay_with_injected_stub_clock_equals_live() {
         live_snapshot,
         snapshot(&replay),
         "replayed state under a fresh StubClock must equal live state under its own fresh StubClock"
+    );
+}
+
+#[test]
+fn test_replay_replace_rematch_equals_live() {
+    // A focused journal whose replace re-prices a resting buy up to the ask so it
+    // rematches and clears both orders, plus one untouched resting bid. Replaying
+    // that journal into a fresh book must rebuild identical state — the replace
+    // rematches identically because replay re-runs it through the same engine
+    // path.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+    let symbol = "BTC-20240329-50000-C";
+
+    let live = fresh_book(&journal);
+    live.submit_add_order(symbol, oid(1), Side::Sell, 600, 5)
+        .expect("seed sell");
+    live.submit_add_order(symbol, oid(2), Side::Buy, 580, 5)
+        .expect("seed buy below ask");
+    // An untouched resting bid so the rebuilt book is non-empty after the rematch.
+    live.submit_add_order(symbol, oid(3), Side::Buy, 100, 4)
+        .expect("resting bid");
+    let replaced = live
+        .submit_replace_order(symbol, oid(2), 600, 5, Side::Buy)
+        .expect("replace up to the crossing level");
+    assert!(
+        matches!(replaced.result, OptionChainResult::OrderReplaced { .. }),
+        "replace must succeed live: {:?}",
+        replaced.result
+    );
+
+    let live_snapshot = snapshot(&live);
+
+    let replay = fresh_book(&journal);
+    let replayed = replay.replay(0).expect("replay");
+    assert_eq!(replayed, 4, "replay re-runs all four journaled commands");
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed replace-rematch state must equal live"
+    );
+}
+
+#[test]
+fn test_replay_old_style_add_order_journal_applies_gtc_defaults() {
+    // A journal written before #148: the AddOrder command has no tif / user_id,
+    // and the OrderAdded result has no trade. It must decode (fields defaulting
+    // to Gtc / zero user / no trade) and replay into the SAME state a current
+    // Gtc, zero-user add produces.
+    let symbol = "BTC-20240329-50000-C";
+
+    // Live equivalent via the current API with the explicit pre-#148 defaults.
+    let live_journal = Arc::new(InMemoryOptionChainJournal::new());
+    let live = fresh_book(&live_journal);
+    live.submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("live add");
+    let live_snapshot = snapshot(&live);
+
+    // Hand-built OLD-style journal JSON: no tif / user_id / trade fields.
+    let old_journal_json = r#"[
+        {
+            "sequence_num": 0,
+            "timestamp_ns": 1700000000000000000,
+            "command": { "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "1",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 10
+            } },
+            "result": { "OrderAdded": { "order_id": "1" } }
+        }
+    ]"#;
+    let events: Vec<OptionChainEvent> =
+        serde_json::from_str(old_journal_json).expect("old-style journal must decode");
+
+    let replay_journal = Arc::new(InMemoryOptionChainJournal::new());
+    for event in &events {
+        replay_journal.append(event).expect("append old event");
+    }
+    let replay = fresh_book(&replay_journal);
+    let replayed = replay.replay(0).expect("replay old journal");
+    assert_eq!(replayed, 1, "the single old-style event replays");
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "an old-style AddOrder must replay to the Gtc / zero-user default state"
+    );
+}
+
+#[test]
+fn test_replay_rejected_after_fills_ioc_remainder_equals_live() {
+    // Error-after-fills: an IOC buy for more than the resting liquidity consumes
+    // the entire resting ask (a real, listener-visible fill) and THEN the engine
+    // returns a typed "insufficient liquidity" error for the remainder it can
+    // neither fill nor rest. So the journaled result is `Rejected` even though
+    // contracts actually traded. #148 makes this path reachable through the
+    // journaled stream for the first time (IOC via `submit_add_order_with`); this
+    // test pins that submit and replay stay equivalent across it.
+    //
+    // Empirically observed result shape (orderbook-rs 0.10.3): `Rejected` with
+    // reason "…Insufficient liquidity for BUY order: requested 10, available 5",
+    // with the resting ask fully consumed by the partial fill.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+    let symbol = "BTC-20240329-50000-C";
+
+    let live = fresh_book(&journal);
+    // Resting ask: 5 contracts at 100.
+    live.submit_add_order(symbol, oid(1), Side::Sell, 100, 5)
+        .expect("seed resting ask");
+    // IOC buy for 10 at the crossing price: fills the 5 available, then errors on
+    // the 5-contract remainder.
+    let receipt = live
+        .submit_add_order_with(
+            symbol,
+            oid(2),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Ioc,
+            Hash32::zero(),
+        )
+        .expect("submit ioc: journaling succeeds even though the result is a rejection");
+
+    // (1) The journaled result is Rejected, yet the resting ask was fully consumed
+    //     on the live book — the fills happened, listener-visible only.
+    assert!(
+        matches!(receipt.result, OptionChainResult::Rejected { .. }),
+        "IOC-over-liquidity must journal a Rejected result, got {:?}",
+        receipt.result
+    );
+    let live_leaf = call_leaf(&live, symbol).expect("live leaf");
+    assert_eq!(
+        live_leaf.call().best_ask(),
+        None,
+        "the resting ask must be fully consumed by the partial fill"
+    );
+    assert_eq!(
+        live_leaf.call().total_ask_depth(),
+        0,
+        "no ask depth remains after the fill"
+    );
+    assert_eq!(
+        live_leaf.call().order_count(),
+        0,
+        "the IOC remainder did not rest"
+    );
+
+    // The journaled event's result matches the receipt (Rejected).
+    let events = journal.read_from(0).expect("read journal");
+    assert_eq!(
+        events.len(),
+        2,
+        "the seed add and the IOC are both journaled"
+    );
+    assert!(
+        matches!(events[1].result, OptionChainResult::Rejected { .. }),
+        "the journaled IOC result must be Rejected"
+    );
+
+    let live_snapshot = snapshot(&live);
+
+    // (2) Replay into a fresh, identically-configured instance reproduces the
+    //     exact same full-state snapshot — the fill-then-reject is deterministic.
+    let replay = fresh_book(&journal);
+    let replayed = replay.replay(0).expect("replay");
+    assert_eq!(replayed, 2, "replay re-runs both journaled commands");
+    // (3) Replay reads the journal, it never appends: the length is unchanged.
+    assert_eq!(journal.len(), 2, "replay must not mutate the journal");
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed error-after-fills state must equal live"
     );
 }

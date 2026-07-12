@@ -63,7 +63,7 @@ use crate::orderbook::symbol_index::SymbolIndex;
 use crate::orderbook::underlying::UnderlyingOrderBook;
 use crate::utils::{SymbolParser, nanos_since_epoch};
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{Clock, OrderId, Side};
+use orderbook_rs::{Clock, OrderId, Side, TimeInForce, TradeResult};
 use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -120,6 +120,20 @@ pub enum MassCancelType {
     ByUser(Hash32),
 }
 
+/// The default time-in-force for a journaled [`OptionChainCommand::AddOrder`]
+/// that predates the #148 `tif` field.
+///
+/// Serde uses this via `#[serde(default = "...")]` so an old journal — written
+/// before `AddOrder` carried a `tif` — decodes to [`TimeInForce::Gtc`], which is
+/// exactly the good-till-cancelled behavior every pre-#148 add had. Keeping the
+/// default here (rather than relying on a `Default` impl) is required because
+/// `TimeInForce` has no `Default`.
+#[must_use]
+#[inline]
+fn default_add_order_tif() -> TimeInForce {
+    TimeInForce::Gtc
+}
+
 /// Command for the option chain sequencer with hierarchy routing.
 ///
 /// Each variant represents an operation that can be sequenced through
@@ -165,6 +179,29 @@ pub enum OptionChainCommand {
         price: u128,
         /// Order quantity.
         quantity: u64,
+        /// Time-in-force policy for the order.
+        ///
+        /// Defaults to [`TimeInForce::Gtc`] (via a serde default) when absent, so
+        /// a journal written before #148 decodes and replays exactly
+        /// as it did then (every pre-#148 add was good-till-cancelled). That
+        /// missing-field default only exists in self-describing encodings
+        /// (JSON): a positional codec such as bincode cannot detect an absent
+        /// trailing field, so pre-#148 *binary* records do not decode against
+        /// the new shape — re-journal or migrate them instead. The wire
+        /// tags are pricelevel's casing — `"GTC" | "IOC" | "FOK" | {"GTD": ms} |
+        /// "DAY"` — not the `snake_case` used for the other fields. The
+        /// clock-relative variants (`Gtd`, `Day`) are replay-stable only because
+        /// #147 injects the engine clock; without that the eviction cutoff would
+        /// read wall-clock and diverge.
+        #[serde(default = "default_add_order_tif")]
+        tif: TimeInForce,
+        /// Owning user identity, used for by-user mass cancel and STP grouping.
+        ///
+        /// Defaults to the zero [`Hash32`] (via `#[serde(default)]`, which
+        /// `Hash32` derives) when absent, reproducing the pre-#148 behavior where
+        /// every add was attributed to the zero user. Serializes as a hex string.
+        #[serde(default)]
+        user_id: Hash32,
     },
     /// Cancel an order in a specific option book.
     CancelOrder {
@@ -227,6 +264,41 @@ pub enum OptionChainCommand {
         /// market close.
         now_ms: TimestampMs,
     },
+    /// Atomically replace a resting order's price, quantity, and side.
+    ///
+    /// A replace names an order that already exists, so it resolves through the
+    /// NON-creating `find_book_by_symbol` path — it never vivifies an expiration
+    /// or strike. This is deterministic:
+    /// live execution and replay both use the same non-creating resolver, so a
+    /// replace against a book that was never created is rejected identically on
+    /// both. The replacement carries validate-first atomic semantics from the
+    /// leaf [`replace_order`](crate::orderbook::OptionOrderBook::replace_order):
+    /// if the replacement's shape, risk, or self-cross check fails, the original
+    /// order survives untouched.
+    ///
+    /// Replace fills are NOT carried in the v1 result. If the new price crosses
+    /// the book the replacement can rematch and fill immediately; those fills
+    /// reach only the trade listener (and the NATS publisher), not the journaled
+    /// [`OptionChainResult::OrderReplaced`] — a follow-up will surface them once
+    /// OrderBook-rs#199 ships replay-stable ids.
+    ///
+    /// Wire-compatible addition: appended after every prior variant, so existing
+    /// journals replay unchanged and their bincode variant indices are
+    /// unaffected. A journal carrying `ReplaceOrder` fails to decode against an
+    /// older binary that predates the variant — expected, and the same
+    /// forward-compat asymmetry documented on this enum.
+    ReplaceOrder {
+        /// Target option symbol (e.g., "BTC-20240329-50000-C").
+        symbol: String,
+        /// Identifier of the resting order to replace.
+        order_id: OrderId,
+        /// New limit price in smallest units.
+        price: u128,
+        /// New order quantity.
+        quantity: u64,
+        /// New side (Buy or Sell); a flip moves the order across the book.
+        side: Side,
+    },
 }
 
 /// Result of executing an option chain command.
@@ -251,6 +323,30 @@ pub enum OptionChainResult {
     OrderAdded {
         /// The identifier of the newly added order.
         order_id: OrderId,
+        /// The fills the add produced, if any.
+        ///
+        /// `Some` iff the add crossed the book and executed at least one trade;
+        /// `None` when the order rested unfilled — which is also what any
+        /// pre-#148 journal (whose `OrderAdded` had no `trade` field) decodes to
+        /// via `#[serde(default)]`. As with `AddOrder`'s appended fields, that
+        /// old-journal default applies only to self-describing encodings
+        /// (JSON); positional codecs such as bincode cannot decode pre-#148
+        /// binary records against the new shape.
+        ///
+        /// # Replay caveat
+        ///
+        /// The payload's [`TradeResult::engine_seq`], the individual trade ids,
+        /// and the trade timestamps are NOT replay-stable: a replay into a fresh
+        /// book mints a fresh engine-seq / trade-id namespace (pending
+        /// OrderBook-rs#199). Replay discards journaled results by design (it
+        /// re-executes commands and keeps the freshly produced state), so the
+        /// replay==live *state* oracle is unaffected — but a consumer must not
+        /// diff `trade` payloads across a live run and a replay run and expect
+        /// them to match. There is deliberately no `skip_serializing_if` here:
+        /// the field is always emitted (as `null` when `None`) so the JSON and
+        /// bincode encodings stay symmetric across decode/encode round-trips.
+        #[serde(default)]
+        trade: Option<TradeResult>,
     },
     /// An order was successfully cancelled.
     OrderCancelled {
@@ -293,6 +389,16 @@ pub enum OptionChainResult {
     ExpiredEvicted {
         /// Evicted order identifiers in the sweep's deterministic order.
         evicted_ids: Vec<OrderId>,
+    },
+    /// A resting order was atomically replaced.
+    ///
+    /// The successful outcome of an [`OptionChainCommand::ReplaceOrder`]. The
+    /// replacement's fills, if the new price crossed the book, are NOT carried
+    /// here in v1 — they reach only the trade listener / NATS publisher (see the
+    /// command's doc). This variant reports placement, not fills.
+    OrderReplaced {
+        /// The identifier of the replaced order.
+        order_id: OrderId,
     },
 }
 
@@ -840,11 +946,11 @@ impl SequencedUnderlyingOrderBook {
     /// [`submit`](Self::submit), so it is linearized against the sequenced
     /// command stream: every command either fully precedes or fully follows
     /// the clock change, and which clock a lazily vivified leaf receives is
-    /// well-defined relative to the journal order. Note that until the
-    /// journaled `AddOrder` command carries a time-in-force (tracked in
-    /// issue #148), `Gtc` is hardcoded on the sequenced add path and the
-    /// injected clock affects only order timestamps — not admission — for
-    /// commands flowing through `submit`.
+    /// well-defined relative to the journal order. The journaled `AddOrder`
+    /// command carries a time-in-force (#148), so an injected deterministic
+    /// clock makes `Gtd` / `Day` admission — and the order timestamps the
+    /// engine stamps — replay-stable for commands flowing through
+    /// [`submit`](Self::submit).
     #[inline]
     pub fn set_clock(&self, clock: Arc<dyn Clock>) {
         // Linearize the config change against submit/replay so a racing
@@ -939,6 +1045,13 @@ impl SequencedUnderlyingOrderBook {
 
     /// Submits an add order command to a specific option book.
     ///
+    /// The order is good-till-cancelled ([`TimeInForce::Gtc`]) and attributed to
+    /// the zero [`Hash32`] user. For a non-default time-in-force or user
+    /// identity, use [`submit_add_order_with`](Self::submit_add_order_with).
+    /// On a book with self-trade prevention enabled the zero user is rejected
+    /// by the engine (`MissingUserId`) — STP-enabled sequenced books must
+    /// submit through `submit_add_order_with` with a non-zero identity.
+    ///
     /// # Arguments
     ///
     /// * `symbol` - Target option symbol (e.g., "BTC-20240329-50000-C")
@@ -958,12 +1071,64 @@ impl SequencedUnderlyingOrderBook {
         price: u128,
         quantity: u64,
     ) -> Result<OptionChainReceipt, Error> {
+        // Delegate with the pre-#148 defaults so this signature stays a
+        // convenience wrapper and the two paths cannot drift.
+        self.submit_add_order_with(
+            symbol,
+            order_id,
+            side,
+            price,
+            quantity,
+            TimeInForce::Gtc,
+            Hash32::zero(),
+        )
+    }
+
+    /// Submits an add order command with an explicit time-in-force and user
+    /// identity.
+    ///
+    /// This is the full-fidelity add: it carries the `tif` and `user_id` into the
+    /// journaled [`OptionChainCommand::AddOrder`] so replay reproduces the same
+    /// eviction behavior (for `Gtd`/`Day`, in concert with the injected engine
+    /// clock) and the same by-user attribution. On success the receipt's
+    /// [`OptionChainResult::OrderAdded`] carries the fills the add produced (see
+    /// that variant's replay caveat).
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol (e.g., "BTC-20240329-50000-C")
+    /// * `order_id` - Unique order identifier
+    /// * `side` - Buy or Sell
+    /// * `price` - Limit price
+    /// * `quantity` - Order quantity
+    /// * `tif` - Time-in-force policy for the order
+    /// * `user_id` - Owning user identity
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    // A full venue add is inherently 7 order attributes (symbol, id, side, price,
+    // quantity, tif, user) — bundling them into a struct would only obscure the
+    // call site, so the argument count is intrinsic here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_add_order_with(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<OptionChainReceipt, Error> {
         let command = OptionChainCommand::AddOrder {
             symbol: symbol.to_string(),
             order_id,
             side,
             price,
             quantity,
+            tif,
+            user_id,
         };
         self.submit(command)
     }
@@ -1067,6 +1232,50 @@ impl SequencedUnderlyingOrderBook {
         self.submit(command)
     }
 
+    /// Submits an atomic replace command for a resting order.
+    ///
+    /// Journals the replace as an [`OptionChainCommand::ReplaceOrder`]. The
+    /// target order must already exist: the command resolves through the
+    /// non-creating book lookup and never vivifies an expiration or strike, so a
+    /// replace against a book that does not exist is rejected. Replace semantics
+    /// are validate-first and atomic — a rejected replacement leaves the original
+    /// order untouched (see the leaf
+    /// [`replace_order`](crate::orderbook::OptionOrderBook::replace_order)).
+    ///
+    /// The receipt is [`OptionChainResult::OrderReplaced`] on success,
+    /// [`OptionChainResult::BookNotFound`] when the symbol names no existing
+    /// book, or [`OptionChainResult::Rejected`] when the order is not resting,
+    /// the symbol crosses underlyings, or the engine rejects the replacement.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol
+    /// * `order_id` - Identifier of the resting order to replace
+    /// * `price` - New limit price in smallest units
+    /// * `quantity` - New order quantity
+    /// * `side` - New side (Buy or Sell)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit_replace_order(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        price: u128,
+        quantity: u64,
+        side: Side,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::ReplaceOrder {
+            symbol: symbol.to_string(),
+            order_id,
+            price,
+            quantity,
+            side,
+        };
+        self.submit(command)
+    }
+
     // ── Command Execution ────────────────────────────────────────────────
 
     /// Executes a command against the underlying order book.
@@ -1078,7 +1287,11 @@ impl SequencedUnderlyingOrderBook {
                 side,
                 price,
                 quantity,
-            } => self.execute_add_order(symbol, *order_id, *side, *price, *quantity),
+                tif,
+                user_id,
+            } => {
+                self.execute_add_order(symbol, *order_id, *side, *price, *quantity, *tif, *user_id)
+            }
             OptionChainCommand::CancelOrder { symbol, order_id } => {
                 self.execute_cancel_order(symbol, *order_id)
             }
@@ -1091,6 +1304,13 @@ impl SequencedUnderlyingOrderBook {
             OptionChainCommand::EvictExpiredOrders { now_ms } => {
                 self.execute_evict_expired_orders(*now_ms)
             }
+            OptionChainCommand::ReplaceOrder {
+                symbol,
+                order_id,
+                price,
+                quantity,
+                side,
+            } => self.execute_replace_order(symbol, *order_id, *price, *quantity, *side),
         }
     }
 
@@ -1103,6 +1323,21 @@ impl SequencedUnderlyingOrderBook {
     /// prefix rebuilds identical structural state in a fresh book. A malformed
     /// symbol still yields [`OptionChainResult::BookNotFound`]; a cross-underlying
     /// symbol is rejected before anything is created.
+    ///
+    /// # Fills and the error-after-fills caveat
+    ///
+    /// On success the result's `trade` is `Some` iff the add crossed and executed
+    /// at least one trade, `None` if it rested unfilled. The engine can also
+    /// return an error *after* executing real fills — an `Ioc`/`Fok` remainder
+    /// that cannot rest, or an STP taker-cancel — in which case the add is
+    /// journaled as [`OptionChainResult::Rejected`] even though fills reached the
+    /// trade listener (and the NATS publisher). Those fills are listener-visible
+    /// only; they are deterministic, so replay reproduces the same rejection and
+    /// the same fills, but a venue consumer must not read `Rejected` as "nothing
+    /// happened".
+    // Mirrors the full add attribute set (see `submit_add_order_with`); the count
+    // is intrinsic to a limit-order add, not accidental.
+    #[allow(clippy::too_many_arguments)]
     fn execute_add_order(
         &self,
         symbol: &str,
@@ -1110,6 +1345,8 @@ impl SequencedUnderlyingOrderBook {
         side: Side,
         price: u128,
         quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
     ) -> OptionChainResult {
         let book = match self.find_or_create_book_by_symbol(symbol) {
             Ok(book) => book,
@@ -1129,8 +1366,15 @@ impl SequencedUnderlyingOrderBook {
             }
         };
 
-        match book.add_limit_order(order_id, side, price, quantity) {
-            Ok(_) => OptionChainResult::OrderAdded { order_id },
+        match book
+            .add_limit_order_with_tif_and_user_full(order_id, side, price, quantity, tif, user_id)
+        {
+            Ok(trade) => OptionChainResult::OrderAdded {
+                order_id,
+                // Carry the fills only when the add actually crossed; an empty
+                // trade list means the order rested, which is `None`.
+                trade: (!trade.match_result.trades().is_empty()).then_some(trade),
+            },
             Err(e) => OptionChainResult::Rejected {
                 reason: e.to_string(),
             },
@@ -1208,6 +1452,56 @@ impl SequencedUnderlyingOrderBook {
 
         match book.cancel_order(order_id) {
             Ok(_) => OptionChainResult::OrderCancelled { order_id },
+            Err(e) => OptionChainResult::Rejected {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Executes an atomic replace operation.
+    ///
+    /// Resolution goes through the NON-creating
+    /// [`find_book_by_symbol`](Self::find_book_by_symbol) — the same resolver as
+    /// [`execute_cancel_order`](Self::execute_cancel_order) — so a replace never
+    /// vivifies an expiration or strike. The error mapping mirrors the cancel
+    /// path: a cross-underlying symbol is [`Rejected`](OptionChainResult::Rejected)
+    /// with the typed reason, any other resolution failure (malformed symbol, or
+    /// a book that was never created) is
+    /// [`BookNotFound`](OptionChainResult::BookNotFound). The leaf replace then
+    /// distinguishes replaced (`Ok(true)`), order-not-resting (`Ok(false)`, a
+    /// deterministic rejection), and an engine rejection (`Err`, with the
+    /// original order left untouched).
+    fn execute_replace_order(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        price: u128,
+        quantity: u64,
+        side: Side,
+    ) -> OptionChainResult {
+        let book = match self.find_book_by_symbol(symbol) {
+            Ok(book) => book,
+            // A cross-underlying command must be rejected with the typed reason,
+            // never silently routed or masked as a missing book.
+            Err(e @ Error::UnderlyingMismatch { .. }) => {
+                return OptionChainResult::Rejected {
+                    reason: e.to_string(),
+                };
+            }
+            Err(_) => {
+                return OptionChainResult::BookNotFound {
+                    symbol: symbol.to_string(),
+                };
+            }
+        };
+
+        match book.replace_order(order_id, price, quantity, side) {
+            Ok(true) => OptionChainResult::OrderReplaced { order_id },
+            // The book exists but no order with that id is resting: a
+            // deterministic rejection (not a book-not-found).
+            Ok(false) => OptionChainResult::Rejected {
+                reason: format!("order not found: {order_id}"),
+            },
             Err(e) => OptionChainResult::Rejected {
                 reason: e.to_string(),
             },
@@ -1661,6 +1955,20 @@ impl SequencedUnderlyingOrderBook {
     /// evicts exactly the orders it evicted live; the sweep is idempotent, so a
     /// duplicate replay is a no-op.
     ///
+    /// **Replaces are reconstructed when journaled.** An
+    /// [`OptionChainCommand::ReplaceOrder`] (via
+    /// [`submit_replace_order`](Self::submit_replace_order)) replays through the
+    /// SAME non-creating resolution and the same engine validate-first replace
+    /// path (the leaf
+    /// [`replace_order`](crate::orderbook::OptionOrderBook::replace_order)) as
+    /// live, so a replace that re-priced an order to a crossing level and
+    /// rematched live rematches identically on replay, rebuilding the same
+    /// resting book. Journaled `trade` payloads carried in
+    /// [`OptionChainResult::OrderAdded`] results are ignored by replay: replay
+    /// re-executes commands and keeps the freshly produced results, so the
+    /// non-replay-stable trade ids / engine-seqs in the journal never influence
+    /// the rebuilt state.
+    ///
     /// Returns the number of events replayed.
     ///
     /// # Errors
@@ -1794,6 +2102,7 @@ mod tests {
     fn test_option_chain_result_is_error() {
         let success = OptionChainResult::OrderAdded {
             order_id: OrderId::new(),
+            trade: None,
         };
         let rejected = OptionChainResult::Rejected {
             reason: "test".to_string(),
@@ -2421,9 +2730,12 @@ mod tests {
                 side: Side::Buy,
                 price: 100,
                 quantity: 10,
+                tif: TimeInForce::Gtc,
+                user_id: Hash32::zero(),
             },
             result: OptionChainResult::OrderAdded {
                 order_id: OrderId::new(),
+                trade: None,
             },
         };
 
@@ -2670,7 +2982,7 @@ mod tests {
             .expect("canonical expiry");
 
         vec![
-            // AddOrder + OrderAdded
+            // AddOrder + OrderAdded (default tif/user, rested unfilled → trade None)
             OptionChainEvent {
                 sequence_num: 1,
                 timestamp_ns: 1_700_000_000_000_000_000,
@@ -2680,8 +2992,13 @@ mod tests {
                     side: Side::Buy,
                     price: 100,
                     quantity: 10,
+                    tif: TimeInForce::Gtc,
+                    user_id: Hash32::zero(),
                 },
-                result: OptionChainResult::OrderAdded { order_id: oid },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: None,
+                },
             },
             // CancelOrder + OrderCancelled
             OptionChainEvent {
@@ -2766,7 +3083,71 @@ mod tests {
                     evicted_ids: vec![OrderId::sequential(42), OrderId::sequential(43)],
                 },
             },
+            // AddOrder with a NON-default tif (Gtd) + nonzero user_id, and an
+            // OrderAdded carrying deterministic fills (#148). Exercises the
+            // enriched wire shape end to end.
+            OptionChainEvent {
+                sequence_num: 9,
+                timestamp_ns: 1_700_000_000_000_000_008,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Buy,
+                    price: 100,
+                    quantity: 4,
+                    tif: TimeInForce::Gtd(1_700_000_000_000),
+                    user_id: user,
+                },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: Some(deterministic_trade_result()),
+                },
+            },
+            // ReplaceOrder + OrderReplaced (#148).
+            OptionChainEvent {
+                sequence_num: 10,
+                timestamp_ns: 1_700_000_000_000_000_009,
+                command: OptionChainCommand::ReplaceOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    price: 105,
+                    quantity: 7,
+                    side: Side::Buy,
+                },
+                result: OptionChainResult::OrderReplaced { order_id: oid },
+            },
         ]
+    }
+
+    /// Builds a deterministic single-fill [`TradeResult`] for fixtures and wire
+    /// tests.
+    ///
+    /// The inner [`Trade`](pricelevel::Trade) is deserialized from a pinned JSON
+    /// literal — never `Trade::new`, which stamps a wall-clock timestamp and
+    /// would make the encoding non-reproducible — so the whole `TradeResult`, and
+    /// any journal event carrying it, is byte-stable across runs. Represents a
+    /// taker of 4 units fully filled at price 100 by maker order 43.
+    fn deterministic_trade_result() -> TradeResult {
+        // Pinned Trade wire form: `Id`s are strings, price/quantity/timestamp are
+        // transparent numbers, `taker_side` is "BUY"/"SELL". The fixed timestamp
+        // is what keeps this reproducible (Trade::new would read the clock).
+        const TRADE_JSON: &str = r#"{
+            "trade_id": "9001",
+            "taker_order_id": "42",
+            "maker_order_id": "43",
+            "price": 100,
+            "quantity": 4,
+            "taker_side": "BUY",
+            "timestamp": 1700000000000
+        }"#;
+        let trade: pricelevel::Trade =
+            serde_json::from_str(TRADE_JSON).expect("pinned trade json must decode");
+        let mut match_result =
+            pricelevel::MatchResult::new(OrderId::sequential(42), pricelevel::Quantity::new(4));
+        match_result
+            .add_trade(trade)
+            .expect("pinned trade must not overfill the match result");
+        TradeResult::new("BTC-20240329-50000-C".to_string(), match_result)
     }
 
     /// Back-compat / format-pin guard: a checked-in journal sample written under
@@ -2809,15 +3190,42 @@ mod tests {
             }
         ));
 
-        // Re-encoding is value-identical to the on-disk fixture: the wire format
-        // is unchanged by the serde attributes (key order / whitespace aside).
+        // Re-encoding: the #148 additive fields (`tif` / `user_id` on `AddOrder`,
+        // `trade` on `OrderAdded`) are absent from the frozen v0.5.0 fixture but
+        // are ALWAYS emitted by the current schema (no `skip_serializing_if`), so
+        // a naive `to_value(decoded) == fixture` comparison would fail purely on
+        // the new fields. That is expected and correct: the additive-field
+        // precedent is that an old journal decodes to the field DEFAULTS, and
+        // re-encoding then materializes those defaults. To keep this test a true
+        // wire-stability pin (nothing OTHER than the known additive fields
+        // changed), we patch the parsed fixture with exactly those defaults —
+        // `"tif":"GTC"`, the zero-hex `user_id`, `"trade":null` — and require the
+        // patched fixture to match the re-encode byte-for-byte. Any drift in a
+        // pre-existing field still fails loudly. The frozen fixture file itself
+        // is NOT edited.
         let reencoded: serde_json::Value =
             serde_json::to_value(&decoded).expect("re-encode decoded events");
-        let on_disk: serde_json::Value =
+        let mut on_disk: serde_json::Value =
             serde_json::from_str(FIXTURE).expect("parse fixture as value");
+
+        // Event 0 is the AddOrder + OrderAdded; inject the defaulted fields.
+        let add_cmd = on_disk[0]["command"]["AddOrder"]
+            .as_object_mut()
+            .expect("fixture event 0 command is AddOrder");
+        add_cmd.insert("tif".to_string(), serde_json::json!("GTC"));
+        add_cmd.insert(
+            "user_id".to_string(),
+            serde_json::json!(Hash32::zero().to_hex()),
+        );
+        let added_result = on_disk[0]["result"]["OrderAdded"]
+            .as_object_mut()
+            .expect("fixture event 0 result is OrderAdded");
+        added_result.insert("trade".to_string(), serde_json::Value::Null);
+
         assert_eq!(
             reencoded, on_disk,
-            "re-encoded journal diverged from the checked-in v0.5.0 wire format"
+            "re-encoded journal diverged from the checked-in v0.5.0 wire format \
+             (beyond the known #148 additive fields)"
         );
     }
 
@@ -2834,6 +3242,63 @@ mod tests {
             let json2 = serde_json::to_string(&back).expect("re-serialize");
             assert_eq!(json, json2, "round-trip changed the encoding for {event:?}");
         }
+    }
+
+    /// Format-pin guard for the CURRENT (#148) schema: a checked-in journal
+    /// sample written under the enriched schema MUST decode into
+    /// `OptionChainEvent` and re-encode value-identically. Unlike the v0.5.0
+    /// fixture (which predates the additive fields and therefore needs the
+    /// defaults patched in), this fixture already carries `tif` / `user_id` /
+    /// `trade` and the `ReplaceOrder` / `OrderReplaced` variants, so the
+    /// comparison is strict with no patching. It covers `AddOrder` with the
+    /// default and with a non-default `Gtd` tif + nonzero user, `OrderAdded` both
+    /// with `trade: null` and with a deterministic fill payload, and the replace
+    /// pair.
+    ///
+    /// The fixture lives at `tests/fixtures/journal_event_v0.8.0.json`.
+    #[test]
+    fn test_journal_event_v0_8_0_fixture_decodes_and_is_stable() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/journal_event_v0.8.0.json");
+
+        let decoded: Vec<OptionChainEvent> =
+            serde_json::from_str(FIXTURE).expect("v0.8.0 journal fixture must decode");
+        assert_eq!(decoded.len(), 10, "fixture should hold ten events");
+
+        // Spot-check the #148 shapes landed as expected.
+        assert!(matches!(
+            decoded[0].result,
+            OptionChainResult::OrderAdded { trade: None, .. }
+        ));
+        assert!(matches!(
+            decoded[8].command,
+            OptionChainCommand::AddOrder {
+                tif: TimeInForce::Gtd(1_700_000_000_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[8].result,
+            OptionChainResult::OrderAdded { trade: Some(_), .. }
+        ));
+        assert!(matches!(
+            decoded[9].command,
+            OptionChainCommand::ReplaceOrder { price: 105, .. }
+        ));
+        assert!(matches!(
+            decoded[9].result,
+            OptionChainResult::OrderReplaced { .. }
+        ));
+
+        // Strict re-encode: the current schema is fully materialized in the
+        // fixture, so no additive-field patching is needed.
+        let reencoded: serde_json::Value =
+            serde_json::to_value(&decoded).expect("re-encode decoded events");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("parse fixture as value");
+        assert_eq!(
+            reencoded, on_disk,
+            "re-encoded journal diverged from the checked-in v0.8.0 wire format"
+        );
     }
 
     /// Negative guard proving `deny_unknown_fields` is active at every journal
@@ -2921,6 +3386,60 @@ mod tests {
             serde_json::from_str::<OptionChainEvent>(in_evict_result).is_err(),
             "unknown field inside ExpiredEvicted must be rejected"
         );
+
+        // Extra field inside the #148 enriched AddOrder command struct-variant
+        // (alongside the new tif/user_id fields, to prove they did not weaken
+        // deny_unknown_fields).
+        let in_enriched_add = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 10,
+                "tif": "IOC",
+                "user_id": "0707070707070707070707070707070707070707070707070707070707070707",
+                "extra": 1
+            } },
+            "result": { "OrderAdded": { "order_id": "42", "trade": null } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_enriched_add).is_err(),
+            "unknown field inside the enriched AddOrder must be rejected"
+        );
+
+        // Extra field inside the #148 ReplaceOrder command struct-variant.
+        let in_replace_command = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "ReplaceOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "price": 105,
+                "quantity": 7,
+                "side": "BUY",
+                "extra": 1
+            } },
+            "result": { "OrderReplaced": { "order_id": "42" } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_replace_command).is_err(),
+            "unknown field inside ReplaceOrder must be rejected"
+        );
+
+        // Extra field inside the #148 OrderReplaced result struct-variant.
+        let in_replaced_result = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "CancelOrder": { "symbol": "BTC-20240329-50000-C", "order_id": "42" } },
+            "result": { "OrderReplaced": { "order_id": "42", "extra": 1 } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_replaced_result).is_err(),
+            "unknown field inside OrderReplaced must be rejected"
+        );
     }
 
     /// Pins the 0.7.0 wire format of the appended `EvictExpiredOrders` /
@@ -2975,6 +3494,163 @@ mod tests {
         assert!(
             serde_json::from_str::<OldCommand>(cmd_bytes).is_err(),
             "a binary predating EvictExpiredOrders must reject the new variant tag"
+        );
+    }
+
+    /// Pins the #148 enriched `AddOrder` wire shape: the appended `tif` /
+    /// `user_id` fields, the pricelevel casing of the `Gtd` payload
+    /// (`{"GTD": ms}`, not `snake_case`), and the hex-string `user_id`. Also pins
+    /// that the default `tif`/`user` still serialize explicitly (no
+    /// `skip_serializing_if`), which is what keeps the JSON/bincode encodings
+    /// symmetric across a decode/encode round-trip.
+    #[test]
+    fn test_add_order_wire_format_pinned() {
+        // Non-default tif (Gtd) + nonzero user.
+        let gtd = OptionChainCommand::AddOrder {
+            symbol: "BTC-20240329-50000-C".to_string(),
+            order_id: OrderId::sequential(42),
+            side: Side::Buy,
+            price: 100,
+            quantity: 4,
+            tif: TimeInForce::Gtd(1_700_000_000_000),
+            user_id: Hash32::from([7u8; 32]),
+        };
+        let value = serde_json::to_value(&gtd).expect("serialize");
+        let expected = serde_json::json!({
+            "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 4,
+                "tif": { "GTD": 1_700_000_000_000_u64 },
+                "user_id": "0707070707070707070707070707070707070707070707070707070707070707"
+            }
+        });
+        assert_eq!(value, expected, "enriched AddOrder wire format drifted");
+
+        // Default tif/user still serialize explicitly.
+        let default = OptionChainCommand::AddOrder {
+            symbol: "BTC-20240329-50000-C".to_string(),
+            order_id: OrderId::sequential(42),
+            side: Side::Sell,
+            price: 110,
+            quantity: 5,
+            tif: TimeInForce::Gtc,
+            user_id: Hash32::zero(),
+        };
+        let default_value = serde_json::to_value(&default).expect("serialize default");
+        assert_eq!(
+            default_value["AddOrder"]["tif"],
+            serde_json::json!("GTC"),
+            "default tif must serialize as \"GTC\""
+        );
+        assert_eq!(
+            default_value["AddOrder"]["user_id"],
+            serde_json::json!(Hash32::zero().to_hex()),
+            "default user_id must serialize as the zero hex string"
+        );
+    }
+
+    /// Pins the wire shape of an `OrderAdded` that carries a fill payload: the
+    /// nested `TradeResult` / `MatchResult` / `Trade` structure, with `Id`s as
+    /// strings and numeric price/quantity/timestamp.
+    #[test]
+    fn test_order_added_with_trade_wire_format_pinned() {
+        let result = OptionChainResult::OrderAdded {
+            order_id: OrderId::sequential(42),
+            trade: Some(deterministic_trade_result()),
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        let expected = serde_json::json!({
+            "OrderAdded": {
+                "order_id": "42",
+                "trade": {
+                    "symbol": "BTC-20240329-50000-C",
+                    "match_result": {
+                        "order_id": "42",
+                        "trades": {
+                            "trades": [
+                                {
+                                    "trade_id": "9001",
+                                    "taker_order_id": "42",
+                                    "maker_order_id": "43",
+                                    "price": 100,
+                                    "quantity": 4,
+                                    "taker_side": "BUY",
+                                    "timestamp": 1_700_000_000_000_u64
+                                }
+                            ]
+                        },
+                        "remaining_quantity": 0,
+                        "is_complete": true,
+                        "filled_order_ids": [],
+                        "outcome": "filled"
+                    },
+                    "total_maker_fees": 0,
+                    "total_taker_fees": 0,
+                    "engine_seq": 0,
+                    "quote_notional": 400
+                }
+            }
+        });
+        assert_eq!(value, expected, "OrderAdded-with-trade wire format drifted");
+    }
+
+    /// Pins the #148 `ReplaceOrder` / `OrderReplaced` wire format and proves the
+    /// old-binary-reads-new-journal asymmetry: a binary that predates the
+    /// variant rejects the new tag (unknown variant), independent of
+    /// `deny_unknown_fields`.
+    #[test]
+    fn test_replace_order_wire_format_pinned() {
+        let event = OptionChainEvent {
+            sequence_num: 10,
+            timestamp_ns: 42,
+            command: OptionChainCommand::ReplaceOrder {
+                symbol: "BTC-20240329-50000-C".to_string(),
+                order_id: OrderId::sequential(42),
+                price: 105,
+                quantity: 7,
+                side: Side::Buy,
+            },
+            result: OptionChainResult::OrderReplaced {
+                order_id: OrderId::sequential(42),
+            },
+        };
+        let value = serde_json::to_value(&event).expect("serialize");
+        let expected = serde_json::json!({
+            "sequence_num": 10,
+            "timestamp_ns": 42,
+            "command": { "ReplaceOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "price": 105,
+                "quantity": 7,
+                "side": "BUY"
+            } },
+            "result": { "OrderReplaced": { "order_id": "42" } }
+        });
+        assert_eq!(value, expected, "ReplaceOrder wire format drifted");
+
+        // Old-binary-reads-new-journal: an enum missing the ReplaceOrder arm must
+        // reject the journaled bytes (unknown variant tag).
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        #[allow(dead_code)]
+        enum OldCommand {
+            AddOrder,
+            CancelOrder,
+        }
+        let cmd_bytes = r#"{ "ReplaceOrder": {
+            "symbol": "BTC-20240329-50000-C",
+            "order_id": "42",
+            "price": 105,
+            "quantity": 7,
+            "side": "BUY"
+        } }"#;
+        assert!(
+            serde_json::from_str::<OldCommand>(cmd_bytes).is_err(),
+            "a binary predating ReplaceOrder must reject the new variant tag"
         );
     }
 
@@ -3162,6 +3838,251 @@ mod tests {
         }
         // Nothing was materialized for an unparseable symbol.
         assert_eq!(book.expiration_count(), 0);
+    }
+
+    // ── Submit: add order with tif / user, and fill attribution (#148) ────
+
+    #[test]
+    fn test_submit_add_order_with_tif_and_user_executes_and_journals() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        let user = Hash32::from([9u8; 32]);
+        // A far-future GTD deadline (Unix ms): admission accepts it, so the order
+        // rests rather than being evicted on entry.
+        let tif = TimeInForce::Gtd(10_000_000_000_000);
+
+        let receipt = book
+            .submit_add_order_with(
+                "BTC-20240329-50000-C",
+                OrderId::sequential(1),
+                Side::Buy,
+                100,
+                10,
+                tif,
+                user,
+            )
+            .expect("submit");
+        assert!(receipt.result.is_success(), "got {:?}", receipt.result);
+
+        // The journaled command carries the tif and user identity verbatim.
+        let events = journal.read_from(0).expect("read journal");
+        assert_eq!(events.len(), 1);
+        match &events[0].command {
+            OptionChainCommand::AddOrder {
+                tif: journaled_tif,
+                user_id,
+                ..
+            } => {
+                assert_eq!(*journaled_tif, tif);
+                assert_eq!(*user_id, user);
+            }
+            other => panic!("expected AddOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_submit_add_order_defaults_to_gtc_and_zero_user() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        book.submit_add_order(
+            "BTC-20240329-50000-C",
+            OrderId::sequential(1),
+            Side::Buy,
+            100,
+            10,
+        )
+        .expect("submit");
+
+        let events = journal.read_from(0).expect("read journal");
+        match &events[0].command {
+            OptionChainCommand::AddOrder { tif, user_id, .. } => {
+                assert_eq!(*tif, TimeInForce::Gtc);
+                assert_eq!(*user_id, Hash32::zero());
+            }
+            other => panic!("expected AddOrder, got {other:?}"),
+        }
+
+        // And they materialize on the wire as "GTC" + the zero hex string.
+        let value = serde_json::to_value(&events[0]).expect("serialize event");
+        assert_eq!(
+            value["command"]["AddOrder"]["tif"],
+            serde_json::json!("GTC")
+        );
+        assert_eq!(
+            value["command"]["AddOrder"]["user_id"],
+            serde_json::json!(Hash32::zero().to_hex())
+        );
+    }
+
+    #[test]
+    fn test_add_order_old_wire_decodes_with_gtc_and_zero_user_defaults() {
+        // A pre-#148 AddOrder command has no tif / user_id fields. It must decode
+        // to the good-till-cancelled, zero-user defaults so old journals replay
+        // identically.
+        let old_wire = r#"{ "AddOrder": {
+            "symbol": "BTC-20240329-50000-C",
+            "order_id": "1",
+            "side": "BUY",
+            "price": 100,
+            "quantity": 10
+        } }"#;
+        let command: OptionChainCommand =
+            serde_json::from_str(old_wire).expect("old AddOrder wire must decode");
+        match command {
+            OptionChainCommand::AddOrder { tif, user_id, .. } => {
+                assert_eq!(tif, TimeInForce::Gtc);
+                assert_eq!(user_id, Hash32::zero());
+            }
+            other => panic!("expected AddOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_order_added_carries_trade_when_add_fills() {
+        // The fixture seeds a resting call sell@110 qty5; a marketable buy@110
+        // crosses it and executes a fill, so OrderAdded carries the trade.
+        let (book, _, symbol) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 110, 5)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::OrderAdded { trade, .. } => {
+                let trade = trade.as_ref().expect("a crossing add must carry fills");
+                assert!(
+                    !trade.match_result.trades().is_empty(),
+                    "trade payload must record at least one fill"
+                );
+            }
+            other => panic!("expected OrderAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_order_added_trade_none_when_add_rests() {
+        // A buy@95 sits below the resting sell@110, so it rests without crossing
+        // and OrderAdded carries no trade.
+        let (book, _, symbol) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 95, 5)
+            .expect("submit");
+        assert!(matches!(
+            receipt.result,
+            OptionChainResult::OrderAdded { trade: None, .. }
+        ));
+    }
+
+    // ── Submit: replace order (#148) ─────────────────────────────────────
+
+    #[test]
+    fn test_submit_replace_order_success_returns_order_replaced() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        let symbol = "BTC-20240329-50000-C";
+        let oid = OrderId::sequential(1);
+        book.submit_add_order(symbol, oid, Side::Buy, 100, 10)
+            .expect("seed add");
+
+        let receipt = book
+            .submit_replace_order(symbol, oid, 105, 7, Side::Buy)
+            .expect("submit replace");
+        match &receipt.result {
+            OptionChainResult::OrderReplaced { order_id } => assert_eq!(*order_id, oid),
+            other => panic!("expected OrderReplaced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_submit_replace_order_book_not_found() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        // A valid, well-formed symbol whose book was never created: replace uses
+        // the non-creating resolver, so it reports BookNotFound.
+        let receipt = book
+            .submit_replace_order(
+                "BTC-20240329-50000-C",
+                OrderId::sequential(1),
+                105,
+                7,
+                Side::Buy,
+            )
+            .expect("submit");
+        assert!(matches!(
+            receipt.result,
+            OptionChainResult::BookNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn test_submit_replace_order_unknown_order_rejected_deterministically() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        let symbol = "BTC-20240329-50000-C";
+        // The book exists (one resting order), but the replaced id is not resting.
+        book.submit_add_order(symbol, OrderId::sequential(1), Side::Buy, 100, 10)
+            .expect("seed");
+
+        let unknown = OrderId::sequential(999);
+        let receipt = book
+            .submit_replace_order(symbol, unknown, 105, 7, Side::Buy)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(
+                    reason.contains("order not found"),
+                    "reason should name the missing order, got {reason:?}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_submit_replace_order_does_not_vivify_expiration_or_strike() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        assert_eq!(book.expiration_count(), 0);
+
+        let receipt = book
+            .submit_replace_order(
+                "BTC-20240329-50000-C",
+                OrderId::sequential(1),
+                105,
+                7,
+                Side::Buy,
+            )
+            .expect("submit");
+        assert!(matches!(
+            receipt.result,
+            OptionChainResult::BookNotFound { .. }
+        ));
+        // The non-creating resolution left the hierarchy untouched — no expiration
+        // or strike was materialized by the replace.
+        assert_eq!(book.expiration_count(), 0);
+        assert_eq!(book.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_submit_replace_order_underlying_mismatch_rejected() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        // An ETH symbol against a BTC book is a cross-underlying command, rejected
+        // with the typed reason before any book resolution.
+        let receipt = book
+            .submit_replace_order(
+                "ETH-20240329-50000-C",
+                OrderId::sequential(1),
+                105,
+                7,
+                Side::Buy,
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::Rejected { reason } => {
+                assert!(
+                    reason.contains("ETH") || reason.contains("BTC"),
+                    "reason should name the mismatched underlyings, got {reason:?}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     // ── Submit: cancel order ─────────────────────────────────────────────
