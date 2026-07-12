@@ -15,7 +15,7 @@ use orderbook_rs::{
     Clock, DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId,
     OrderStateTracker, OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
 };
-use pricelevel::{Hash32, MatchResult, Price, Quantity, TimestampMs};
+use pricelevel::{Hash32, MatchResult, OrderUpdate, Price, Quantity, TimestampMs};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -338,6 +338,11 @@ pub struct OptionOrderBook {
     ///
     /// `None` when state tracking is disabled via `BookConfig`.
     terminal_counters: Option<Arc<TerminalCounters>>,
+    /// Crate-side maximum order price (smallest price units); orders priced
+    /// above are rejected before reaching the engine. The upstream engine has
+    /// no price-bound hook, so this bound cannot be delegated and is enforced
+    /// here. `None` disables the bound.
+    max_price: Option<u128>,
 }
 
 impl OptionOrderBook {
@@ -367,6 +372,12 @@ impl OptionOrderBook {
         if let Some(ref validation) = config.validation {
             Self::apply_validation(&mut book, validation);
         }
+        // The max-price bound is enforced crate-side (no engine hook), so keep a
+        // copy on the book rather than delegating it to the inner order book.
+        let max_price = config
+            .validation
+            .as_ref()
+            .and_then(ValidationConfig::max_price);
         if let Some(schedule) = config.fee_schedule {
             book.set_fee_schedule(Some(schedule));
         }
@@ -452,6 +463,7 @@ impl OptionOrderBook {
             last_trade_result: capture,
             trade_capture_armed: armed,
             terminal_counters,
+            max_price,
         }
     }
 
@@ -559,6 +571,9 @@ impl OptionOrderBook {
         if let Some(max) = config.max_order_size() {
             book.set_max_order_size(max);
         }
+        // `max_price` is intentionally NOT delegated to the engine: `orderbook_rs`
+        // exposes no price-bound setter, so the bound is stored on the leaf and
+        // enforced crate-side in `check_max_price`.
     }
 
     /// Returns the current validation configuration read back from the underlying book,
@@ -577,6 +592,12 @@ impl OptionOrderBook {
         }
         if let Some(max) = self.book.max_order_size() {
             config = config.with_max_order_size(max);
+        }
+        // The price bound lives on the leaf, not the engine, so merge it back in
+        // before the emptiness check so a book configured with only a max_price
+        // still reports its config.
+        if let Some(bound) = self.max_price {
+            config = config.with_max_price(bound);
         }
         if config.is_empty() {
             None
@@ -729,6 +750,39 @@ impl OptionOrderBook {
     #[inline]
     pub fn is_trade_capture_armed(&self) -> bool {
         self.trade_capture_armed.load(Ordering::Relaxed)
+    }
+
+    /// Consumes and returns the captured trade result, emptying the slot.
+    ///
+    /// Unlike [`last_trade_result`](Self::last_trade_result), which clones and
+    /// leaves the value in place, this is a read-once venue-poll primitive: it
+    /// takes the captured [`TradeResult`] out and leaves the slot empty, so a
+    /// subsequent call returns `None` until the next armed match writes a new
+    /// value. The slot is single-value and last-write-wins (see
+    /// [`last_trade_result`](Self::last_trade_result) for the concurrency
+    /// caveats); this take does not disarm capture.
+    #[must_use]
+    pub fn take_trade_result(&self) -> Option<TradeResult> {
+        self.last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Empties the trade-capture slot without disarming capture.
+    ///
+    /// Clears any value left by an earlier armed match so the next
+    /// [`last_trade_result`](Self::last_trade_result) /
+    /// [`take_trade_result`](Self::take_trade_result) reflects only matches that
+    /// occur after this call. Capture stays armed if it was armed — this is
+    /// distinct from [`arm_trade_capture(false)`](Self::arm_trade_capture), which
+    /// disarms future capture but does NOT clear the slot.
+    pub fn clear_trade_capture(&self) {
+        let mut guard = self
+            .last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
     }
 
     /// Returns the current lifecycle status of this instrument.
@@ -953,6 +1007,32 @@ impl OptionOrderBook {
         }
     }
 
+    /// Rejects an order priced above the crate-side `max_price` bound.
+    ///
+    /// The happy path (no bound, or price within the bound) is allocation-free;
+    /// the error construction is offloaded to a `#[cold]` helper so the check
+    /// stays branch-predictable on the submission hot path.
+    #[inline]
+    fn check_max_price(&self, price: u128) -> Result<()> {
+        if let Some(bound) = self.max_price
+            && price > bound
+        {
+            return Err(self.max_price_exceeded(price, bound));
+        }
+        Ok(())
+    }
+
+    /// Builds the `max_price` violation error. Cold + un-inlined so the common
+    /// in-bounds path carries none of the formatting code.
+    #[cold]
+    #[inline(never)]
+    fn max_price_exceeded(&self, price: u128, bound: u128) -> Error {
+        Error::validation(format!(
+            "price {price} exceeds max_price {bound} for {}",
+            self.symbol
+        ))
+    }
+
     /// Adds a limit order to the book.
     ///
     /// # Arguments
@@ -964,8 +1044,10 @@ impl OptionOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
-    /// [`Active`](InstrumentStatus::Active).
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     pub fn add_limit_order(
         &self,
         order_id: OrderId,
@@ -974,6 +1056,7 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<()> {
         self.check_active()?;
+        self.check_max_price(price)?;
         self.book
             .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
         Ok(())
@@ -991,8 +1074,10 @@ impl OptionOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
-    /// [`Active`](InstrumentStatus::Active).
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     pub fn add_limit_order_with_tif(
         &self,
         order_id: OrderId,
@@ -1002,6 +1087,7 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<()> {
         self.check_active()?;
+        self.check_max_price(price)?;
         self.book
             .add_limit_order(order_id, price, quantity, side, tif, None)?;
         Ok(())
@@ -1024,6 +1110,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (e.g., `MissingUserId` when STP is enabled and `user_id` is zero).
     pub fn add_limit_order_with_user(
@@ -1035,6 +1123,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<()> {
         self.check_active()?;
+        self.check_max_price(price)?;
         self.book.add_limit_order_with_user(
             order_id,
             price,
@@ -1064,6 +1153,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_tif_and_user(
         &self,
@@ -1075,6 +1166,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<()> {
         self.check_active()?;
+        self.check_max_price(price)?;
         self.book
             .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
         Ok(())
@@ -1117,6 +1209,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     ///
     /// On an error-after-fills path (an unfillable IOC remainder, or a
@@ -1132,6 +1226,7 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        self.check_max_price(price)?;
         let (_order, trade) = self.book.add_limit_order_with_result(
             order_id,
             price,
@@ -1153,6 +1248,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_full(
@@ -1164,6 +1261,7 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        self.check_max_price(price)?;
         let (_order, trade) = self
             .book
             .add_limit_order_with_result(order_id, price, quantity, side, tif, None)?;
@@ -1180,6 +1278,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_user_full(
@@ -1191,6 +1291,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        self.check_max_price(price)?;
         let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id,
             price,
@@ -1214,6 +1315,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_and_user_full(
@@ -1226,6 +1329,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
+        self.check_max_price(price)?;
         let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id, price, quantity, side, tif, user_id, None,
         )?;
@@ -1255,6 +1359,67 @@ impl OptionOrderBook {
         // `false` (not a false success), and a real error must surface (not be
         // swallowed as a benign not-found).
         match self.book.cancel_order(order_id) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Atomically replaces a resting order's price, quantity, and side.
+    ///
+    /// Delegates to the engine's validate-first [`OrderUpdate::Replace`]: the
+    /// replacement's shape, the modify-aware risk check, and the self-trade
+    /// self-cross check all run **before** the original is cancelled, so on any
+    /// rejection the original order stays resting untouched (no book mutation,
+    /// no events, no trades). Only after both checks pass is the original
+    /// cancelled and the replacement added.
+    ///
+    /// The replacement is a brand-new order: **queue priority is lost** (the
+    /// replacement goes to the back of its price level). If the new price
+    /// crosses the book, the replacement may rematch and fill immediately;
+    /// those fills reach only the installed trade listener (and thus the NATS
+    /// publisher / order-state tracker), **never this return value** — this call
+    /// reports placement, not fills.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the resting order to replace
+    /// * `price` - New limit price in smallest units (u128)
+    /// * `quantity` - New quantity in smallest units (u64)
+    /// * `side` - New side (Buy or Sell); a flip moves the order across the book
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the order was found and replaced, `Ok(false)` if no order
+    /// with that ID was resting on the book.
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
+    ///   configured `max_price` bound.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream engine rejects the
+    ///   replacement (e.g. a tick/lot shape violation or a risk/STP rejection);
+    ///   on any such rejection the original order survives.
+    pub fn replace_order(
+        &self,
+        order_id: OrderId,
+        price: u128,
+        quantity: u64,
+        side: Side,
+    ) -> Result<bool> {
+        self.check_active()?;
+        self.check_max_price(price)?;
+        // Map the engine's validate-first replace like `cancel_order`: Some =>
+        // replaced, None => the order was not resting, Err => a real engine
+        // rejection (with the original left untouched).
+        match self.book.update_order(OrderUpdate::Replace {
+            order_id,
+            price: Price::new(price),
+            quantity: Quantity::new(quantity),
+            side,
+        }) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => Err(e.into()),
@@ -4074,5 +4239,338 @@ mod tests {
             book_change_count.load(Ordering::Relaxed) >= 1,
             "book-change listener must fire on price-level changes"
         );
+    }
+
+    // ── max_price leaf enforcement ──────────────────────────────────────
+
+    /// Builds a book whose only validation rule is a `max_price` bound.
+    fn max_price_book(bound: u128) -> OptionOrderBook {
+        OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(ValidationConfig::new().with_max_price(bound)),
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn test_max_price_add_above_bound_rejected_all_eight_paths() {
+        const BOUND: u128 = 1_000;
+        const ABOVE: u128 = 1_001;
+        let user = Hash32::from([3u8; 32]);
+        let book = max_price_book(BOUND);
+
+        // Every add entry point must apply the crate-side bound. Normalize each
+        // return type to `Result<()>` so the eight paths can be checked uniformly.
+        let results: Vec<Result<()>> = vec![
+            book.add_limit_order(OrderId::new(), Side::Buy, ABOVE, 10),
+            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, ABOVE, 10, TimeInForce::Gtc),
+            book.add_limit_order_with_user(OrderId::new(), Side::Buy, ABOVE, 10, user),
+            book.add_limit_order_with_tif_and_user(
+                OrderId::new(),
+                Side::Buy,
+                ABOVE,
+                10,
+                TimeInForce::Gtc,
+                user,
+            ),
+            book.add_limit_order_full(OrderId::new(), Side::Buy, ABOVE, 10)
+                .map(|_| ()),
+            book.add_limit_order_with_tif_full(
+                OrderId::new(),
+                Side::Buy,
+                ABOVE,
+                10,
+                TimeInForce::Gtc,
+            )
+            .map(|_| ()),
+            book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, ABOVE, 10, user)
+                .map(|_| ()),
+            book.add_limit_order_with_tif_and_user_full(
+                OrderId::new(),
+                Side::Buy,
+                ABOVE,
+                10,
+                TimeInForce::Gtc,
+                user,
+            )
+            .map(|_| ()),
+        ];
+
+        assert_eq!(results.len(), 8);
+        for (i, res) in results.into_iter().enumerate() {
+            assert!(
+                matches!(res, Err(Error::ValidationError { .. })),
+                "add path {i} must reject an above-bound price with ValidationError"
+            );
+        }
+        // No above-bound order ever reached the engine.
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_max_price_add_at_bound_accepted() {
+        const BOUND: u128 = 1_000;
+        let book = max_price_book(BOUND);
+        // The bound is inclusive: a price exactly at the bound is accepted.
+        let res = book.add_limit_order(OrderId::new(), Side::Buy, BOUND, 10);
+        assert!(res.is_ok(), "price at the bound must be accepted: {res:?}");
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_max_price_unset_never_rejects() {
+        // No max_price configured: even an extreme price is admitted (subject to
+        // the engine's own checks, of which there are none here).
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let res = book.add_limit_order(OrderId::new(), Side::Buy, u128::MAX, 10);
+        assert!(
+            res.is_ok(),
+            "no bound means no crate-side price rejection: {res:?}"
+        );
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_validation_config_readback_merges_max_price() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(
+                    ValidationConfig::new()
+                        .with_tick_size(1)
+                        .with_max_price(5_000),
+                ),
+                ..BookConfig::default()
+            },
+        );
+        let config = book.validation_config().expect("config present");
+        assert_eq!(config.max_price(), Some(5_000));
+        assert_eq!(config.tick_size(), Some(1));
+    }
+
+    #[test]
+    fn test_validation_config_readback_only_max_price_is_some() {
+        // A book configured with ONLY a max_price still reports a non-empty
+        // config, because the readback merges the leaf-held bound before the
+        // emptiness check.
+        let book = max_price_book(2_000);
+        let config = book
+            .validation_config()
+            .expect("config present with only max_price");
+        assert_eq!(config.max_price(), Some(2_000));
+        assert_eq!(config.tick_size(), None);
+    }
+
+    // ── trade-capture take / clear ──────────────────────────────────────
+
+    #[test]
+    fn test_take_trade_result_returns_captured_and_empties_slot() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.arm_trade_capture(true);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("cross buy");
+
+        let first = book.take_trade_result();
+        assert!(
+            first.is_some(),
+            "the crossing match must have been captured"
+        );
+        // The take consumed the slot: a second read is empty until the next match.
+        assert!(book.take_trade_result().is_none());
+    }
+
+    #[test]
+    fn test_take_trade_result_none_when_never_armed() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // A match occurs, but capture was never armed, so nothing is recorded.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("cross buy");
+        assert!(book.take_trade_result().is_none());
+    }
+
+    #[test]
+    fn test_clear_trade_capture_empties_slot_without_disarming() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.arm_trade_capture(true);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .expect("cross buy");
+        assert!(book.last_trade_result().is_some());
+
+        book.clear_trade_capture();
+        assert!(book.last_trade_result().is_none(), "clear empties the slot");
+        // Clearing does NOT disarm: capture stays on for future matches.
+        assert!(book.is_trade_capture_armed());
+    }
+
+    #[test]
+    fn test_take_trade_result_recovers_from_poisoned_lock() {
+        let book = Arc::new(OptionOrderBook::new(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+        ));
+        // Seed the slot directly with an empty trade result.
+        {
+            let mut guard = book
+                .last_trade_result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(book.empty_trade_result(OrderId::new(), 5));
+        }
+
+        // Poison the capture lock by panicking while holding the guard.
+        let clone = Arc::clone(&book);
+        let handle = std::thread::spawn(move || {
+            let _guard = clone
+                .last_trade_result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("poison the trade-capture lock");
+        });
+        assert!(handle.join().is_err());
+
+        // The take still recovers the seeded value and empties the slot.
+        assert!(book.take_trade_result().is_some());
+        assert!(book.take_trade_result().is_none());
+    }
+
+    // ── replace_order ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_replace_order_moves_price_and_quantity_returns_true() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10).expect("add");
+
+        let res = book.replace_order(id, 105, 20, Side::Buy);
+        assert!(
+            matches!(res, Ok(true)),
+            "replace should report a hit: {res:?}"
+        );
+        assert_eq!(book.best_bid(), Some(105));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_order_unknown_id_returns_false() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let res = book.replace_order(OrderId::new(), 100, 10, Side::Buy);
+        assert!(
+            matches!(res, Ok(false)),
+            "unknown id must be a miss: {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_replace_order_rejected_when_halted_original_untouched() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10).expect("add");
+        book.halt().expect("halt");
+
+        let res = book.replace_order(id, 105, 20, Side::Buy);
+        assert!(
+            matches!(res, Err(Error::InstrumentNotActive { .. })),
+            "replace on a halted book must be rejected: {res:?}"
+        );
+        // The original is untouched (inspectable while halted).
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_order_validate_first_rejection_leaves_original_resting() {
+        // Tick size 10: the original rests at a valid multiple, then the replace
+        // targets a non-multiple price. The engine validates the new shape BEFORE
+        // cancelling, so the original stays resting on the rejection.
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(ValidationConfig::new().with_tick_size(10)),
+                ..BookConfig::default()
+            },
+        );
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add at valid tick");
+
+        let res = book.replace_order(id, 105, 10, Side::Buy);
+        assert!(
+            matches!(res, Err(Error::OrderBookEngine(_))),
+            "a tick-size violation must be rejected by the engine: {res:?}"
+        );
+        // Validate-first: the original survives the rejection untouched.
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_order_to_crossing_price_rematches_and_fills_reach_listener() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Resting sell to cross into, and a resting buy well below it.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 90, 5)
+            .expect("rest buy");
+
+        book.arm_trade_capture(true);
+        // Reprice the buy up to the sell: the replacement rematches and fills.
+        let res = book.replace_order(id, 100, 5, Side::Buy);
+        assert!(
+            matches!(res, Ok(true)),
+            "crossing replace reports a hit: {res:?}"
+        );
+
+        // The fills reached the trade listener (capture slot), NOT this return.
+        let captured = book.take_trade_result();
+        assert!(
+            captured.is_some(),
+            "a crossing replace's fills must reach the trade listener"
+        );
+    }
+
+    #[test]
+    fn test_replace_order_side_flip_moves_order_across_book() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add buy");
+        assert_eq!(book.best_bid(), Some(100));
+        assert!(book.best_ask().is_none());
+
+        // Flip the resting buy into a sell on the other side of the book.
+        let res = book.replace_order(id, 120, 10, Side::Sell);
+        assert!(matches!(res, Ok(true)), "side flip reports a hit: {res:?}");
+        assert!(book.best_bid().is_none());
+        assert_eq!(book.best_ask(), Some(120));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_max_price_enforced_on_replace_order() {
+        let book = max_price_book(1_000);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 500, 10)
+            .expect("add within bound");
+
+        let res = book.replace_order(id, 1_001, 10, Side::Buy);
+        assert!(
+            matches!(res, Err(Error::ValidationError { .. })),
+            "replace above the bound must be rejected crate-side: {res:?}"
+        );
+        // The bound is checked before the engine, so the original is untouched.
+        assert_eq!(book.best_bid(), Some(500));
+        assert_eq!(book.order_count(), 1);
     }
 }

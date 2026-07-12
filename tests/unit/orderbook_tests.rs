@@ -1,6 +1,8 @@
 //! Integration tests for the orderbook module.
 
-use option_chain_orderbook::orderbook::{OptionOrderBook, UnderlyingOrderBookManager};
+use option_chain_orderbook::orderbook::{
+    OptionOrderBook, UnderlyingOrderBookManager, ValidationConfig,
+};
 use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
@@ -209,4 +211,60 @@ fn test_cancel_by_side_across_underlyings() {
     assert_eq!(result.total_cancelled(), 2);
     assert_eq!(result.books_affected(), 2);
     assert_eq!(manager.total_order_count(), 2);
+}
+
+#[test]
+fn test_hierarchy_set_validation_max_price_propagates_to_new_strikes() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+
+    let btc = manager.get_or_create("BTC");
+    // Configure the price bound BEFORE vivifying the expiration/strike so the
+    // new leaf inherits it through the validation propagation path.
+    btc.set_validation(ValidationConfig::new().with_max_price(1_000));
+
+    let exp = btc.get_or_create_expiration(exp_date);
+    let strike = exp.get_or_create_strike(50000);
+
+    // An above-bound add on the freshly vivified leaf is rejected crate-side.
+    let rejected = strike
+        .call()
+        .add_limit_order(OrderId::new(), Side::Buy, 1_001, 10);
+    let err = match rejected {
+        Ok(()) => panic!("above-bound add should be rejected on a propagated leaf"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("max_price"));
+
+    // A within-bound add on the same leaf still succeeds.
+    strike
+        .call()
+        .add_limit_order(OrderId::new(), Side::Buy, 1_000, 10)
+        .unwrap_or_else(|err| panic!("within-bound add failed: {err}"));
+    assert_eq!(strike.call().order_count(), 1);
+}
+
+#[test]
+fn test_replace_order_through_hierarchy_handles() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+
+    let btc = manager.get_or_create("BTC");
+    let exp = btc.get_or_create_expiration(exp_date);
+    let strike = exp.get_or_create_strike(50000);
+
+    let id = OrderId::new();
+    strike
+        .call()
+        .add_limit_order(id, Side::Buy, 100, 10)
+        .unwrap_or_else(|err| panic!("add failed: {err}"));
+
+    // Replace through the strike's call() leaf handle.
+    let replaced = strike
+        .call()
+        .replace_order(id, 110, 20, Side::Buy)
+        .unwrap_or_else(|err| panic!("replace failed: {err}"));
+    assert!(replaced, "replace should report a hit");
+    assert_eq!(strike.call().best_bid(), Some(110));
+    assert_eq!(strike.call().order_count(), 1);
 }

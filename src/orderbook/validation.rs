@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 /// - **Lot size**: quantities must be exact multiples of the lot size
 /// - **Min order size**: orders below this quantity are rejected
 /// - **Max order size**: orders above this quantity are rejected
+/// - **Max price**: orders priced above this bound are rejected crate-side
 ///
 /// All fields default to `None`, which disables the corresponding validation.
 ///
@@ -45,6 +46,10 @@ pub struct ValidationConfig {
     /// Maximum allowed order quantity. Orders with quantity above this value
     /// are rejected. `None` disables maximum size validation.
     max_order_size: Option<u64>,
+    /// Maximum allowed order price in smallest price units; orders priced above
+    /// are rejected crate-side (the upstream engine has no price-bound hook);
+    /// `None` disables.
+    max_price: Option<u128>,
 }
 
 impl ValidationConfig {
@@ -133,6 +138,31 @@ impl ValidationConfig {
         self
     }
 
+    /// Sets the maximum order price (in smallest price units).
+    ///
+    /// Orders priced above `max_price` are rejected crate-side, because the
+    /// upstream matching engine has no price-bound hook to delegate to.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_price` - Maximum allowed order price in smallest price units
+    ///
+    /// # Footgun
+    ///
+    /// This setter is infallible. Setting `Some(0)` rejects every order (no
+    /// price is `<= 0`); to disable the price bound leave it unset (`None`), and
+    /// call [`validate`](Self::validate) to reject a zero bound as an error.
+    ///
+    /// A finite price bound also lets venues prove upstream fee saturation
+    /// unreachable (see orderbook-rs `FeeSchedule::max_guaranteed_exact_notional_for_bps`,
+    /// available from 0.10.4).
+    #[must_use]
+    #[inline]
+    pub const fn with_max_price(mut self, max_price: u128) -> Self {
+        self.max_price = Some(max_price);
+        self
+    }
+
     /// Returns the configured tick size, if any.
     #[must_use]
     #[inline]
@@ -161,6 +191,13 @@ impl ValidationConfig {
         self.max_order_size
     }
 
+    /// Returns the configured maximum order price, if any.
+    #[must_use]
+    #[inline]
+    pub const fn max_price(&self) -> Option<u128> {
+        self.max_price
+    }
+
     /// Returns `true` if no validation rules are configured.
     #[must_use]
     #[inline]
@@ -169,6 +206,7 @@ impl ValidationConfig {
             && self.lot_size.is_none()
             && self.min_order_size.is_none()
             && self.max_order_size.is_none()
+            && self.max_price.is_none()
     }
 
     /// Validates the configured rules, rejecting structurally-broken settings.
@@ -186,6 +224,7 @@ impl ValidationConfig {
     /// - `tick_size` is set to zero
     /// - `lot_size` is set to zero
     /// - `min_order_size` is set to zero
+    /// - `max_price` is set to zero
     /// - both `min_order_size` and `max_order_size` are set and
     ///   `max_order_size < min_order_size`
     pub fn validate(&self) -> Result<()> {
@@ -202,6 +241,11 @@ impl ValidationConfig {
         if self.min_order_size == Some(0) {
             return Err(Error::configuration(
                 "min_order_size must be at least 1 (got 0); leave it unset to disable minimum-size validation",
+            ));
+        }
+        if self.max_price == Some(0) {
+            return Err(Error::configuration(
+                "max_price must be at least 1 (got 0); leave it unset to disable the price bound",
             ));
         }
         if let (Some(min), Some(max)) = (self.min_order_size, self.max_order_size)
@@ -245,6 +289,13 @@ impl std::fmt::Display for ValidationConfig {
                 write!(f, ", ")?;
             }
             write!(f, "max={max}")?;
+            first = false;
+        }
+        if let Some(max_price) = self.max_price {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "max_price={max_price}")?;
         }
         write!(f, ")")
     }
@@ -392,5 +443,48 @@ mod tests {
         // A max with no min is a valid one-sided window.
         let config = ValidationConfig::new().with_max_order_size(500);
         assert!(config.validate().is_ok());
+    }
+
+    // ========== ValidationConfig::max_price tests ==========
+
+    #[test]
+    fn test_validation_config_with_max_price_builder() {
+        let config = ValidationConfig::new().with_max_price(1_000_000);
+        assert_eq!(config.max_price(), Some(1_000_000));
+    }
+
+    #[test]
+    fn test_validation_config_is_empty_false_with_only_max_price() {
+        let config = ValidationConfig::new().with_max_price(500);
+        assert!(!config.is_empty());
+        assert_eq!(config.tick_size(), None);
+        assert_eq!(config.max_order_size(), None);
+    }
+
+    #[test]
+    fn test_validation_config_validate_zero_max_price_rejected() {
+        let config = ValidationConfig::new().with_max_price(0);
+        let err = match config.validate() {
+            Ok(()) => panic!("expected zero max_price to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("max_price"));
+        assert!(err.to_string().contains('0'));
+    }
+
+    #[test]
+    fn test_validation_config_validate_max_price_set_ok() {
+        let config = ValidationConfig::new().with_max_price(1_000_000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_config_display_includes_max_price() {
+        let config = ValidationConfig::new()
+            .with_tick_size(100)
+            .with_max_price(999);
+        let display = format!("{config}");
+        assert!(display.contains("tick=100"));
+        assert!(display.contains("max_price=999"));
     }
 }
