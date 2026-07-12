@@ -246,6 +246,16 @@ impl ExpirationOrderBook {
         self.chain.set_clock(clock);
     }
 
+    /// Clears the injected engine clock, so future option books fall back to
+    /// the upstream default `MonotonicClock`.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::clear_clock`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.chain.clear_clock();
+    }
+
     /// Returns the current engine clock, or `None` when future books use the
     /// upstream default `MonotonicClock`.
     #[must_use]

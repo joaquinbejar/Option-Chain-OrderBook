@@ -835,8 +835,21 @@ impl SequencedUnderlyingOrderBook {
     /// [`StubClock`](orderbook_rs::StubClock) constructed with the same
     /// start and step as the live instance — before its journal prefix is
     /// replayed. The `Arc<dyn Clock>` is shared, not deep-cloned.
+    ///
+    /// This call takes the same serialization gate as
+    /// [`submit`](Self::submit), so it is linearized against the sequenced
+    /// command stream: every command either fully precedes or fully follows
+    /// the clock change, and which clock a lazily vivified leaf receives is
+    /// well-defined relative to the journal order. Note that until the
+    /// journaled `AddOrder` command carries a time-in-force (tracked in
+    /// issue #148), `Gtc` is hardcoded on the sequenced add path and the
+    /// injected clock affects only order timestamps — not admission — for
+    /// commands flowing through `submit`.
     #[inline]
     pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        // Linearize the config change against submit/replay so a racing
+        // command deterministically sees either the old or the new clock.
+        let _serialized = self.sequencer.acquire_gate();
         self.inner.set_clock(clock);
     }
 
@@ -1582,6 +1595,14 @@ impl SequencedUnderlyingOrderBook {
     /// section. A submit therefore never observes a half-rebuilt hierarchy, and
     /// replay never races the sequence advance. Never call `submit` from within
     /// `replay` or vice versa (both take the same gate, which would deadlock).
+    ///
+    /// The gate guarantees safety, not reproducibility, for replays on a live
+    /// instance: replaying into a book that already holds state or is
+    /// concurrently receiving submits is well-formed but yields an outcome
+    /// that depends on where the replay lands in the submit stream. The
+    /// deterministic contract — the one the replay-equals-live oracle tests —
+    /// is replaying a journal prefix into a *fresh*, identically-configured
+    /// (and identically-clocked) instance.
     ///
     /// Each event's command is re-executed against the underlying order book.
     /// Replay re-runs the `AddOrder` / `CancelOrder` / `MassCancel` stream

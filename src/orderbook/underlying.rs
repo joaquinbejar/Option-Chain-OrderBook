@@ -467,6 +467,16 @@ impl UnderlyingOrderBook {
         self.expirations.set_clock(clock);
     }
 
+    /// Clears the injected engine clock, so future option books fall back to
+    /// the upstream default `MonotonicClock`.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::clear_clock`]. Existing
+    /// books are not affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.expirations.clear_clock();
+    }
+
     /// Returns the current engine clock, or `None` when future books use the
     /// upstream default `MonotonicClock`.
     #[must_use]
