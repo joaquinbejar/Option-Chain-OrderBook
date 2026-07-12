@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
+use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
@@ -235,6 +235,23 @@ impl ExpirationOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.chain.fee_schedule()
+    }
+
+    /// Sets the engine clock for all future option books created within this expiration.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::set_clock`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.chain.set_clock(clock);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.chain.clock()
     }
 
     /// Propagates the per-contract NATS listener factory down to this
@@ -626,6 +643,10 @@ pub struct ExpirationOrderBookManager {
     stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created expiration books.
     fee_schedule: Shared<Option<FeeSchedule>>,
+    /// Engine clock propagated to newly created expiration books. `None` keeps
+    /// the upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
+    /// time-in-force admission deterministic for replay.
+    clock: Shared<Option<Arc<dyn Clock>>>,
     /// Per-contract NATS listener factory propagated to newly created
     /// expiration books (and onward to their strikes). `None` (the default)
     /// reproduces the non-NATS path exactly.
@@ -650,6 +671,7 @@ impl ExpirationOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -679,6 +701,7 @@ impl ExpirationOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -706,6 +729,7 @@ impl ExpirationOrderBookManager {
             symbol_index: Some(symbol_index),
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -778,6 +802,37 @@ impl ExpirationOrderBookManager {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
+    }
+
+    /// Sets the engine clock for all future expiration books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will have this clock propagated
+    /// down to their chains and strikes. The `Arc<dyn Clock>` is shared, not
+    /// deep-cloned, so every future option book stamps orders from the same
+    /// clock — inject a `StubClock` to make time-in-force admission
+    /// deterministic for replay.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.clock.set(Some(clock));
+    }
+
+    /// Clears the engine clock so future expiration books use the upstream
+    /// default `MonotonicClock` (wall-clock time).
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.clock.set(None);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.clock.get()
     }
 
     /// Stores the per-contract NATS listener factory propagated from the top of
@@ -891,6 +946,9 @@ impl ExpirationOrderBookManager {
         }
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
+        }
+        if let Some(clock) = self.clock.get() {
+            fresh.set_clock(clock);
         }
         // Propagate the per-contract NATS factory down to the fresh chain/strike
         // manager BEFORE publishing, so the configured-before-visible invariant

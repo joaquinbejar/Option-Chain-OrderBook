@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::utils::checked_accumulate;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
+use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -455,6 +455,24 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.expirations.fee_schedule()
+    }
+
+    /// Sets the engine clock for future expirations created within this underlying.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_clock`]. Only expirations
+    /// created after this call inherit the clock; existing expirations and
+    /// their strikes are not affected.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.expirations.set_clock(clock);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.expirations.clock()
     }
 
     /// Propagates the per-contract NATS listener factory down to this
@@ -1106,6 +1124,10 @@ pub struct UnderlyingOrderBookManager {
     stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created underlying books.
     fee_schedule: Shared<Option<FeeSchedule>>,
+    /// Engine clock propagated to newly created underlying books. `None` keeps
+    /// the upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
+    /// time-in-force admission deterministic for replay.
+    clock: Shared<Option<Arc<dyn Clock>>>,
     /// Per-contract NATS listener factory propagated to every underlying book
     /// (and onward to its expirations and strikes). Configured via
     /// [`with_nats_factory`](UnderlyingOrderBookManager::with_nats_factory);
@@ -1134,6 +1156,7 @@ impl UnderlyingOrderBookManager {
             symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1156,6 +1179,7 @@ impl UnderlyingOrderBookManager {
             symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1231,6 +1255,9 @@ impl UnderlyingOrderBookManager {
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
         }
+        if let Some(clock) = self.clock.get() {
+            fresh.set_clock(clock);
+        }
         // Propagate the per-contract NATS factory down the fresh subtree BEFORE
         // publishing so it is configured-before-visible. Only when a factory is
         // configured, keeping the no-factory path identical.
@@ -1282,6 +1309,37 @@ impl UnderlyingOrderBookManager {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
+    }
+
+    /// Sets the engine clock for all future underlying books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will have this clock propagated
+    /// down to their expirations, chains, and strikes. The `Arc<dyn Clock>` is
+    /// shared, not deep-cloned, so every future option book stamps orders from
+    /// the same clock — inject a `StubClock` to make time-in-force admission
+    /// deterministic for replay.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.clock.set(Some(clock));
+    }
+
+    /// Clears the engine clock so future underlying books use the upstream
+    /// default `MonotonicClock` (wall-clock time).
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.clock.set(None);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.clock.get()
     }
 
     /// Returns a reference to the symbol index.
@@ -2134,6 +2192,38 @@ mod tests {
             .cancel_all_across_underlyings()
             .expect("global cancel");
         assert_eq!(global_result.books_affected(), expected);
+    }
+
+    #[test]
+    fn test_underlying_manager_set_clock_propagates_to_vivified_leaf() {
+        use orderbook_rs::{StubClock, TimeInForce};
+
+        // A GTD deadline (Unix ms) a fresh `StubClock` near 0 admits, but the
+        // wall-clock default rejects on admission.
+        const GTD_ADMIT_DEADLINE: u64 = 10_000;
+
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+
+        // Walk the full hierarchy the manager vivifies after the clock is set:
+        // underlying -> expiration -> chain -> strike -> leaf.
+        let leaf = manager
+            .get_or_create("BTC")
+            .get_or_create_expiration(test_expiration())
+            .get_or_create_strike(50000);
+
+        let admitted = leaf.call().add_limit_order_with_tif(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+        );
+        assert!(
+            admitted.is_ok(),
+            "leaf vivified after manager.set_clock stamps orders from the stub and admits the GTD: {admitted:?}"
+        );
+        assert_eq!(leaf.call().order_count(), 1);
     }
 
     #[test]

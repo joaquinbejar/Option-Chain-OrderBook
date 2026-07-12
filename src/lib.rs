@@ -324,7 +324,7 @@ pub use error::{Error, Result};
 // from `orderbook_rs` / `pricelevel`.
 pub use orderbook::{
     AggregatedGreeks, CancelReason, ChainEvictExpiredResult, ChainMassCancelResult, CleanupResult,
-    ContractSpecs, ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback,
+    Clock, ContractSpecs, ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback,
     ExpirationEvictExpiredResult, ExpirationManagerStats, ExpirationMassCancelResult,
     ExpirationOrderBook, ExpirationOrderBookManager, ExpiryCycleConfig, ExpiryLifecycleManager,
     ExpiryScheduler, ExpiryType, FeeSchedule, FlatVolSurface, GlobalEvictExpiredResult,
@@ -332,15 +332,15 @@ pub use orderbook::{
     GreeksUpdate, GreeksUpdateListener, Hash32, IndexPriceFeed, InstrumentInfo, InstrumentRegistry,
     InstrumentStatus, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
     MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MassCancelResult, MockPriceFeed,
-    OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats, OptionOrderBook, OrderId,
-    OrderStateTracker, OrderStatus, OrderType, Position, Price, PriceUpdate, PriceUpdateListener,
-    Quantity, Quote, QuoteUpdate, RefreshResult, STPMode, SettlementType, Side, StaticPriceFeed,
-    StrikeEvictExpiredResult, StrikeGenerator, StrikeMassCancelResult, StrikeOrderBook,
-    StrikeOrderBookManager, StrikeRangeConfig, StrikeRangeConfigBuilder, SubscriptionId,
-    SymbolIndex, SymbolRef, TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult,
-    UnderlyingEvictExpiredResult, UnderlyingMassCancelResult, UnderlyingOrderBook,
-    UnderlyingOrderBookManager, UnderlyingStats, ValidationConfig, VolSurface, calculate_tte_years,
-    wire_feed_to_calculator,
+    MonotonicClock, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
+    OptionOrderBook, OrderId, OrderStateTracker, OrderStatus, OrderType, Position, Price,
+    PriceUpdate, PriceUpdateListener, Quantity, Quote, QuoteUpdate, RefreshResult, STPMode,
+    SettlementType, Side, StaticPriceFeed, StrikeEvictExpiredResult, StrikeGenerator,
+    StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager, StrikeRangeConfig,
+    StrikeRangeConfigBuilder, StubClock, SubscriptionId, SymbolIndex, SymbolRef,
+    TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingEvictExpiredResult,
+    UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
+    ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
 };
 
 #[cfg(feature = "nats")]

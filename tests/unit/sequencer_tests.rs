@@ -39,7 +39,7 @@ use option_chain_orderbook::orderbook::{
     MassCancelType, OptionChainJournal, OptionOrderBook, SequencedUnderlyingOrderBook, SymbolIndex,
 };
 use optionstratlib::OptionStyle;
-use orderbook_rs::{OrderId, Side};
+use orderbook_rs::{Clock, OrderId, Side, StubClock, TimeInForce};
 use std::sync::Arc;
 
 // ── Deterministic test inputs ──────────────────────────────────────────────
@@ -669,5 +669,98 @@ fn test_submit_concurrent_replay_equals_live_full_state_oracle() {
         live_snapshot,
         snapshot(&replay),
         "replayed state must equal live state after a concurrent load"
+    );
+}
+
+// ── Injected clock: leaf vivification + replay determinism ──────────────────
+
+// A GTD deadline (Unix ms) a fresh `StubClock` near 0 admits, but the wall-clock
+// default rejects on admission.
+const GTD_ADMIT_DEADLINE: u64 = 10_000;
+
+/// Resolves the call leaf for `symbol` inside a sequenced book, or `None` if the
+/// hierarchy has not vivified it yet.
+fn call_leaf(
+    book: &SequencedUnderlyingOrderBook,
+    symbol: &str,
+) -> Option<Arc<option_chain_orderbook::orderbook::StrikeOrderBook>> {
+    let parsed = SymbolParser::parse(symbol).expect("parse symbol");
+    let exp = book.underlying().get_expiration(parsed.expiration()).ok()?;
+    exp.get_strike(parsed.strike()).ok()
+}
+
+#[test]
+fn test_sequenced_set_clock_applies_to_leaves_vivified_by_submit() {
+    // The sequencer's `AddOrder` is Gtc-hardcoded today, so the injected clock is
+    // observable through TIF admission on a leaf vivified BY a submit: set the
+    // stub clock, submit a (Gtc) order that vivifies the leaf, then add a GTD
+    // directly on the leaf handle. Under the stub the GTD is admitted; the
+    // control without an injected clock rejects it against the wall clock.
+    let symbol = "BTC-20240329-50000-C";
+
+    let with_clock = SequencedUnderlyingOrderBook::new("BTC");
+    with_clock.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    with_clock
+        .submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf under the stub clock");
+
+    let leaf = call_leaf(&with_clock, symbol).expect("leaf vivified by submit");
+    let admitted = leaf.call().add_limit_order_with_tif(
+        oid(2),
+        Side::Buy,
+        99,
+        5,
+        TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+    );
+    assert!(
+        admitted.is_ok(),
+        "GTD admitted on a leaf vivified after set_clock: {admitted:?}"
+    );
+
+    // Control: no injected clock, so the leaf keeps the wall clock and rejects.
+    let without_clock = SequencedUnderlyingOrderBook::new("BTC");
+    without_clock
+        .submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf under the default clock");
+    let control_leaf = call_leaf(&without_clock, symbol).expect("control leaf vivified");
+    let rejected = control_leaf.call().add_limit_order_with_tif(
+        oid(2),
+        Side::Buy,
+        99,
+        5,
+        TimeInForce::Gtd(GTD_ADMIT_DEADLINE),
+    );
+    assert!(
+        rejected.is_err(),
+        "GTD rejected on a leaf using the default wall clock"
+    );
+}
+
+#[test]
+fn test_replay_with_injected_stub_clock_equals_live() {
+    // Injecting a fresh `StubClock` into BOTH the live and the replay instance
+    // before driving / replaying must preserve the full-state oracle equality:
+    // a deterministic clock keeps replay byte-identical to live. Each instance
+    // gets its OWN fresh `StubClock` with the same start/step so their logical
+    // time streams behave identically.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+
+    let live = fresh_book(&journal);
+    live.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    let submitted = drive_command_prefix(&live);
+    let live_snapshot = snapshot(&live);
+
+    let replay = fresh_book(&journal);
+    replay.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    let replayed = replay.replay(0).expect("replay under injected stub clock");
+    assert_eq!(
+        replayed, submitted,
+        "replay must re-run every journaled command"
+    );
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed state under a fresh StubClock must equal live state under its own fresh StubClock"
     );
 }

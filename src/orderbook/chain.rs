@@ -15,7 +15,7 @@ use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
+use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,6 +243,23 @@ impl OptionChainOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.strikes.fee_schedule()
+    }
+
+    /// Sets the engine clock for all future option books created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_clock`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.strikes.set_clock(clock);
+    }
+
+    /// Returns the current engine clock, or `None` when future books use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.strikes.clock()
     }
 
     /// Propagates the per-contract NATS listener factory down to the strike
@@ -906,6 +923,10 @@ pub struct OptionChainOrderBookManager {
     stp_mode: Shared<STPMode>,
     /// Fee schedule propagated to newly created chains.
     fee_schedule: Shared<Option<FeeSchedule>>,
+    /// Engine clock propagated to newly created chains. `None` keeps the
+    /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
+    /// time-in-force admission deterministic for replay.
+    clock: Shared<Option<Arc<dyn Clock>>>,
 }
 
 impl OptionChainOrderBookManager {
@@ -925,6 +946,7 @@ impl OptionChainOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
         }
     }
 
@@ -952,6 +974,7 @@ impl OptionChainOrderBookManager {
             symbol_index: None,
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
         }
     }
 
@@ -988,6 +1011,7 @@ impl OptionChainOrderBookManager {
             symbol_index: Some(symbol_index),
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
+            clock: Shared::new(None),
         }
     }
 
@@ -1060,6 +1084,37 @@ impl OptionChainOrderBookManager {
         self.fee_schedule.get()
     }
 
+    /// Sets the engine clock for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains via
+    /// [`get_or_create`](Self::get_or_create) will have this clock propagated
+    /// down to their strike manager. The `Arc<dyn Clock>` is shared, not
+    /// deep-cloned, so every future option book stamps orders from the same
+    /// clock — inject a `StubClock` to make time-in-force admission
+    /// deterministic for replay.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.clock.set(Some(clock));
+    }
+
+    /// Clears the engine clock so future chains use the upstream default
+    /// `MonotonicClock` (wall-clock time).
+    ///
+    /// Existing chains are not affected. Only newly created chains via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_clock(&self) {
+        self.clock.set(None);
+    }
+
+    /// Returns the current engine clock, or `None` when future chains use the
+    /// upstream default `MonotonicClock`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> Option<Arc<dyn Clock>> {
+        self.clock.get()
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -1128,6 +1183,9 @@ impl OptionChainOrderBookManager {
         }
         if let Some(schedule) = self.fee_schedule.get() {
             fresh.set_fee_schedule(schedule);
+        }
+        if let Some(clock) = self.clock.get() {
+            fresh.set_clock(clock);
         }
         // Atomic, idempotent publish: first inserter wins and is never evicted.
         let entry = self.chains.get_or_insert(key, fresh);

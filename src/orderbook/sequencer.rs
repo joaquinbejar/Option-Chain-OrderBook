@@ -50,7 +50,7 @@ use crate::orderbook::symbol_index::SymbolIndex;
 use crate::orderbook::underlying::UnderlyingOrderBook;
 use crate::utils::{SymbolParser, nanos_since_epoch};
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{OrderId, Side};
+use orderbook_rs::{Clock, OrderId, Side};
 use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -805,6 +805,26 @@ impl SequencedUnderlyingOrderBook {
     #[inline]
     pub fn symbol_index(&self) -> Option<&Arc<SymbolIndex>> {
         self.inner.symbol_index()
+    }
+
+    /// Injects the engine clock used to stamp orders on every leaf book the
+    /// hierarchy vivifies from later commands.
+    ///
+    /// Delegates to [`UnderlyingOrderBook::set_clock`], so the clock is
+    /// propagated to expirations, chains, and strikes created *after* this
+    /// call. Set it BEFORE the first [`submit`](Self::submit) for full
+    /// determinism: leaves vivified by earlier commands keep whatever clock
+    /// they were built with (the upstream default `MonotonicClock` when none
+    /// was injected).
+    ///
+    /// For byte-identical replay, the replaying instance must be configured
+    /// with an identically-behaving clock — e.g. a fresh
+    /// [`StubClock`](orderbook_rs::StubClock) constructed with the same
+    /// start and step as the live instance — before its journal prefix is
+    /// replayed. The `Arc<dyn Clock>` is shared, not deep-cloned.
+    #[inline]
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.inner.set_clock(clock);
     }
 
     /// Returns the current sequence number.
