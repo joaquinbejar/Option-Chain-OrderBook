@@ -33,6 +33,19 @@
 //! deadlock against the journal. `execute_command` must never acquire the gate,
 //! since it runs while the gate is already held.
 //!
+//! # Known limitation — trade-ID determinism
+//!
+//! The upstream `orderbook_rs::OrderBook` mints its trade/transaction-ID
+//! namespace internally with a random `Uuid::new_v4()` at construction, and
+//! offers no injection seam. Trade IDs therefore differ between a live run and
+//! its replay even when the command stream, the injected
+//! [`Clock`](orderbook_rs::Clock), and the matching are identical. The replay
+//! oracle intentionally compares order-book *state* (resting orders,
+//! top-of-book, instrument status) and excludes trade IDs. Tracked upstream as
+//! [OrderBook-rs#199](https://github.com/joaquinbejar/OrderBook-rs/issues/199);
+//! once a namespace seam ships, the hierarchy will thread a deterministic
+//! namespace alongside the clock.
+//!
 //! # Feature Gate
 //!
 //! This module is only available when the `sequencer` feature is enabled:
