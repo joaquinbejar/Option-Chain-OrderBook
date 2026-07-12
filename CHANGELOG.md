@@ -11,6 +11,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.8.0] - 2026-07-12
+
+### ⚠️ Breaking Changes
+
+- **`OptionChainCommand::AddOrder` gained `tif: TimeInForce` + `user_id: Hash32`;
+  `OptionChainResult::OrderAdded` gained `trade: Option<TradeResult>`.** Both
+  enums were already `#[non_exhaustive]`, so wildcard `match`es keep compiling,
+  but literal constructors and full field patterns need the new fields (or
+  `..`). `TimeInForce::Gtc` + `Hash32::zero()` reproduce the old semantics
+  exactly. The journal wire format is backward-compatible: the fields carry
+  `#[serde(default)]`, so every pre-0.8.0 journal decodes and replays
+  identically (pinned by the frozen v0.5.0 fixture test). Walkthrough:
+  [`MIGRATING-0.8.0.md`](./MIGRATING-0.8.0.md). (#148)
+
+### Added
+
+- **Deterministic venue seams (#147).**
+  - `SequencedUnderlyingOrderBook::submit` now serializes the whole
+    assign→execute→journal-append sequence in one critical section: journal
+    insertion order == sequence order == book-mutation order. `replay` takes
+    the same gate, so a rebuild cannot interleave with live submits.
+  - An injectable engine clock threads from every manager level into lazily
+    vivified leaf books (`set_clock` / `clear_clock` / `clock()` on managers
+    and books; `SequencedUnderlyingOrderBook::set_clock` is linearized against
+    the command stream). `Clock`, `MonotonicClock`, `StubClock` re-exported.
+    GTD/Day admission becomes replay-deterministic under an injected clock.
+  - Known limitation documented: trade IDs are not replay-stable — upstream
+    `orderbook-rs` mints each book's trade-ID namespace with a random
+    `Uuid::new_v4()` (tracked as OrderBook-rs#199); the replay oracle compares
+    book state and excludes trade IDs.
+- **Lossless venue integration (#148).**
+  - `OrderAdded` carries the fills: `trade: Option<TradeResult>`, `Some` iff
+    the add crossed, attributed per-call (never the shared capture slot). A
+    journaled `Rejected` after real fills (unfillable IOC remainder, STP
+    taker-cancel) is deterministic and documented; those fills stay
+    listener-visible.
+  - `submit_add_order_with(...)` journals TIF variety and account/STP
+    identity; `submit_add_order` delegates unchanged (Gtc + zero user).
+  - `OptionChainCommand::ReplaceOrder` / `OptionChainResult::OrderReplaced` +
+    `submit_replace_order(...)`: atomic validate-first replace through the
+    sequencer, resolved via the non-creating lookup (a replace never vivifies
+    expirations/strikes); the original order survives any rejection.
+  - `OptionOrderBook::replace_order(order_id, price, quantity, side)` — leaf
+    primitive over the engine's validate-first `OrderUpdate::Replace` (queue
+    priority lost; rematch fills reach the trade listener only).
+  - `OptionOrderBook::take_trade_result()` / `clear_trade_capture()` — atomic
+    consuming read and explicit reset for the single-slot trade capture.
+  - `ValidationConfig::with_max_price(u128)` — crate-side maximum price bound
+    enforced on every add and replace path (the upstream engine has no
+    price-bound hook); `validation_config()` readback merges the leaf-held
+    bound. A finite bound lets venues prove upstream fee saturation
+    unreachable (`FeeSchedule::max_guaranteed_exact_notional_for_bps`,
+    orderbook-rs ≥ 0.10.4).
+- New strict wire fixture `tests/fixtures/journal_event_v0.8.0.json` freezing
+  the current schema (deterministic `Some(trade)` payload built via serde, no
+  wall-clock/random-id construction); wire pins for the enriched `AddOrder`,
+  `OrderAdded`-with-trade and `ReplaceOrder`, deny-unknown-fields probes, and
+  an old-binary-rejects-new-variant simulation.
+
+### Tests
+
+Concurrent-load journal-order and replay-equals-live oracles under the new
+gate; GTD admission via injected `StubClock` at leaf/strike/underlying levels;
+replay-equals-live under an injected clock; crossing/IOC/nonzero-user adds,
+replace-that-rematches and unknown-id replace pinned by the full-state replay
+oracle; max-price enforcement across all eight add paths plus replace;
+capture take/clear including poisoned-lock recovery.
+
 ## [0.7.0] - 2026-07-11
 
 ### ⚠️ Breaking Changes
