@@ -1,0 +1,215 @@
+[
+  {
+    "sequence_num": 1,
+    "timestamp_ns": 1700000000000000000,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "side": "BUY",
+        "price": 100,
+        "quantity": 10,
+        "tif": "GTC",
+        "user_id": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "result": {
+      "OrderAdded": {
+        "order_id": "42",
+        "trade": null
+      }
+    }
+  },
+  {
+    "sequence_num": 2,
+    "timestamp_ns": 1700000000000000001,
+    "command": {
+      "CancelOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42"
+      }
+    },
+    "result": {
+      "OrderCancelled": {
+        "order_id": "42"
+      }
+    }
+  },
+  {
+    "sequence_num": 3,
+    "timestamp_ns": 1700000000000000002,
+    "command": {
+      "MassCancel": {
+        "scope": {
+          "Strike": {
+            "expiration": {
+              "datetime": "2024-03-29T23:59:59Z"
+            },
+            "strike": 50000
+          }
+        },
+        "cancel_type": {
+          "BySide": "SELL"
+        }
+      }
+    },
+    "result": {
+      "MassCancelled": {
+        "cancelled_count": 4
+      }
+    }
+  },
+  {
+    "sequence_num": 4,
+    "timestamp_ns": 1700000000000000003,
+    "command": {
+      "MassCancel": {
+        "scope": "Underlying",
+        "cancel_type": {
+          "ByUser": "0707070707070707070707070707070707070707070707070707070707070707"
+        }
+      }
+    },
+    "result": {
+      "Rejected": {
+        "reason": "boom"
+      }
+    }
+  },
+  {
+    "sequence_num": 5,
+    "timestamp_ns": 1700000000000000004,
+    "command": {
+      "MassCancel": {
+        "scope": {
+          "Book": "BTC-20240329-50000-C"
+        },
+        "cancel_type": "All"
+      }
+    },
+    "result": {
+      "BookNotFound": {
+        "symbol": "ETH-20240329-50000-C"
+      }
+    }
+  },
+  {
+    "sequence_num": 6,
+    "timestamp_ns": 1700000000000000005,
+    "command": {
+      "MassCancel": {
+        "scope": {
+          "Expiration": {
+            "datetime": "2024-03-29T23:59:59Z"
+          }
+        },
+        "cancel_type": "All"
+      }
+    },
+    "result": {
+      "MassCancelled": {
+        "cancelled_count": 0
+      }
+    }
+  },
+  {
+    "sequence_num": 7,
+    "timestamp_ns": 1700000000000000006,
+    "command": {
+      "SetInstrumentStatus": {
+        "symbol": "BTC-20240329-50000-C",
+        "status": "Halted"
+      }
+    },
+    "result": {
+      "StatusChanged": {
+        "symbol": "BTC-20240329-50000-C",
+        "status": "Halted"
+      }
+    }
+  },
+  {
+    "sequence_num": 8,
+    "timestamp_ns": 1700000000000000007,
+    "command": {
+      "EvictExpiredOrders": {
+        "now_ms": 10000000000000
+      }
+    },
+    "result": {
+      "ExpiredEvicted": {
+        "evicted_ids": [
+          "42",
+          "43"
+        ]
+      }
+    }
+  },
+  {
+    "sequence_num": 9,
+    "timestamp_ns": 1700000000000000008,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "side": "BUY",
+        "price": 100,
+        "quantity": 4,
+        "tif": {
+          "GTD": 1700000000000
+        },
+        "user_id": "0707070707070707070707070707070707070707070707070707070707070707"
+      }
+    },
+    "result": {
+      "OrderAdded": {
+        "order_id": "42",
+        "trade": {
+          "symbol": "BTC-20240329-50000-C",
+          "match_result": {
+            "order_id": "42",
+            "trades": {
+              "trades": [
+                {
+                  "trade_id": "9001",
+                  "taker_order_id": "42",
+                  "maker_order_id": "43",
+                  "price": 100,
+                  "quantity": 4,
+                  "taker_side": "BUY",
+                  "timestamp": 1700000000000
+                }
+              ]
+            },
+            "remaining_quantity": 0,
+            "is_complete": true,
+            "filled_order_ids": [],
+            "outcome": "filled"
+          },
+          "total_maker_fees": 0,
+          "total_taker_fees": 0,
+          "engine_seq": 0,
+          "quote_notional": 400
+        }
+      }
+    }
+  },
+  {
+    "sequence_num": 10,
+    "timestamp_ns": 1700000000000000009,
+    "command": {
+      "ReplaceOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "price": 105,
+        "quantity": 7,
+        "side": "BUY"
+      }
+    },
+    "result": {
+      "OrderReplaced": {
+        "order_id": "42"
+      }
+    }
+  }
+]
