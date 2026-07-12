@@ -20,9 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enums were already `#[non_exhaustive]`, so wildcard `match`es keep compiling,
   but literal constructors and full field patterns need the new fields (or
   `..`). `TimeInForce::Gtc` + `Hash32::zero()` reproduce the old semantics
-  exactly. The journal wire format is backward-compatible: the fields carry
-  `#[serde(default)]`, so every pre-0.8.0 journal decodes and replays
-  identically (pinned by the frozen v0.5.0 fixture test). Walkthrough:
+  exactly. The journal wire format is backward-compatible **for self-describing
+  encodings (JSON)**: the fields carry `#[serde(default)]`, so every pre-0.8.0
+  JSON journal decodes and replays identically (pinned by the frozen v0.5.0
+  fixture test). Positional codecs such as bincode cannot apply a
+  missing-field default, so pre-0.8.0 *binary* journal records do not decode
+  against the new shape — re-journal or migrate them. (Appending the new
+  `ReplaceOrder` / `OrderReplaced` *variants* is bincode-safe either way:
+  earlier variant indices never shift.) Walkthrough:
   [`MIGRATING-0.8.0.md`](./MIGRATING-0.8.0.md). (#148)
 
 ### Added

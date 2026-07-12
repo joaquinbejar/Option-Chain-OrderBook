@@ -183,7 +183,11 @@ pub enum OptionChainCommand {
         ///
         /// Defaults to [`TimeInForce::Gtc`] (via a serde default) when absent, so
         /// a journal written before #148 decodes and replays exactly
-        /// as it did then (every pre-#148 add was good-till-cancelled). The wire
+        /// as it did then (every pre-#148 add was good-till-cancelled). That
+        /// missing-field default only exists in self-describing encodings
+        /// (JSON): a positional codec such as bincode cannot detect an absent
+        /// trailing field, so pre-#148 *binary* records do not decode against
+        /// the new shape — re-journal or migrate them instead. The wire
         /// tags are pricelevel's casing — `"GTC" | "IOC" | "FOK" | {"GTD": ms} |
         /// "DAY"` — not the `snake_case` used for the other fields. The
         /// clock-relative variants (`Gtd`, `Day`) are replay-stable only because
@@ -324,7 +328,10 @@ pub enum OptionChainResult {
         /// `Some` iff the add crossed the book and executed at least one trade;
         /// `None` when the order rested unfilled — which is also what any
         /// pre-#148 journal (whose `OrderAdded` had no `trade` field) decodes to
-        /// via `#[serde(default)]`.
+        /// via `#[serde(default)]`. As with `AddOrder`'s appended fields, that
+        /// old-journal default applies only to self-describing encodings
+        /// (JSON); positional codecs such as bincode cannot decode pre-#148
+        /// binary records against the new shape.
         ///
         /// # Replay caveat
         ///
@@ -939,11 +946,11 @@ impl SequencedUnderlyingOrderBook {
     /// [`submit`](Self::submit), so it is linearized against the sequenced
     /// command stream: every command either fully precedes or fully follows
     /// the clock change, and which clock a lazily vivified leaf receives is
-    /// well-defined relative to the journal order. Note that until the
-    /// journaled `AddOrder` command carries a time-in-force (tracked in
-    /// issue #148), `Gtc` is hardcoded on the sequenced add path and the
-    /// injected clock affects only order timestamps — not admission — for
-    /// commands flowing through `submit`.
+    /// well-defined relative to the journal order. The journaled `AddOrder`
+    /// command carries a time-in-force (#148), so an injected deterministic
+    /// clock makes `Gtd` / `Day` admission — and the order timestamps the
+    /// engine stamps — replay-stable for commands flowing through
+    /// [`submit`](Self::submit).
     #[inline]
     pub fn set_clock(&self, clock: Arc<dyn Clock>) {
         // Linearize the config change against submit/replay so a racing
@@ -1041,6 +1048,9 @@ impl SequencedUnderlyingOrderBook {
     /// The order is good-till-cancelled ([`TimeInForce::Gtc`]) and attributed to
     /// the zero [`Hash32`] user. For a non-default time-in-force or user
     /// identity, use [`submit_add_order_with`](Self::submit_add_order_with).
+    /// On a book with self-trade prevention enabled the zero user is rejected
+    /// by the engine (`MissingUserId`) — STP-enabled sequenced books must
+    /// submit through `submit_add_order_with` with a non-zero identity.
     ///
     /// # Arguments
     ///

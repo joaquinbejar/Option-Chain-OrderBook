@@ -897,3 +897,90 @@ fn test_replay_old_style_add_order_journal_applies_gtc_defaults() {
         "an old-style AddOrder must replay to the Gtc / zero-user default state"
     );
 }
+
+#[test]
+fn test_replay_rejected_after_fills_ioc_remainder_equals_live() {
+    // Error-after-fills: an IOC buy for more than the resting liquidity consumes
+    // the entire resting ask (a real, listener-visible fill) and THEN the engine
+    // returns a typed "insufficient liquidity" error for the remainder it can
+    // neither fill nor rest. So the journaled result is `Rejected` even though
+    // contracts actually traded. #148 makes this path reachable through the
+    // journaled stream for the first time (IOC via `submit_add_order_with`); this
+    // test pins that submit and replay stay equivalent across it.
+    //
+    // Empirically observed result shape (orderbook-rs 0.10.3): `Rejected` with
+    // reason "…Insufficient liquidity for BUY order: requested 10, available 5",
+    // with the resting ask fully consumed by the partial fill.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+    let symbol = "BTC-20240329-50000-C";
+
+    let live = fresh_book(&journal);
+    // Resting ask: 5 contracts at 100.
+    live.submit_add_order(symbol, oid(1), Side::Sell, 100, 5)
+        .expect("seed resting ask");
+    // IOC buy for 10 at the crossing price: fills the 5 available, then errors on
+    // the 5-contract remainder.
+    let receipt = live
+        .submit_add_order_with(
+            symbol,
+            oid(2),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Ioc,
+            Hash32::zero(),
+        )
+        .expect("submit ioc: journaling succeeds even though the result is a rejection");
+
+    // (1) The journaled result is Rejected, yet the resting ask was fully consumed
+    //     on the live book — the fills happened, listener-visible only.
+    assert!(
+        matches!(receipt.result, OptionChainResult::Rejected { .. }),
+        "IOC-over-liquidity must journal a Rejected result, got {:?}",
+        receipt.result
+    );
+    let live_leaf = call_leaf(&live, symbol).expect("live leaf");
+    assert_eq!(
+        live_leaf.call().best_ask(),
+        None,
+        "the resting ask must be fully consumed by the partial fill"
+    );
+    assert_eq!(
+        live_leaf.call().total_ask_depth(),
+        0,
+        "no ask depth remains after the fill"
+    );
+    assert_eq!(
+        live_leaf.call().order_count(),
+        0,
+        "the IOC remainder did not rest"
+    );
+
+    // The journaled event's result matches the receipt (Rejected).
+    let events = journal.read_from(0).expect("read journal");
+    assert_eq!(
+        events.len(),
+        2,
+        "the seed add and the IOC are both journaled"
+    );
+    assert!(
+        matches!(events[1].result, OptionChainResult::Rejected { .. }),
+        "the journaled IOC result must be Rejected"
+    );
+
+    let live_snapshot = snapshot(&live);
+
+    // (2) Replay into a fresh, identically-configured instance reproduces the
+    //     exact same full-state snapshot — the fill-then-reject is deterministic.
+    let replay = fresh_book(&journal);
+    let replayed = replay.replay(0).expect("replay");
+    assert_eq!(replayed, 2, "replay re-runs both journaled commands");
+    // (3) Replay reads the journal, it never appends: the length is unchanged.
+    assert_eq!(journal.len(), 2, "replay must not mutate the journal");
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed error-after-fills state must equal live"
+    );
+}

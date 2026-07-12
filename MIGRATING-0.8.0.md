@@ -1,10 +1,12 @@
 # Migrating `option-chain-orderbook` 0.7.0 → 0.8.0
 
 `0.8.0` delivers the deterministic venue seams (#147) and the lossless venue
-integration surface (#148). The journal wire format is backward-compatible —
-a 0.8.0 binary reads every 0.5.0+ journal unchanged. The only source breaks
-are in code that constructs or exhaustively destructures two sequencer enum
-variants by literal.
+integration surface (#148). The journal wire format is backward-compatible for
+self-describing encodings — a 0.8.0 binary reads every 0.5.0+ **JSON** journal
+unchanged (positional codecs such as bincode cannot apply missing-field
+defaults; see the wire-format note below). The only source breaks are in code
+that constructs or exhaustively destructures two sequencer enum variants by
+literal.
 
 ---
 
@@ -27,8 +29,7 @@ if let OptionChainResult::OrderAdded { order_id } = receipt.result { /* … */ }
 **After (0.8.0)**
 
 ```rust
-use option_chain_orderbook::TimeInForce;
-use pricelevel::Hash32;
+use option_chain_orderbook::{Hash32, TimeInForce};
 
 let cmd = OptionChainCommand::AddOrder {
     symbol,
@@ -48,12 +49,18 @@ if let OptionChainResult::OrderAdded { order_id, .. } = receipt.result { /* … 
 field patterns. Prefer the `submit_add_order` / `submit_add_order_with`
 helpers over hand-built command literals — the former is signature-unchanged.
 
-**Wire format:** unaffected in the backward direction. The new fields carry
-`#[serde(default)]`, so old journals decode to `Gtc` / zero-user / no-trade
-and replay identically (pinned by the frozen v0.5.0 fixture test). An *old*
-binary reading a journal produced by 0.8.0 fails loudly on the unknown fields
-or the new `ReplaceOrder` variant tag — the established, intentional
-asymmetry.
+**Wire format:** unaffected in the backward direction **for self-describing
+encodings (JSON)**. The new fields carry `#[serde(default)]`, so old JSON
+journals decode to `Gtc` / zero-user / no-trade and replay identically
+(pinned by the frozen v0.5.0 fixture test). Serde's missing-field default
+does not exist in positional codecs: a bincode-style journal cannot detect
+an absent trailing field, so pre-0.8.0 *binary* records fail to decode
+against the new `AddOrder` / `OrderAdded` shape — re-journal or migrate
+them before upgrading. (Appending the `ReplaceOrder` / `OrderReplaced`
+*variants* is safe in every codec — earlier variant indices never shift.)
+An *old* binary reading a journal produced by 0.8.0 fails loudly on the
+unknown fields or the new `ReplaceOrder` variant tag — the established,
+intentional asymmetry.
 
 ---
 
