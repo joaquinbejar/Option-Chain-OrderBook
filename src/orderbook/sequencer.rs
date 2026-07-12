@@ -13,6 +13,26 @@
 //! - Parallel operation across different underlyings
 //! - Isolated failure domains
 //!
+//! # Ordering & atomicity
+//!
+//! Within a single [`SequencedUnderlyingOrderBook`], submissions are internally
+//! serialized. Each [`submit`](SequencedUnderlyingOrderBook::submit) holds a
+//! per-sequencer gate across the whole assign→execute→journal-append sequence,
+//! so concurrent callers are safe but serialized: sequence assignment, book
+//! mutation, and journal append happen as one indivisible step. This is what
+//! makes journal insertion order equal to sequence order equal to book-mutation
+//! order — a property replay relies on. Because the journal append happens
+//! *inside* the critical section, the [`OptionChainJournal`] contract is that
+//! `append` must be fast: a slow or blocking journal serializes every
+//! submission on that underlying.
+//!
+//! [`replay`](SequencedUnderlyingOrderBook::replay) takes the same gate, so a
+//! rebuild cannot interleave with a live submit. Deadlock analysis: there is no
+//! `submit`↔`replay` nesting (neither calls the other), and the lock order is
+//! always gate → journal-internal lock (never the reverse), so the gate cannot
+//! deadlock against the journal. `execute_command` must never acquire the gate,
+//! since it runs while the gate is already held.
+//!
 //! # Feature Gate
 //!
 //! This module is only available when the `sequencer` feature is enabled:
@@ -33,8 +53,8 @@ use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Scope for mass cancel operations in the option chain hierarchy.
 ///
@@ -484,6 +504,8 @@ pub(crate) struct OptionChainSequencer {
     success_count: AtomicU64,
     /// Count of rejected commands.
     reject_count: AtomicU64,
+    /// Serializes the assign→execute→journal-append critical section.
+    gate: Mutex<()>,
 }
 
 impl OptionChainSequencer {
@@ -494,6 +516,7 @@ impl OptionChainSequencer {
             sequence: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
             reject_count: AtomicU64::new(0),
+            gate: Mutex::new(()),
         }
     }
 
@@ -507,6 +530,7 @@ impl OptionChainSequencer {
             sequence: AtomicU64::new(start),
             success_count: AtomicU64::new(0),
             reject_count: AtomicU64::new(0),
+            gate: Mutex::new(()),
         }
     }
 
@@ -551,6 +575,35 @@ impl OptionChainSequencer {
     #[inline]
     pub fn record_reject(&self) {
         self.reject_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Acquires the serialization gate for the assign→execute→journal-append
+    /// critical section.
+    ///
+    /// The returned guard serializes concurrent submissions so that sequence
+    /// assignment, book mutation, and journal append happen as one indivisible
+    /// step; releasing the guard (dropping it) ends the critical section.
+    /// Recovers from a poisoned lock via
+    /// `unwrap_or_else(|poisoned| poisoned.into_inner())`, matching the
+    /// poison-recovery policy used across the hierarchy (see
+    /// [`Shared`](crate::orderbook::shared)), so a panic while another thread
+    /// held the gate never wedges the sequencer.
+    pub fn acquire_gate(&self) -> MutexGuard<'_, ()> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Advances the sequence counter so the next assigned number is at least
+    /// `next`, without ever moving it backwards.
+    ///
+    /// Encapsulates the `fetch_max` used on the replay-resume path so callers
+    /// (e.g. [`SequencedUnderlyingOrderBook::replay`]) do not reach into the
+    /// private `sequence` field directly. Advancing past the highest replayed
+    /// sequence number keeps subsequently assigned ids non-conflicting.
+    #[inline]
+    pub fn advance_to(&self, next: u64) {
+        self.sequence.fetch_max(next, Ordering::Release);
     }
 }
 
@@ -790,10 +843,26 @@ impl SequencedUnderlyingOrderBook {
     /// against the underlying order book, and optionally persisted to the
     /// journal.
     ///
+    /// # Ordering & atomicity
+    ///
+    /// Submissions are internally serialized: sequence assignment, book
+    /// mutation, and journal append run inside a single critical section held
+    /// for the duration of this call. Concurrent callers are therefore safe but
+    /// serialized — one submission completes fully before the next begins. As a
+    /// result, journal insertion order equals sequence order equals
+    /// book-mutation order: the event journaled at sequence `n` was applied to
+    /// the books strictly before the event at sequence `n + 1`.
+    ///
     /// # Errors
     ///
     /// Returns an error if journaling fails.
     pub fn submit(&self, command: OptionChainCommand) -> Result<OptionChainReceipt, Error> {
+        // Hold the gate for the whole assign→execute→journal-append sequence so
+        // concurrent submissions cannot interleave and so the journal is
+        // appended in sequence order. Released when `_serialized` drops on
+        // return.
+        let _serialized = self.sequencer.acquire_gate();
+
         let (seq, ts) = self.sequencer.assign();
         let result = self.execute_command(&command);
 
@@ -1471,6 +1540,16 @@ impl SequencedUnderlyingOrderBook {
     /// Replays events from the journal starting at `from_sequence`, rebuilding
     /// the hierarchy state deterministically.
     ///
+    /// # Ordering & atomicity
+    ///
+    /// Replay acquires the same serialization gate that
+    /// [`submit`](Self::submit) holds, so a replay and a concurrent live
+    /// submission cannot interleave: the whole rebuild — re-executing every
+    /// command and advancing the sequence counter — runs as one critical
+    /// section. A submit therefore never observes a half-rebuilt hierarchy, and
+    /// replay never races the sequence advance. Never call `submit` from within
+    /// `replay` or vice versa (both take the same gate, which would deadlock).
+    ///
     /// Each event's command is re-executed against the underlying order book.
     /// Replay re-runs the `AddOrder` / `CancelOrder` / `MassCancel` stream
     /// exactly as it was recorded: every `AddOrder` deterministically vivifies
@@ -1539,6 +1618,13 @@ impl SequencedUnderlyingOrderBook {
             .as_ref()
             .ok_or_else(|| Error::journal_error("replay requires a journal"))?;
 
+        // Hold the same gate `submit` uses so a replay cannot interleave with a
+        // concurrent live submission: the rebuild runs as one critical section
+        // and no submit can observe a half-rebuilt hierarchy or race the
+        // sequence advance. Acquired after the journal-presence check so a
+        // journal-less book fails fast without taking the gate.
+        let _serialized = self.sequencer.acquire_gate();
+
         let events = journal.read_from(from_sequence)?;
         let count = events.len();
 
@@ -1563,9 +1649,7 @@ impl SequencedUnderlyingOrderBook {
         // Advance sequencer past the replayed range in a single atomic
         // operation instead of one fetch_max per event.
         if max_next > 0 {
-            self.sequencer
-                .sequence
-                .fetch_max(max_next, Ordering::Release);
+            self.sequencer.advance_to(max_next);
         }
 
         Ok(count)
@@ -3554,5 +3638,92 @@ mod tests {
 
         assert!(book.registry().is_some());
         assert!(book.symbol_index().is_some());
+    }
+
+    #[test]
+    fn test_replay_serialized_against_concurrent_submits_no_deadlock() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // A journal pre-populated by a first live run: replaying it must be
+        // able to run concurrently with fresh submits on a second book without
+        // deadlocking, because submit and replay share the same gate but never
+        // nest.
+        let seed_journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let seed = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&seed_journal));
+        for i in 0..20u64 {
+            seed.submit_add_order(
+                "BTC-20240329-50000-C",
+                OrderId::from_u64(1 + i),
+                Side::Buy,
+                100 + u128::from(i),
+                10,
+            )
+            .expect("seed submit");
+        }
+        let seed_events = seed_journal.read_from(0).expect("read seed");
+        assert_eq!(seed_events.len(), 20);
+
+        // The book under test carries the seeded events in a fresh journal so
+        // the replaying thread has something to rebuild while the other thread
+        // submits new commands.
+        let replay_journal: Arc<dyn OptionChainJournal> =
+            Arc::new(InMemoryOptionChainJournal::new());
+        for event in &seed_events {
+            replay_journal.append(event).expect("append seed");
+        }
+        let book = Arc::new(SequencedUnderlyingOrderBook::with_journal(
+            "BTC",
+            Arc::clone(&replay_journal),
+        ));
+
+        // Lockstep start so the replay and the submits genuinely contend for
+        // the gate rather than running one-after-the-other.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let replay_book = Arc::clone(&book);
+        let replay_barrier = Arc::clone(&barrier);
+        let replayer = thread::spawn(move || {
+            replay_barrier.wait();
+            replay_book.replay(0).expect("replay")
+        });
+
+        let submit_book = Arc::clone(&book);
+        let submit_barrier = Arc::clone(&barrier);
+        let submitter = thread::spawn(move || {
+            submit_barrier.wait();
+            for i in 0..20u64 {
+                submit_book
+                    .submit_add_order(
+                        "BTC-20240329-55000-C",
+                        OrderId::from_u64(1_000 + i),
+                        Side::Sell,
+                        200 + u128::from(i),
+                        5,
+                    )
+                    .expect("live submit");
+            }
+        });
+
+        // Both threads must complete; a deadlock would hang the join forever.
+        let replayed = replayer.join().expect("replayer thread");
+        submitter.join().expect("submitter thread");
+
+        // Replay and submit share one journal, and replay reads it atomically
+        // under the gate: it sees the 20 seeded events plus however many of the
+        // 20 live submits had already been appended when it acquired the gate.
+        // So the replayed count lands in [20, 40] depending on interleaving.
+        assert!(
+            (20..=40).contains(&replayed),
+            "replay must return between the seeded count and seeded+submits, got {replayed}"
+        );
+        // The 20 live submits each `fetch_add(1)` unconditionally, so the
+        // sequence has advanced by at least 20 regardless of how replay's
+        // `fetch_max` interleaves with them (which can only raise it).
+        assert!(
+            book.current_sequence() >= 20,
+            "sequence must advance past the live submits, got {}",
+            book.current_sequence()
+        );
     }
 }

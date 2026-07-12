@@ -551,3 +551,123 @@ fn test_replay_into_empty_book_then_resume_is_consistent() {
     // 10 rebuilt resting orders + 1 new.
     assert_eq!(resumed.total_order_count(), 11);
 }
+
+// ── Concurrent submit: gate ordering + replay-under-load oracle ─────────────
+
+/// Number of worker threads used by the concurrent-load helper.
+const CONCURRENT_THREADS: u64 = 8;
+/// Number of `AddOrder` commands each worker submits.
+const CONCURRENT_PER_THREAD: u64 = 25;
+
+/// Drives a concurrent `AddOrder` load through the sequencer.
+///
+/// Spawns [`CONCURRENT_THREADS`] workers that each submit
+/// [`CONCURRENT_PER_THREAD`] orders to a per-thread-distinct symbol, released in
+/// lockstep by a [`Barrier`](std::sync::Barrier) so the submissions genuinely
+/// contend for the sequencer gate rather than running one after another.
+/// Distinct strikes keep the workers from matching against each other, and the
+/// absolute `YYYYMMDD` date makes every derived symbol replay-stable. Returns
+/// the total number of commands submitted.
+fn drive_concurrent_add_load(book: &Arc<SequencedUnderlyingOrderBook>) -> usize {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let barrier = Arc::new(Barrier::new(CONCURRENT_THREADS as usize));
+    let mut handles = Vec::with_capacity(CONCURRENT_THREADS as usize);
+    for t in 0..CONCURRENT_THREADS {
+        let book = Arc::clone(book);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let symbol = format!("BTC-20240329-{}-C", 50000 + t * 1000);
+            barrier.wait();
+            for i in 0..CONCURRENT_PER_THREAD {
+                // Order ids are offset by 1 so no worker ever submits id 0, and
+                // the per-thread 1000-stride keeps them globally distinct.
+                book.submit_add_order(
+                    &symbol,
+                    oid(1 + t * 1000 + i),
+                    Side::Buy,
+                    100 + u128::from(i),
+                    10,
+                )
+                .expect("concurrent add must succeed");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker thread must not panic");
+    }
+    (CONCURRENT_THREADS * CONCURRENT_PER_THREAD) as usize
+}
+
+#[test]
+fn test_submit_concurrent_journal_order_matches_sequence_order() {
+    // The submit gate serializes assign→execute→journal-append, so even under a
+    // concurrent load the journal is appended in sequence order.
+    let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+    let book = Arc::new(SequencedUnderlyingOrderBook::with_journal(
+        "BTC",
+        Arc::clone(&journal),
+    ));
+
+    let total = drive_concurrent_add_load(&book);
+    assert_eq!(total, 200);
+
+    // Journal insertion order equals sequence order: reading from 0 yields
+    // sequence numbers 0..200, strictly ascending by exactly +1, in the order
+    // they were appended.
+    let events = journal.read_from(0).expect("read journal");
+    assert_eq!(
+        events.len(),
+        200,
+        "every concurrent submit must be journaled exactly once"
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.sequence_num, index as u64,
+            "journal entry at position {index} must carry sequence {index} \
+             (insertion order == sequence order)"
+        );
+    }
+
+    // Each submit records exactly one outcome (success or reject).
+    assert_eq!(
+        book.success_count() + book.reject_count(),
+        200,
+        "each of the 200 submits records exactly one outcome"
+    );
+}
+
+#[test]
+fn test_submit_concurrent_replay_equals_live_full_state_oracle() {
+    // Under a concurrent load the gate makes strike creation — and therefore
+    // registry-id allocation — happen in sequence order across threads, so
+    // replay (which re-runs the journal in that same order into a fresh book)
+    // rebuilds an identical hierarchy AND identical registry ids. This exercises
+    // the full-state oracle against a concurrently-produced journal.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+
+    let live = Arc::new(fresh_book(&journal));
+    let submitted = drive_concurrent_add_load(&live);
+    assert_eq!(
+        journal.len(),
+        submitted,
+        "every concurrent command must be journaled"
+    );
+
+    let live_snapshot = snapshot(&live);
+
+    // Replay into a fresh, identically-configured book and compare.
+    let replay = fresh_book(&journal);
+    let replayed = replay.replay(0).expect("replay");
+    assert_eq!(
+        replayed, submitted,
+        "replay must re-run every journaled command"
+    );
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed state must equal live state after a concurrent load"
+    );
+}
