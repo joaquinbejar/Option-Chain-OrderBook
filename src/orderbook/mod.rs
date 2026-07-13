@@ -140,7 +140,7 @@ pub use nats::{
 #[cfg(feature = "sequencer")]
 pub use sequencer::{
     InMemoryOptionChainJournal, MassCancelScope, MassCancelType, OptionChainCommand,
-    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult,
+    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult, OrderKind,
     SequencedUnderlyingOrderBook,
 };
 

@@ -37,7 +37,7 @@ use option_chain_orderbook::SymbolParser;
 use option_chain_orderbook::orderbook::{
     InMemoryOptionChainJournal, InstrumentRegistry, InstrumentStatus, MassCancelScope,
     MassCancelType, OptionChainEvent, OptionChainJournal, OptionChainResult, OptionOrderBook,
-    SequencedUnderlyingOrderBook, SymbolIndex,
+    OrderKind, SequencedUnderlyingOrderBook, SymbolIndex,
 };
 use optionstratlib::OptionStyle;
 use orderbook_rs::{Clock, OrderId, Side, StubClock, TimeInForce};
@@ -199,9 +199,62 @@ fn drive_command_prefix(book: &SequencedUnderlyingOrderBook) -> usize {
     book.submit_replace_order(c50c, oid(999), 100, 1, Side::Buy)
         .expect("replace unknown id (rejected)");
 
+    // ── #151 order kinds on a fresh expiration D (again kept off A/B/C): a
+    //    post-only that rests, a post-only that would cross (rejected, state
+    //    untouched), and an iceberg (visible 5 / hidden 20) that a crossing taker
+    //    > visible drains through a refill from the hidden reserve. All
+    //    deterministic, so replay rebuilds the identical visible/hidden split. ──
+    let d70c = "BTC-20241227-70000-C";
+
+    // Post-only bid that rests (no ask to cross).
+    book.submit_add_order_kind(
+        d70c,
+        oid(30),
+        Side::Buy,
+        300,
+        4,
+        TimeInForce::Gtc,
+        Hash32::zero(),
+        OrderKind::PostOnly,
+        None,
+    )
+    .expect("add d70c post-only rest");
+    // Post-only ask at the bid price would cross → rejected, resting state
+    // untouched.
+    book.submit_add_order_kind(
+        d70c,
+        oid(31),
+        Side::Sell,
+        300,
+        2,
+        TimeInForce::Gtc,
+        Hash32::zero(),
+        OrderKind::PostOnly,
+        None,
+    )
+    .expect("add d70c post-only would-cross (rejected)");
+    // Iceberg ask: visible 5, hidden 20 (total 25) at 310.
+    book.submit_add_order_kind(
+        d70c,
+        oid(32),
+        Side::Sell,
+        310,
+        5,
+        TimeInForce::Gtc,
+        Hash32::zero(),
+        OrderKind::Iceberg,
+        Some(20),
+    )
+    .expect("add d70c iceberg");
+    // A crossing taker of 8 (> visible 5) drains the tranche and refills from the
+    // hidden reserve, leaving the iceberg resting at visible 2 / hidden 15.
+    book.submit_add_order(d70c, oid(33), Side::Buy, 310, 8)
+        .expect("add d70c iceberg-crossing taker");
+
     // 15 adds + 2 cancels + 1 halt + 1 rejected add + 2 mass cancels (expirations
-    // A/B) plus the 7 #148 commands on expiration C (5 adds + 2 replaces).
-    28
+    // A/B), 7 #148 commands on expiration C (5 adds + 2 replaces), and 4 #151
+    // order-kind commands on expiration D.
+    32
 }
 
 // ── Comparable full-state snapshot (the oracle) ────────────────────────────
@@ -446,9 +499,11 @@ fn test_replay_equals_live_full_state_oracle() {
     // Expirations A/B leave 10 resting orders (the halted a55c keeps its 3; the
     // rejected add rested nothing). The #148 expiration C adds one net resting
     // order (c45c's partially-filled sell; c50c is cleared by its replace
-    // rematch), for 11 total across three expirations.
-    assert_eq!(live.expiration_count(), 3);
-    assert_eq!(live.total_order_count(), 11);
+    // rematch). The #151 expiration D adds two (the post-only bid and the
+    // partially-drained iceberg; the would-cross post-only rested nothing), for
+    // 13 total across four expirations.
+    assert_eq!(live.expiration_count(), 4);
+    assert_eq!(live.total_order_count(), 13);
     let exp_a = live
         .underlying()
         .get_expiration(
@@ -475,6 +530,42 @@ fn test_replay_equals_live_full_state_oracle() {
     );
     assert_eq!(a55c.call().bid_level_count(), 2, "two resting bid levels");
     assert_eq!(a55c.call().best_bid(), Some(120));
+
+    // #151 explicit post-refill hidden-quantity spot-check: the d70c iceberg
+    // (visible 5 / hidden 20) drained by a crossing taker of 8 must rest at
+    // visible 2 / hidden 15 on the 310 ask level. The `level_ladder` oracle
+    // already captures visible+hidden per level, but assert it here directly so
+    // the iceberg refill split is an explicit, load-bearing part of the prefix.
+    let exp_d = live
+        .underlying()
+        .get_expiration(
+            SymbolParser::parse("BTC-20241227-70000-C")
+                .expect("parse d70c")
+                .expiration(),
+        )
+        .expect("exp D present");
+    let d70c = exp_d.get_strike(70000).expect("strike 70000 present");
+    assert_eq!(d70c.call().best_ask(), Some(310), "iceberg rests at 310");
+    assert_eq!(
+        d70c.call().total_ask_depth(),
+        17,
+        "iceberg total (visible + hidden) after draining 8 of 25"
+    );
+    let d70c_asks = d70c.call().snapshot(SNAPSHOT_DEPTH).asks;
+    let ask_310 = d70c_asks
+        .iter()
+        .find(|l| l.price().as_u128() == 310)
+        .expect("310 ask level present");
+    assert_eq!(
+        ask_310.visible_quantity().as_u64(),
+        2,
+        "iceberg visible tranche after the refill"
+    );
+    assert_eq!(
+        ask_310.hidden_quantity().as_u64(),
+        15,
+        "iceberg hidden reserve after the refill"
+    );
 
     let live_snapshot = snapshot(&live);
 
@@ -544,9 +635,9 @@ fn test_replay_registry_ids_match_live() {
             "instrument symbol diverged for id {live_id}"
         );
     }
-    // Ten leaf books: 5 strikes × (call + put) — A 50000/55000, B 60000, and the
-    // #148 expiration C 45000/50000.
-    assert_eq!(live_ids.len(), 10);
+    // Twelve leaf books: 6 strikes × (call + put) — A 50000/55000, B 60000, the
+    // #148 expiration C 45000/50000, and the #151 expiration D 70000.
+    assert_eq!(live_ids.len(), 12);
 }
 
 #[test]
@@ -594,8 +685,8 @@ fn test_replay_into_empty_book_then_resume_is_consistent() {
         .submit_add_order("BTC-20240329-50000-C", new_oid, Side::Buy, 101, 2)
         .expect("post-replay add");
     assert_eq!(journal.len(), submitted + 1);
-    // 11 rebuilt resting orders + 1 new.
-    assert_eq!(resumed.total_order_count(), 12);
+    // 13 rebuilt resting orders + 1 new.
+    assert_eq!(resumed.total_order_count(), 14);
 }
 
 // ── Concurrent submit: gate ordering + replay-under-load oracle ─────────────
