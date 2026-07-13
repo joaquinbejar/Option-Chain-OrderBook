@@ -24,6 +24,7 @@ use pricelevel::{Hash32, TimestampMs};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 use super::book::TerminalOrderSummary;
 #[cfg(feature = "nats")]
@@ -486,6 +487,35 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.expirations.clock()
+    }
+
+    /// Sets the root trade-ID namespace for future expirations created within
+    /// this underlying.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_trade_id_namespace`]. Only
+    /// expirations created after this call inherit the root; existing
+    /// expirations and their strikes are not affected.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.expirations.set_trade_id_namespace(namespace);
+    }
+
+    /// Clears the root trade-ID namespace, so future option books use the
+    /// upstream default random namespace.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::clear_trade_id_namespace`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.expirations.clear_trade_id_namespace();
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.expirations.trade_id_namespace()
     }
 
     /// Propagates the per-contract NATS listener factory down to this
@@ -1141,6 +1171,10 @@ pub struct UnderlyingOrderBookManager {
     /// the upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
     /// time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Root trade-ID namespace propagated to newly created underlying books.
+    /// `None` keeps the upstream default random namespace; a set root makes
+    /// trade IDs reproducible across runs sharing the root.
+    trade_id_root_namespace: Shared<Option<Uuid>>,
     /// Per-contract NATS listener factory propagated to every underlying book
     /// (and onward to its expirations and strikes). Configured via
     /// [`with_nats_factory`](UnderlyingOrderBookManager::with_nats_factory);
@@ -1170,6 +1204,7 @@ impl UnderlyingOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1193,6 +1228,7 @@ impl UnderlyingOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1270,6 +1306,9 @@ impl UnderlyingOrderBookManager {
         }
         if let Some(clock) = self.clock.get() {
             fresh.set_clock(clock);
+        }
+        if let Some(ns) = self.trade_id_root_namespace.get() {
+            fresh.set_trade_id_namespace(ns);
         }
         // Propagate the per-contract NATS factory down the fresh subtree BEFORE
         // publishing so it is configured-before-visible. Only when a factory is
@@ -1353,6 +1392,37 @@ impl UnderlyingOrderBookManager {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// Sets the root trade-ID namespace for all future underlying books created
+    /// by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will have this root propagated down
+    /// to their expirations, chains, and strikes, where each leaf derives
+    /// `UUIDv5(root, symbol)` at construction. Set it before the first order for
+    /// deterministic trade IDs across runs sharing the root.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.trade_id_root_namespace.set(Some(namespace));
+    }
+
+    /// Clears the root trade-ID namespace so future underlying books use the
+    /// upstream default random namespace.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.trade_id_root_namespace.set(None);
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.trade_id_root_namespace.get()
     }
 
     /// Returns a reference to the symbol index.
@@ -3978,5 +4048,39 @@ mod tests {
         let config = leaf.call().validation_config().expect("config present");
         assert_eq!(config.min_price(), Some(100));
         assert_eq!(config.max_price(), Some(1_000));
+    }
+
+    #[test]
+    fn test_underlying_manager_set_trade_id_namespace_propagates_to_vivified_leaf() {
+        // Drives a fixed crossing sequence on a leaf vivified under a root and
+        // returns the first fill's trade ID.
+        fn run(root: Uuid) -> pricelevel::Id {
+            let manager = UnderlyingOrderBookManager::new();
+            manager.set_trade_id_namespace(root);
+            let leaf = manager
+                .get_or_create("BTC")
+                .get_or_create_expiration(test_expiration())
+                .get_or_create_strike(50000);
+            leaf.call()
+                .add_limit_order(OrderId::from_u64(1), Side::Sell, 100, 10)
+                .expect("rest sell");
+            let trade = leaf
+                .call()
+                .add_limit_order_full(OrderId::from_u64(2), Side::Buy, 100, 5)
+                .expect("crossing buy");
+            trade
+                .match_result
+                .trades()
+                .as_vec()
+                .first()
+                .expect("one fill")
+                .trade_id()
+        }
+
+        let root = Uuid::from_u128(0x0BAD_C0DE);
+        // The root propagates deterministically: same root → same leaf trade ID.
+        assert_eq!(run(root), run(root));
+        // The root genuinely reaches the leaf: a different root changes the ID.
+        assert_ne!(run(root), run(Uuid::from_u128(0xFEED_FACE)));
     }
 }

@@ -21,6 +21,7 @@ use orderbook_rs::{Clock, FeeSchedule, MassCancelResult, OrderId, OrderStatus, S
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 use super::book::TerminalOrderSummary;
 
@@ -927,6 +928,11 @@ pub struct StrikeOrderBookManager {
     /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` (e.g.
     /// `StubClock`) makes time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Root trade-ID namespace applied to newly created option books. `None`
+    /// keeps the upstream default (a random per-book namespace); a set root has
+    /// each future leaf derive `UUIDv5(root, symbol)` at construction, making
+    /// trade IDs reproducible across runs that share the root and clock.
+    trade_id_root_namespace: Shared<Option<Uuid>>,
     /// Per-contract NATS listener factory propagated from the top of the
     /// hierarchy. When present, each lazily created call/put book installs its
     /// own publishers pre-`Arc` in the [`get_or_create`](Self::get_or_create)
@@ -955,6 +961,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -987,6 +994,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1018,6 +1026,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -1193,6 +1202,38 @@ impl StrikeOrderBookManager {
         self.clock.get()
     }
 
+    /// Sets the root trade-ID namespace for all future option books created by
+    /// this manager.
+    ///
+    /// Applies to option books created *after* this call via
+    /// [`get_or_create`](Self::get_or_create); existing books are unaffected
+    /// (same semantics as the engine clock). Each future leaf derives its own
+    /// namespace `UUIDv5(root, symbol)` at construction, so call and put receive
+    /// distinct namespaces and — together with a deterministic clock — produce
+    /// byte-identical trade IDs across runs sharing this root.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.trade_id_root_namespace.set(Some(namespace));
+    }
+
+    /// Clears the root trade-ID namespace so future option books use the upstream
+    /// default (a random per-book namespace).
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.trade_id_root_namespace.set(None);
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.trade_id_root_namespace.get()
+    }
+
     /// Stores the per-contract NATS listener factory propagated from the top of
     /// the hierarchy.
     ///
@@ -1342,6 +1383,7 @@ impl StrikeOrderBookManager {
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
+            trade_id_root_namespace: self.trade_id_root_namespace.get(),
             ..BookConfig::default()
         };
 
@@ -1470,6 +1512,7 @@ impl StrikeOrderBookManager {
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
+            trade_id_root_namespace: self.trade_id_root_namespace.get(),
             nats_listeners: listeners,
             ..BookConfig::default()
         }
@@ -2936,5 +2979,56 @@ mod tests {
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
             .expect("within-band add on the NATS path");
+    }
+
+    #[test]
+    fn test_strike_manager_set_trade_id_namespace_applies_only_to_future_books() {
+        fn first_trade_id(book: &OptionOrderBook) -> pricelevel::Id {
+            book.add_limit_order(OrderId::from_u64(1), Side::Sell, 100, 10)
+                .expect("rest sell");
+            let trade = book
+                .add_limit_order_full(OrderId::from_u64(2), Side::Buy, 100, 5)
+                .expect("crossing buy");
+            trade
+                .match_result
+                .trades()
+                .as_vec()
+                .first()
+                .expect("one fill")
+                .trade_id()
+        }
+        fn reference_leaf(symbol: &str, root: Uuid) -> OptionOrderBook {
+            OptionOrderBook::new_with_config(
+                symbol,
+                OptionStyle::Call,
+                BookConfig {
+                    trade_id_root_namespace: Some(root),
+                    ..BookConfig::default()
+                },
+            )
+        }
+
+        let root = Uuid::from_u128(0x0BAD_C0DE);
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+        let before = manager.get_or_create(50000);
+        manager.set_trade_id_namespace(root);
+        let after = manager.get_or_create(51000);
+
+        // A book created AFTER the set derives its namespace from the root, so it
+        // matches an independently-derived reference leaf with the same symbol.
+        let after_symbol = after.call().symbol().to_string();
+        assert_eq!(
+            first_trade_id(after.call()),
+            first_trade_id(&reference_leaf(&after_symbol, root)),
+            "a book created after set_trade_id_namespace uses the derived namespace"
+        );
+        // A book created BEFORE the set kept the default random namespace, so it
+        // does NOT match its own root-derived reference.
+        let before_symbol = before.call().symbol().to_string();
+        assert_ne!(
+            first_trade_id(before.call()),
+            first_trade_id(&reference_leaf(&before_symbol, root)),
+            "a book created before set_trade_id_namespace keeps the default namespace"
+        );
     }
 }

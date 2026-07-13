@@ -19,6 +19,7 @@ use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[cfg(feature = "nats")]
 use super::book::ContractNatsListenerFactory;
@@ -278,6 +279,34 @@ impl OptionChainOrderBook {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.strikes.clock()
+    }
+
+    /// Sets the root trade-ID namespace for all future option books created
+    /// within this chain.
+    ///
+    /// Delegates to [`StrikeOrderBookManager::set_trade_id_namespace`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.strikes.set_trade_id_namespace(namespace);
+    }
+
+    /// Clears the root trade-ID namespace, so future option books use the
+    /// upstream default random namespace.
+    ///
+    /// Delegates to [`StrikeOrderBookManager::clear_trade_id_namespace`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.strikes.clear_trade_id_namespace();
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.strikes.trade_id_namespace()
     }
 
     /// Propagates the per-contract NATS listener factory down to the strike
@@ -945,6 +974,10 @@ pub struct OptionChainOrderBookManager {
     /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
     /// time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Root trade-ID namespace propagated to newly created chains. `None` keeps
+    /// the upstream default random namespace; a set root makes trade IDs
+    /// reproducible across runs sharing the root.
+    trade_id_root_namespace: Shared<Option<Uuid>>,
 }
 
 impl OptionChainOrderBookManager {
@@ -965,6 +998,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
         }
     }
 
@@ -993,6 +1027,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
         }
     }
 
@@ -1030,6 +1065,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
         }
     }
 
@@ -1135,6 +1171,35 @@ impl OptionChainOrderBookManager {
         self.clock.get()
     }
 
+    /// Sets the root trade-ID namespace for all future chains created by this
+    /// manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains via
+    /// [`get_or_create`](Self::get_or_create) will have this root propagated down
+    /// to their strike manager, where each leaf derives `UUIDv5(root, symbol)`.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.trade_id_root_namespace.set(Some(namespace));
+    }
+
+    /// Clears the root trade-ID namespace so future chains use the upstream
+    /// default random namespace.
+    ///
+    /// Existing chains are not affected. Only newly created chains via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.trade_id_root_namespace.set(None);
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future chains
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.trade_id_root_namespace.get()
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -1206,6 +1271,9 @@ impl OptionChainOrderBookManager {
         }
         if let Some(clock) = self.clock.get() {
             fresh.set_clock(clock);
+        }
+        if let Some(ns) = self.trade_id_root_namespace.get() {
+            fresh.set_trade_id_namespace(ns);
         }
         // Atomic, idempotent publish: first inserter wins and is never evicted.
         let entry = self.chains.get_or_insert(key, fresh);
@@ -2140,5 +2208,18 @@ mod tests {
 
         // The externally held index is never touched by a manager built via `new`.
         assert!(symbol_index.is_empty());
+    }
+
+    #[test]
+    fn test_chain_set_trade_id_namespace_delegates() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        assert!(chain.trade_id_namespace().is_none());
+
+        let root = Uuid::from_u128(0x0BAD_C0DE);
+        chain.set_trade_id_namespace(root);
+        assert_eq!(chain.trade_id_namespace(), Some(root));
+
+        chain.clear_trade_id_namespace();
+        assert!(chain.trade_id_namespace().is_none());
     }
 }

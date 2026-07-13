@@ -358,7 +358,7 @@ pub use orderbook::{
     StrikeRangeConfigBuilder, StubClock, SubscriptionId, SymbolIndex, SymbolRef,
     TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingEvictExpiredResult,
     UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
-    ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
+    Uuid, ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
 };
 
 #[cfg(feature = "nats")]
