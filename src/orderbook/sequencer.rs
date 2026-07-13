@@ -54,11 +54,14 @@
 //! sequenced command stream produce identical command + result payloads** —
 //! trade ids, engine trade timestamps, and `engine_seq` included. This run-to-
 //! run identity is scoped to sequenced-only traffic on fresh instances (a
-//! non-sequenced direct add on the same book is outside it). The one field that
-//! still differs run to run is each event's `timestamp_ns` envelope (see
-//! [`OptionChainEvent`]), which the sequencer stamps from the wall clock at
-//! ingestion (orthogonal to trade-ID determinism); the engine trade timestamps
-//! *inside* the results come from the injected clock and are stable.
+//! non-sequenced direct add on the same book is outside it). Each event's
+//! `timestamp_ns` envelope (see [`OptionChainEvent`]) is stamped from the wall
+//! clock at ingestion by default; inject a deterministic source via
+//! [`set_timestamp_ns_source`](SequencedUnderlyingOrderBook::set_timestamp_ns_source)
+//! (alongside the clock and namespace, before the first submit) and two
+//! identically-seeded runs produce **fully byte-identical journals** — the
+//! engine trade timestamps *inside* the results come from the injected clock
+//! either way.
 //!
 //! Note the guarantee is about two identical *live* runs, not about live-vs-
 //! replay payload equality: [`replay`](SequencedUnderlyingOrderBook::replay)
@@ -90,7 +93,7 @@ use orderbook_rs::{Clock, OrderId, Side, TimeInForce, TradeResult};
 use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use uuid::Uuid;
 
 /// Scope for mass cancel operations in the option chain hierarchy.
@@ -546,7 +549,9 @@ impl OptionChainResult {
 pub struct OptionChainEvent {
     /// Monotonically increasing sequence number.
     pub sequence_num: u64,
-    /// Wall-clock timestamp in nanoseconds since Unix epoch.
+    /// Envelope timestamp in nanoseconds — wall clock (Unix epoch) by
+    /// default, injectable via
+    /// [`SequencedUnderlyingOrderBook::set_timestamp_ns_source`].
     pub timestamp_ns: u64,
     /// The command that was executed.
     pub command: OptionChainCommand,
@@ -728,6 +733,12 @@ impl OptionChainJournal for InMemoryOptionChainJournal {
     }
 }
 
+/// The injectable source for the event-envelope `timestamp_ns`.
+///
+/// Defaults to the wall clock; a deterministic source (e.g. an atomic
+/// counter) makes the envelope reproducible across identically-seeded runs.
+pub(crate) type TimestampNsSource = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// Internal sequencer that assigns sequence numbers and timestamps.
 pub(crate) struct OptionChainSequencer {
     /// Next sequence number to assign.
@@ -738,6 +749,12 @@ pub(crate) struct OptionChainSequencer {
     reject_count: AtomicU64,
     /// Serializes the assign→execute→journal-append critical section.
     gate: Mutex<()>,
+    /// Source of the event-envelope `timestamp_ns` read by [`assign`](Self::assign).
+    ///
+    /// Wall clock by default. Behind an `RwLock` so the facade can swap it
+    /// through `&self`; the read sits inside the submit gate, so it is
+    /// uncontended in practice.
+    timestamp_ns_source: RwLock<TimestampNsSource>,
 }
 
 impl OptionChainSequencer {
@@ -749,6 +766,7 @@ impl OptionChainSequencer {
             success_count: AtomicU64::new(0),
             reject_count: AtomicU64::new(0),
             gate: Mutex::new(()),
+            timestamp_ns_source: RwLock::new(Arc::new(nanos_since_epoch)),
         }
     }
 
@@ -763,7 +781,20 @@ impl OptionChainSequencer {
             success_count: AtomicU64::new(0),
             reject_count: AtomicU64::new(0),
             gate: Mutex::new(()),
+            timestamp_ns_source: RwLock::new(Arc::new(nanos_since_epoch)),
         }
+    }
+
+    /// Replaces the source of the event-envelope `timestamp_ns`.
+    ///
+    /// Recovers from a poisoned lock via the crate-wide
+    /// `unwrap_or_else(|p| p.into_inner())` policy.
+    pub fn set_timestamp_ns_source(&self, source: TimestampNsSource) {
+        let mut guard = self
+            .timestamp_ns_source
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = source;
     }
 
     /// Returns the sequence number that will be assigned by the next call to `assign()`.
@@ -789,11 +820,19 @@ impl OptionChainSequencer {
 
     /// Assigns a sequence number and timestamp to a command.
     ///
-    /// Returns `(sequence_num, timestamp_ns)`.
+    /// Returns `(sequence_num, timestamp_ns)`. The timestamp comes from the
+    /// injectable [`TimestampNsSource`] (wall clock unless replaced via
+    /// [`set_timestamp_ns_source`](Self::set_timestamp_ns_source)).
     #[inline]
     pub fn assign(&self) -> (u64, u64) {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel);
-        let ts = nanos_since_epoch();
+        let ts = {
+            let source = self
+                .timestamp_ns_source
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (source)()
+        };
         (seq, ts)
     }
 
@@ -1104,6 +1143,35 @@ impl SequencedUnderlyingOrderBook {
         // command deterministically sees either the old or the new namespace.
         let _serialized = self.sequencer.acquire_gate();
         self.inner.set_trade_id_namespace(namespace);
+    }
+
+    /// Replaces the source of the event-envelope `timestamp_ns` stamped on
+    /// every journaled [`OptionChainEvent`] and [`OptionChainReceipt`].
+    ///
+    /// The default source is the wall clock. Injecting a deterministic source
+    /// (e.g. an atomic counter) removes the last run-to-run divergence in the
+    /// journal: with an injected clock ([`set_clock`](Self::set_clock)), a
+    /// root trade-ID namespace
+    /// ([`set_trade_id_namespace`](Self::set_trade_id_namespace)), and this
+    /// source all set BEFORE the first [`submit`](Self::submit), two
+    /// identically-seeded sequenced runs on fresh instances produce **fully**
+    /// byte-identical journals — no field normalization required.
+    ///
+    /// The source only needs run-to-run identity for determinism; wall-clock
+    /// monotonicity matters only for human readability of the envelope. The
+    /// wire format is unchanged — only the value's origin becomes injectable.
+    /// Replay is unaffected (replay re-executes commands and never
+    /// re-journals).
+    ///
+    /// This call takes the same serialization gate as
+    /// [`submit`](Self::submit), so the swap is linearized against the
+    /// sequenced command stream exactly as [`set_clock`](Self::set_clock) is.
+    #[inline]
+    pub fn set_timestamp_ns_source(&self, source: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        // Linearize the config change against submit/replay so a racing
+        // command deterministically sees either the old or the new source.
+        let _serialized = self.sequencer.acquire_gate();
+        self.sequencer.set_timestamp_ns_source(source);
     }
 
     /// Returns the current sequence number.
@@ -5634,5 +5702,93 @@ mod tests {
             "sequence must advance past the live submits, got {}",
             book.current_sequence()
         );
+    }
+
+    #[test]
+    fn test_assign_uses_injected_timestamp_source() {
+        // An injected deterministic source drives the envelope timestamp:
+        // successive assigns carry its successive values.
+        let sequencer = OptionChainSequencer::new();
+        let counter = Arc::new(AtomicU64::new(1));
+        let source_counter = Arc::clone(&counter);
+        sequencer.set_timestamp_ns_source(Arc::new(move || {
+            source_counter.fetch_add(1, Ordering::Relaxed)
+        }));
+
+        let (seq0, ts0) = sequencer.assign();
+        let (seq1, ts1) = sequencer.assign();
+        assert_eq!((seq0, ts0), (0, 1), "first assign carries the first value");
+        assert_eq!((seq1, ts1), (1, 2), "second assign carries the next value");
+    }
+
+    #[test]
+    fn test_assign_default_source_is_wall_clock() {
+        // Without injection the envelope timestamp stays the wall clock:
+        // nonzero and non-decreasing across successive assigns.
+        let sequencer = OptionChainSequencer::new();
+        let (_, ts0) = sequencer.assign();
+        let (_, ts1) = sequencer.assign();
+        assert!(ts0 > 0, "default envelope timestamp must be nonzero");
+        assert!(
+            ts1 >= ts0,
+            "default envelope timestamps must not go backwards"
+        );
+    }
+
+    #[test]
+    fn test_set_timestamp_ns_source_linearized_against_submit() {
+        // The facade setter takes the submit gate: swapping the source while a
+        // thread submits must complete without deadlock, and every event's
+        // timestamp comes from exactly one of the two sources (never a torn
+        // read). Smoke test mirroring the set_clock linearization pattern.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = Arc::new(SequencedUnderlyingOrderBook::with_journal(
+            "BTC",
+            Arc::clone(&journal),
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let setter_book = Arc::clone(&book);
+        let setter_barrier = Arc::clone(&barrier);
+        let setter = thread::spawn(move || {
+            setter_barrier.wait();
+            setter_book.set_timestamp_ns_source(Arc::new(|| 42));
+        });
+
+        let submit_book = Arc::clone(&book);
+        let submit_barrier = Arc::clone(&barrier);
+        let submitter = thread::spawn(move || {
+            submit_barrier.wait();
+            for i in 0..10u64 {
+                submit_book
+                    .submit_add_order(
+                        "BTC-20240329-52000-C",
+                        OrderId::from_u64(9_000 + i),
+                        Side::Sell,
+                        300 + u128::from(i),
+                        5,
+                    )
+                    .expect("live submit");
+            }
+        });
+
+        setter.join().expect("setter thread");
+        submitter.join().expect("submitter thread");
+
+        // Every journaled event stamped after the swap carries exactly 42;
+        // events before it carry wall-clock values (> 42 by many orders of
+        // magnitude). No event may carry anything else.
+        let events = journal.read_from(0).expect("read journal");
+        assert_eq!(events.len(), 10, "all submits must journal");
+        for event in &events {
+            assert!(
+                event.timestamp_ns == 42 || event.timestamp_ns > 1_000_000,
+                "each envelope timestamp must come from exactly one source, got {}",
+                event.timestamp_ns
+            );
+        }
     }
 }

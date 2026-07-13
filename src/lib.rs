@@ -166,7 +166,11 @@
 //!   `UUIDv5(root, symbol)`) together with a deterministic clock via `set_clock`,
 //!   both before the first submit: two identically-seeded sequenced runs on
 //!   fresh instances then produce identical trade payloads (ids, engine trade
-//!   timestamps, `engine_seq`). Without them the old caveat applies. Either way
+//!   timestamps, `engine_seq`). Additionally injecting an event-envelope
+//!   timestamp source via `set_timestamp_ns_source` makes the two journals
+//!   fully byte-identical (with only namespace + clock injected, the trade
+//!   payloads are identical but the wall-clock envelope `timestamp_ns` still
+//!   differs). Without namespace and clock the old caveat applies. Either way
 //!   [`replay`](orderbook::SequencedUnderlyingOrderBook::replay) discards
 //!   journaled results, so the replay oracle compares book state and never diffs
 //!   trade payloads.

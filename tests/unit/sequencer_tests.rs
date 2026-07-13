@@ -1107,33 +1107,29 @@ fn drive_trade_id_prefix(book: &SequencedUnderlyingOrderBook) {
 #[test]
 fn test_sequenced_identical_runs_produce_identical_trade_ids() {
     // HEADLINE: two fully independent sequenced instances, each configured BEFORE
-    // the first submit with a fresh `StubClock` and the SAME root trade-ID
-    // namespace, driven through the identical command stream, produce identical
-    // command + result payloads — trade ids, engine trade timestamps, and
-    // engine_seq included. The namespace fixes the trade-ID root (each leaf
-    // derives UUIDv5(root, symbol)) and the stub clock fixes the engine
-    // timestamps.
-    //
-    // The ONLY field excluded from the comparison is each event's envelope
-    // `timestamp_ns`: the sequencer stamps that from `nanos_since_epoch()` (wall
-    // clock) at ingestion — it is orthogonal to trade-ID determinism and is not
-    // driven by the injected engine clock. It is normalized to 0 below so the
-    // assertion targets exactly the payloads #153 makes deterministic.
+    // the first submit with a fresh `StubClock`, the SAME root trade-ID
+    // namespace, AND a deterministic envelope timestamp source (#157), driven
+    // through the identical command stream, produce FULLY byte-identical
+    // journals — no field normalization. The namespace fixes the trade-ID root
+    // (each leaf derives UUIDv5(root, symbol)), the stub clock fixes the engine
+    // timestamps, and the injected timestamp source fixes the one field that
+    // previously had to be normalized: the event envelope `timestamp_ns`.
     fn run(root: Uuid) -> Vec<serde_json::Value> {
         let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
         let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
         book.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
         book.set_trade_id_namespace(root);
+        // Deterministic envelope timestamps: 1, 2, 3, … per instance.
+        let envelope_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        book.set_timestamp_ns_source(Arc::new(move || {
+            envelope_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }));
         drive_trade_id_prefix(&book);
         journal
             .read_from(0)
             .expect("read journal")
             .iter()
-            .map(|event| {
-                let mut value = serde_json::to_value(event).expect("serialize event");
-                value["timestamp_ns"] = serde_json::json!(0);
-                value
-            })
+            .map(|event| serde_json::to_value(event).expect("serialize event"))
             .collect()
     }
 
@@ -1150,8 +1146,19 @@ fn test_sequenced_identical_runs_produce_identical_trade_ids() {
     );
     assert_eq!(
         first, second,
-        "two identically-seeded sequenced runs must produce identical command + \
-         result payloads (trade ids, engine trade timestamps, engine_seq included)"
+        "two identically-seeded sequenced runs must produce fully byte-identical \
+         journals (trade ids, engine trade timestamps, engine_seq, and the \
+         envelope timestamp_ns included)"
+    );
+    // The envelope timestamps must actually come from the injected source —
+    // guard against the wall-clock default silently sneaking back in.
+    assert_eq!(
+        first
+            .first()
+            .and_then(|e| e["timestamp_ns"].as_u64())
+            .unwrap_or(0),
+        1,
+        "the first journaled event must carry the injected source's first value"
     );
 }
 
