@@ -4770,6 +4770,13 @@ mod tests {
             first_reason.contains("Price crossing"),
             "reason should be a PriceCrossing error, got {first_reason:?}"
         );
+        // Tie the fixture constant to live engine output: if upstream rewords
+        // the PriceCrossing message, this fails here rather than letting the
+        // v0.9.0 fixture silently diverge from reality.
+        assert_eq!(
+            first_reason, POST_ONLY_CROSS_REASON,
+            "POST_ONLY_CROSS_REASON must match the live engine rejection string"
+        );
     }
 
     #[test]

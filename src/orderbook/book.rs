@@ -1069,6 +1069,17 @@ impl OptionOrderBook {
         ))
     }
 
+    /// Builds the iceberg `visible + hidden` overflow error. Cold + un-inlined
+    /// so the common in-range path carries none of the formatting code.
+    #[cold]
+    #[inline(never)]
+    fn iceberg_size_overflow(&self, visible: u64, hidden: u64) -> Error {
+        Error::validation(format!(
+            "iceberg visible_quantity ({visible}) + hidden_quantity ({hidden}) overflows u64 for {}",
+            self.symbol
+        ))
+    }
+
     /// Adds a limit order to the book.
     ///
     /// # Arguments
@@ -1484,12 +1495,9 @@ impl OptionOrderBook {
         // The combined size is what an unmatched-rest empty result reports and
         // what upstream's min/max size check uses; guard the addition so an
         // overflow becomes a typed error rather than a wrap.
-        let total = visible_quantity.checked_add(hidden_quantity).ok_or_else(|| {
-            Error::validation(format!(
-                "iceberg visible_quantity ({visible_quantity}) + hidden_quantity ({hidden_quantity}) overflows u64 for {}",
-                self.symbol
-            ))
-        })?;
+        let total = visible_quantity
+            .checked_add(hidden_quantity)
+            .ok_or_else(|| self.iceberg_size_overflow(visible_quantity, hidden_quantity))?;
         let order = OrderType::IcebergOrder {
             id: order_id,
             price: Price::new(price),
