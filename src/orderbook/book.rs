@@ -13,7 +13,8 @@ use optionstratlib::OptionStyle;
 use orderbook_rs::PriceLevelChangedListener;
 use orderbook_rs::{
     Clock, DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId,
-    OrderStateTracker, OrderStatus, STPMode, Side, TimeInForce, TradeListener, TradeResult,
+    OrderStateTracker, OrderStatus, OrderType, STPMode, Side, TimeInForce, TradeListener,
+    TradeResult,
 };
 use pricelevel::{Hash32, MatchResult, OrderUpdate, Price, Quantity, TimestampMs};
 use std::collections::hash_map::DefaultHasher;
@@ -1369,6 +1370,202 @@ impl OptionOrderBook {
             order_id, price, quantity, side, tif, user_id, None,
         )?;
         Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+    }
+
+    // ── Order-kind methods (post-only / iceberg) ────────────────────────
+
+    /// Adds a post-only order and returns the full [`TradeResult`].
+    ///
+    /// A post-only order **never trades on entry**: if it would cross the
+    /// opposite side, the upstream engine's shape validation rejects it with
+    /// [`OrderBookEngine`](crate::Error::OrderBookEngine) wrapping
+    /// `OrderBookError::PriceCrossing { price, side, opposite_price }` *before*
+    /// any matching. The only outcomes are therefore: the order rests (an empty
+    /// [`TradeResult`] carrying `order_id` is returned), a `PriceCrossing`
+    /// rejection, or another validation rejection (tick / lot / risk / STP).
+    ///
+    /// The leaf builds the [`OrderType::PostOnly`] value directly and submits it
+    /// through the engine's generic `add_order_with_result` primitive, because
+    /// `orderbook_rs` exposes no typed post-only `_with_result` helper. The
+    /// order timestamp is drawn from this book's installed engine clock, so an
+    /// injected deterministic clock keeps the stamp reproducible.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `quantity` - Order quantity in smallest units (u64)
+    /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream engine rejects the
+    ///   order, including `PriceCrossing` when a post-only order would cross.
+    pub fn add_post_only_order_with_tif_and_user_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.check_price_band(price)?;
+        let order = OrderType::PostOnly {
+            id: order_id,
+            price: Price::new(price),
+            quantity: Quantity::new(quantity),
+            side,
+            user_id,
+            timestamp: self.book.clock().now_millis(),
+            time_in_force: tif,
+            extra_fields: (),
+        };
+        let (_order, trade) = self.book.add_order_with_result(order)?;
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+    }
+
+    /// Adds an iceberg order and returns the full [`TradeResult`].
+    ///
+    /// Unlike a post-only order, an iceberg **can cross and trade on entry**: it
+    /// is matched like a standard limit order, exposing only `visible_quantity`
+    /// at a time while `hidden_quantity` is replenished behind it. When it rests
+    /// without matching, an empty [`TradeResult`] carrying `order_id` is
+    /// returned.
+    ///
+    /// Upstream lot-size validation applies to the visible **and** hidden
+    /// quantities independently, while the min/max order-size checks apply to the
+    /// combined total. The resting order's `quantity()` accessor reports the
+    /// *visible* tranche, not the total. As with the post-only path, the leaf
+    /// builds the [`OrderType::IcebergOrder`] value directly and submits it via
+    /// the generic `add_order_with_result` primitive (no typed iceberg
+    /// `_with_result` helper exists upstream); the timestamp comes from this
+    /// book's engine clock.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `visible_quantity` - Visible tranche in smallest units (u64)
+    /// * `hidden_quantity` - Hidden reserve in smallest units (u64)
+    /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band, or if
+    ///   `visible_quantity + hidden_quantity` overflows `u64`.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream engine rejects the
+    ///   order (tick / lot / size / risk / STP).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_iceberg_order_with_tif_and_user_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        visible_quantity: u64,
+        hidden_quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.check_price_band(price)?;
+        // The combined size is what an unmatched-rest empty result reports and
+        // what upstream's min/max size check uses; guard the addition so an
+        // overflow becomes a typed error rather than a wrap.
+        let total = visible_quantity.checked_add(hidden_quantity).ok_or_else(|| {
+            Error::validation(format!(
+                "iceberg visible_quantity ({visible_quantity}) + hidden_quantity ({hidden_quantity}) overflows u64 for {}",
+                self.symbol
+            ))
+        })?;
+        let order = OrderType::IcebergOrder {
+            id: order_id,
+            price: Price::new(price),
+            visible_quantity: Quantity::new(visible_quantity),
+            hidden_quantity: Quantity::new(hidden_quantity),
+            side,
+            user_id,
+            timestamp: self.book.clock().now_millis(),
+            time_in_force: tif,
+            extra_fields: (),
+        };
+        let (_order, trade) = self.book.add_order_with_result(order)?;
+        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, total)))
+    }
+
+    /// Adds a post-only order, discarding the [`TradeResult`].
+    ///
+    /// Convenience wrapper over
+    /// [`add_post_only_order_with_tif_and_user_full`](Self::add_post_only_order_with_tif_and_user_full):
+    /// it delegates to the `_full` method (the single construction site) and
+    /// drops the result. Note the `_with_result` engine path always consumes an
+    /// `engine_seq` tick where a plain add may not; this is irrelevant for
+    /// replay, since `engine_seq` is per-instance and not replay-comparable.
+    ///
+    /// # Errors
+    ///
+    /// Identical to
+    /// [`add_post_only_order_with_tif_and_user_full`](Self::add_post_only_order_with_tif_and_user_full).
+    pub fn add_post_only_order_with_tif_and_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.add_post_only_order_with_tif_and_user_full(
+            order_id, side, price, quantity, tif, user_id,
+        )
+        .map(|_| ())
+    }
+
+    /// Adds an iceberg order, discarding the [`TradeResult`].
+    ///
+    /// Convenience wrapper over
+    /// [`add_iceberg_order_with_tif_and_user_full`](Self::add_iceberg_order_with_tif_and_user_full):
+    /// it delegates to the `_full` method (the single construction site) and
+    /// drops the result. The same `engine_seq` note as the post-only convenience
+    /// applies.
+    ///
+    /// # Errors
+    ///
+    /// Identical to
+    /// [`add_iceberg_order_with_tif_and_user_full`](Self::add_iceberg_order_with_tif_and_user_full).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_iceberg_order_with_tif_and_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        visible_quantity: u64,
+        hidden_quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.add_iceberg_order_with_tif_and_user_full(
+            order_id,
+            side,
+            price,
+            visible_quantity,
+            hidden_quantity,
+            tif,
+            user_id,
+        )
+        .map(|_| ())
     }
 
     /// Cancels an order by its ID.
@@ -4753,6 +4950,251 @@ mod tests {
         );
         // The bound is checked before the engine, so the original is untouched.
         assert_eq!(book.best_bid(), Some(500));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    // ── post-only / iceberg order kinds ─────────────────────────────────
+
+    /// Fixed non-zero owner for the order-kind tests.
+    fn kind_user() -> Hash32 {
+        Hash32::from([7u8; 32])
+    }
+
+    #[test]
+    fn test_add_post_only_order_rests_when_not_crossing() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Empty book: a post-only buy has nothing to cross and rests.
+        let res = book.add_post_only_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            res.is_ok(),
+            "post-only should rest on an empty book: {res:?}"
+        );
+        assert_eq!(book.best_bid(), Some(100));
+        assert!(book.best_ask().is_none());
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_post_only_order_would_cross_rejected_original_book_untouched() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Seed a resting sell; a post-only buy at the same price would cross.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+
+        let res = book.add_post_only_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            5,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        let err = match res {
+            Ok(_) => panic!("a crossing post-only must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("cross"),
+            "the rejection should mention crossing: {err}"
+        );
+        // Validate-first shape check: the book is untouched — no bid rested.
+        assert_eq!(book.order_count(), 1);
+        assert_eq!(book.best_ask(), Some(100));
+        assert!(book.best_bid().is_none());
+    }
+
+    #[test]
+    fn test_add_post_only_order_full_returns_empty_trade_when_rested() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        let trade = book
+            .add_post_only_order_with_tif_and_user_full(
+                id,
+                Side::Buy,
+                100,
+                10,
+                TimeInForce::Gtc,
+                kind_user(),
+            )
+            .expect("post-only rests");
+        // A rested post-only produced no fills; the empty result carries the
+        // taker's own order id.
+        assert!(trade.match_result.trades().is_empty());
+        assert_eq!(trade.match_result.order_id(), id);
+    }
+
+    #[test]
+    fn test_add_iceberg_order_full_rests_with_visible_and_hidden() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let trade = book
+            .add_iceberg_order_with_tif_and_user_full(
+                OrderId::new(),
+                Side::Buy,
+                100,
+                3,
+                7,
+                TimeInForce::Gtc,
+                kind_user(),
+            )
+            .expect("iceberg rests");
+        assert!(
+            trade.match_result.trades().is_empty(),
+            "resting iceberg has no fills"
+        );
+        assert_eq!(book.order_count(), 1);
+        assert_eq!(book.best_bid(), Some(100));
+
+        // The level exposes the visible tranche and hides the reserve.
+        let snapshot = book.snapshot(8);
+        let level = snapshot.bids.first().expect("one resting bid level");
+        assert_eq!(level.visible_quantity().as_u64(), 3, "visible tranche");
+        assert_eq!(level.hidden_quantity().as_u64(), 7, "hidden reserve");
+    }
+
+    #[test]
+    fn test_add_iceberg_order_full_crossing_returns_fills() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Resting sell to cross into.
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+
+        // Iceberg buy at the ask crosses and trades on entry (visible 3 + hidden 5).
+        let trade = book
+            .add_iceberg_order_with_tif_and_user_full(
+                OrderId::new(),
+                Side::Buy,
+                100,
+                3,
+                5,
+                TimeInForce::Gtc,
+                kind_user(),
+            )
+            .expect("iceberg crosses");
+        assert!(
+            !trade.match_result.trades().is_empty(),
+            "a crossing iceberg must trade on entry"
+        );
+    }
+
+    #[test]
+    fn test_add_iceberg_order_visible_plus_hidden_overflow_rejected() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let res = book.add_iceberg_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            u64::MAX,
+            1,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            matches!(res, Err(Error::ValidationError { .. })),
+            "visible + hidden overflow must be a typed ValidationError: {res:?}"
+        );
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_post_only_order_out_of_band_rejected_before_engine() {
+        let book = max_price_book(1_000);
+        // An above-band post-only is rejected by the crate-side band check before
+        // the order is ever built or handed to the engine.
+        let res = book.add_post_only_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            1_001,
+            10,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            matches!(res, Err(Error::ValidationError { .. })),
+            "out-of-band post-only must be a ValidationError, not an engine error: {res:?}"
+        );
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_iceberg_order_out_of_band_rejected_before_engine() {
+        let book = max_price_book(1_000);
+        let res = book.add_iceberg_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            1_001,
+            3,
+            7,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            matches!(res, Err(Error::ValidationError { .. })),
+            "out-of-band iceberg must be a ValidationError, not an engine error: {res:?}"
+        );
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_post_only_order_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt().expect("halt");
+        let res = book.add_post_only_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            matches!(res, Err(Error::InstrumentNotActive { .. })),
+            "post-only on a halted book must be rejected: {res:?}"
+        );
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_iceberg_order_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt().expect("halt");
+        let res = book.add_iceberg_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            3,
+            7,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(
+            matches!(res, Err(Error::InstrumentNotActive { .. })),
+            "iceberg on a halted book must be rejected: {res:?}"
+        );
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_post_only_convenience_delegates() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // The non-`_full` convenience delegates to the `_full` method and drops
+        // the result; a resting post-only still succeeds and rests.
+        let res = book.add_post_only_order_with_tif_and_user(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+            kind_user(),
+        );
+        assert!(res.is_ok(), "post-only convenience should rest: {res:?}");
+        assert_eq!(book.best_bid(), Some(100));
         assert_eq!(book.order_count(), 1);
     }
 }
