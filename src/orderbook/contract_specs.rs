@@ -67,7 +67,10 @@ impl std::fmt::Display for SettlementType {
 /// price-bound hook. When both a spec band and a validation-slot band apply to
 /// the same leaf they are merged tightest-wins (see
 /// [`ValidationConfig::tightened_price_band`]). Band-free specs serialize to the
-/// exact 0.8.0 wire shape (the two band fields are skipped when unset).
+/// exact 0.8.0 wire shape (the two band fields are skipped when unset). A
+/// band-carrying payload read by a 0.8.0 consumer is silently accepted with
+/// the band fields ignored (this DTO does not use `deny_unknown_fields`), so
+/// the band is enforced only by 0.9.0+ binaries — not a decode failure.
 ///
 /// # Examples
 ///
