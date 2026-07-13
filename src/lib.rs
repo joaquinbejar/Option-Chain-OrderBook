@@ -159,11 +159,17 @@
 //! - **Mark price is a derived, non-journaled value.** It is computed from
 //!   current inputs and is not part of the `sequencer` journal; replay
 //!   reconstructs order-book state, not historical mark prices.
-//! - **Trade IDs are not replay-stable.** The upstream engine mints each
-//!   book's trade-ID namespace with a random `Uuid::new_v4()` and exposes no
-//!   injection seam, so trade IDs differ between a live run and its replay
-//!   even on identical command streams; the replay oracle compares book
-//!   state and excludes trade IDs (tracked upstream as OrderBook-rs#199).
+//! - **Deterministic trade IDs require an injected namespace + clock.** By
+//!   default each leaf's trade-ID namespace is a random `Uuid::new_v4()`, so
+//!   trade IDs and timestamps differ from run to run. Inject a root namespace
+//!   via the sequencer's `set_trade_id_namespace` (each leaf then derives
+//!   `UUIDv5(root, symbol)`) together with a deterministic clock via `set_clock`,
+//!   both before the first submit: two identically-seeded sequenced runs on
+//!   fresh instances then produce identical trade payloads (ids, engine trade
+//!   timestamps, `engine_seq`). Without them the old caveat applies. Either way
+//!   [`replay`](orderbook::SequencedUnderlyingOrderBook::replay) discards
+//!   journaled results, so the replay oracle compares book state and never diffs
+//!   trade payloads.
 //! - **Time-in-force replay determinism requires an injected clock.** `GTD` /
 //!   `Day` admission is decided by each leaf's engine clock. Inject a
 //!   deterministic clock (e.g. [`orderbook::StubClock`]) via the hierarchy's
@@ -358,7 +364,7 @@ pub use orderbook::{
     StrikeRangeConfigBuilder, StubClock, SubscriptionId, SymbolIndex, SymbolRef,
     TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingEvictExpiredResult,
     UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
-    ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
+    Uuid, ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
 };
 
 #[cfg(feature = "nats")]

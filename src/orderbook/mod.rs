@@ -154,3 +154,6 @@ pub use orderbook_rs::{
     OrderStatus, OrderType, STPMode, Side, StubClock, TimeInForce, TradeResult,
 };
 pub use pricelevel::{Hash32, Price, Quantity, TimestampMs};
+// Re-export `Uuid` so downstream consumers can set trade-ID namespaces without
+// taking their own direct `uuid` dependency (boundary-type policy).
+pub use uuid::Uuid;

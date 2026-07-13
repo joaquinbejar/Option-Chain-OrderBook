@@ -33,18 +33,41 @@
 //! deadlock against the journal. `execute_command` must never acquire the gate,
 //! since it runs while the gate is already held.
 //!
-//! # Known limitation — trade-ID determinism
+//! # Deterministic trade IDs
 //!
-//! The upstream `orderbook_rs::OrderBook` mints its trade/transaction-ID
-//! namespace internally with a random `Uuid::new_v4()` at construction, and
-//! offers no injection seam. Trade IDs therefore differ between a live run and
-//! its replay even when the command stream, the injected
-//! [`Clock`](orderbook_rs::Clock), and the matching are identical. The replay
-//! oracle intentionally compares order-book *state* (resting orders,
-//! top-of-book, instrument status) and excludes trade IDs. Tracked upstream as
-//! [OrderBook-rs#199](https://github.com/joaquinbejar/OrderBook-rs/issues/199);
-//! once a namespace seam ships, the hierarchy will thread a deterministic
-//! namespace alongside the clock.
+//! By default the upstream `orderbook_rs::OrderBook` mints each book's
+//! trade/transaction-ID namespace with a random `Uuid::new_v4()` at
+//! construction, so trade IDs differ between two runs even on an identical
+//! command stream. Since orderbook-rs 0.11 (upstream #199/#200) the namespace is
+//! injectable, and this crate threads it end to end: a single **root** namespace
+//! set via
+//! [`set_trade_id_namespace`](SequencedUnderlyingOrderBook::set_trade_id_namespace)
+//! propagates down the hierarchy, and each leaf derives its own
+//! `UUIDv5(root, symbol)` at construction (so a strike's call and put get
+//! distinct namespaces from their distinct symbols). Set the root — and an
+//! injected [`Clock`](orderbook_rs::Clock) via
+//! [`set_clock`](SequencedUnderlyingOrderBook::set_clock) — BEFORE the first
+//! [`submit`](SequencedUnderlyingOrderBook::submit).
+//!
+//! With both injected, **two independent `SequencedUnderlyingOrderBook`
+//! instances built on fresh hierarchies and driven through the identical
+//! sequenced command stream produce identical command + result payloads** —
+//! trade ids, engine trade timestamps, and `engine_seq` included. This run-to-
+//! run identity is scoped to sequenced-only traffic on fresh instances (a
+//! non-sequenced direct add on the same book is outside it). The one field that
+//! still differs run to run is each event's `timestamp_ns` envelope (see
+//! [`OptionChainEvent`]), which the sequencer stamps from the wall clock at
+//! ingestion (orthogonal to trade-ID determinism); the engine trade timestamps
+//! *inside* the results come from the injected clock and are stable.
+//!
+//! Note the guarantee is about two identical *live* runs, not about live-vs-
+//! replay payload equality: [`replay`](SequencedUnderlyingOrderBook::replay)
+//! deliberately discards the journaled results and keeps the freshly produced
+//! state, so the replay==live oracle compares order-book *state* (resting
+//! orders, top-of-book, instrument status) and does not diff `trade` payloads.
+//! When the clock and namespace are NOT injected, trade IDs and timestamps carry
+//! each leaf's per-instance random namespace and wall clock and are not
+//! run-to-run stable.
 //!
 //! # Feature Gate
 //!
@@ -68,6 +91,7 @@ use pricelevel::{Hash32, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use uuid::Uuid;
 
 /// Scope for mass cancel operations in the option chain hierarchy.
 ///
@@ -337,15 +361,16 @@ pub enum OptionChainCommand {
     /// live execution and replay both use the same non-creating resolver, so a
     /// replace against a book that was never created is rejected identically on
     /// both. The replacement carries validate-first atomic semantics from the
-    /// leaf [`replace_order`](crate::orderbook::OptionOrderBook::replace_order):
+    /// leaf
+    /// [`replace_order_full`](crate::orderbook::OptionOrderBook::replace_order_full):
     /// if the replacement's shape, risk, or self-cross check fails, the original
     /// order survives untouched.
     ///
-    /// Replace fills are NOT carried in the v1 result. If the new price crosses
-    /// the book the replacement can rematch and fill immediately; those fills
-    /// reach only the trade listener (and the NATS publisher), not the journaled
-    /// [`OptionChainResult::OrderReplaced`] — a follow-up will surface them once
-    /// OrderBook-rs#199 ships replay-stable ids.
+    /// If the new price crosses the book the replacement can rematch and fill
+    /// immediately; those fills are carried in the journaled
+    /// [`OptionChainResult::OrderReplaced::trade`] (as well as reaching the trade
+    /// listener / NATS publisher). See that field for the run-to-run trade-ID
+    /// stability caveat.
     ///
     /// Wire-compatible addition: appended after every prior variant, so existing
     /// journals replay unchanged and their bincode variant indices are
@@ -398,18 +423,23 @@ pub enum OptionChainResult {
         /// (JSON); positional codecs such as bincode cannot decode pre-#148
         /// binary records against the new shape.
         ///
-        /// # Replay caveat
+        /// # Trade-ID stability
         ///
         /// The payload's [`TradeResult::engine_seq`], the individual trade ids,
-        /// and the trade timestamps are NOT replay-stable: a replay into a fresh
-        /// book mints a fresh engine-seq / trade-id namespace (pending
-        /// OrderBook-rs#199). Replay discards journaled results by design (it
-        /// re-executes commands and keeps the freshly produced state), so the
-        /// replay==live *state* oracle is unaffected — but a consumer must not
-        /// diff `trade` payloads across a live run and a replay run and expect
-        /// them to match. There is deliberately no `skip_serializing_if` here:
-        /// the field is always emitted (as `null` when `None`) so the JSON and
-        /// bincode encodings stay symmetric across decode/encode round-trips.
+        /// and the trade timestamps are run-to-run stable **only when** the book
+        /// was configured with an injected clock and trade-ID namespace before the
+        /// first submit (see
+        /// [`set_trade_id_namespace`](SequencedUnderlyingOrderBook::set_trade_id_namespace)):
+        /// two identical sequenced runs on fresh instances then produce identical
+        /// trade payloads. Without those, each leaf uses its per-instance random
+        /// namespace and wall clock, so the payloads differ from run to run.
+        /// Either way, [`replay`](SequencedUnderlyingOrderBook::replay) discards
+        /// journaled results and keeps the freshly produced state, so the
+        /// replay==live *state* oracle is unaffected — a consumer must not diff
+        /// `trade` payloads across a live run and its replay. There is
+        /// deliberately no `skip_serializing_if` here: the field is always emitted
+        /// (as `null` when `None`) so the JSON and bincode encodings stay
+        /// symmetric across decode/encode round-trips.
         #[serde(default)]
         trade: Option<TradeResult>,
     },
@@ -457,13 +487,31 @@ pub enum OptionChainResult {
     },
     /// A resting order was atomically replaced.
     ///
-    /// The successful outcome of an [`OptionChainCommand::ReplaceOrder`]. The
-    /// replacement's fills, if the new price crossed the book, are NOT carried
-    /// here in v1 — they reach only the trade listener / NATS publisher (see the
-    /// command's doc). This variant reports placement, not fills.
+    /// The successful outcome of an [`OptionChainCommand::ReplaceOrder`].
     OrderReplaced {
         /// The identifier of the replaced order.
         order_id: OrderId,
+        /// The fills the replacement produced on entry, if any.
+        ///
+        /// `Some` iff the repriced order crossed the book and executed at least
+        /// one trade; `None` when it rested without crossing — which is also what
+        /// any pre-#153 journal (whose `OrderReplaced` had no `trade` field)
+        /// decodes to via `#[serde(default)]`.
+        ///
+        /// # Replay caveat
+        ///
+        /// Like [`OrderAdded::trade`](Self::OrderAdded), this payload's trade ids,
+        /// timestamps, and `engine_seq` are run-to-run stable only when the book
+        /// was configured with an injected clock and trade-ID namespace before the
+        /// first submit (see
+        /// [`set_trade_id_namespace`](SequencedUnderlyingOrderBook::set_trade_id_namespace));
+        /// without those they carry the leaf's per-instance namespace and clock.
+        /// Replay discards journaled results by design, so the replay==live *state*
+        /// oracle is unaffected either way. There is deliberately no
+        /// `skip_serializing_if`: the field is always emitted (as `null` when
+        /// `None`) so the JSON and bincode encodings stay symmetric.
+        #[serde(default)]
+        trade: Option<TradeResult>,
     },
 }
 
@@ -1024,6 +1072,40 @@ impl SequencedUnderlyingOrderBook {
         self.inner.set_clock(clock);
     }
 
+    /// Sets the root trade-ID namespace for leaves this book vivifies from later
+    /// commands.
+    ///
+    /// Delegates to [`UnderlyingOrderBook::set_trade_id_namespace`], so the root
+    /// is propagated to expirations, chains, and strikes created *after* this
+    /// call; each leaf derives its own `UUIDv5(root, symbol)` at construction
+    /// (call and put get distinct namespaces from their distinct symbols). Set it
+    /// BEFORE the first [`submit`](Self::submit): leaves vivified by earlier
+    /// commands keep whatever namespace they were built with (the upstream
+    /// default random `Uuid::new_v4()` when none was injected).
+    ///
+    /// # Deterministic trade IDs across runs
+    ///
+    /// With an injected clock ([`set_clock`](Self::set_clock)) AND a root
+    /// namespace both set before the first submit, two independent
+    /// `SequencedUnderlyingOrderBook` instances built on fresh hierarchies and
+    /// driven through the identical sequenced command stream produce
+    /// byte-identical trade-ID streams — trade ids, engine timestamps, and
+    /// `engine_seq` included. The namespace fixes the trade-ID root and the clock
+    /// fixes the timestamps; together they remove the two sources of run-to-run
+    /// divergence. This guarantee is scoped to sequenced-only traffic on fresh
+    /// instances; a non-sequenced direct add on the same book is outside it.
+    ///
+    /// This call takes the same serialization gate as
+    /// [`submit`](Self::submit), so the namespace change is linearized against
+    /// the sequenced command stream exactly as [`set_clock`](Self::set_clock) is.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        // Linearize the config change against submit/replay so a racing
+        // command deterministically sees either the old or the new namespace.
+        let _serialized = self.sequencer.acquire_gate();
+        self.inner.set_trade_id_namespace(namespace);
+    }
+
     /// Returns the current sequence number.
     #[must_use]
     #[inline]
@@ -1375,12 +1457,15 @@ impl SequencedUnderlyingOrderBook {
     /// replace against a book that does not exist is rejected. Replace semantics
     /// are validate-first and atomic — a rejected replacement leaves the original
     /// order untouched (see the leaf
-    /// [`replace_order`](crate::orderbook::OptionOrderBook::replace_order)).
+    /// [`replace_order_full`](crate::orderbook::OptionOrderBook::replace_order_full)).
     ///
     /// The receipt is [`OptionChainResult::OrderReplaced`] on success,
     /// [`OptionChainResult::BookNotFound`] when the symbol names no existing
     /// book, or [`OptionChainResult::Rejected`] when the order is not resting,
-    /// the symbol crosses underlyings, or the engine rejects the replacement.
+    /// the symbol crosses underlyings, or the engine rejects the replacement. On
+    /// success, [`OrderReplaced::trade`](OptionChainResult::OrderReplaced) carries
+    /// the replacement's own fills when the repriced order crossed the book (see
+    /// that field for the trade-ID stability caveat).
     ///
     /// # Arguments
     ///
@@ -1700,11 +1785,14 @@ impl SequencedUnderlyingOrderBook {
             }
         };
 
-        match book.replace_order(order_id, price, quantity, side) {
-            Ok(true) => OptionChainResult::OrderReplaced { order_id },
+        match book.replace_order_full(order_id, price, quantity, side) {
+            // Carry the replacement's own fills: `Some(trade)` when it rematched
+            // on entry, `None` when it rested without crossing. The leaf already
+            // filters the capture to this replacement's taker id.
+            Ok((true, trade)) => OptionChainResult::OrderReplaced { order_id, trade },
             // The book exists but no order with that id is resting: a
             // deterministic rejection (not a book-not-found).
-            Ok(false) => OptionChainResult::Rejected {
+            Ok((false, _)) => OptionChainResult::Rejected {
                 reason: format!("order not found: {order_id}"),
             },
             Err(e) => OptionChainResult::Rejected {
@@ -2165,14 +2253,17 @@ impl SequencedUnderlyingOrderBook {
     /// [`submit_replace_order`](Self::submit_replace_order)) replays through the
     /// SAME non-creating resolution and the same engine validate-first replace
     /// path (the leaf
-    /// [`replace_order`](crate::orderbook::OptionOrderBook::replace_order)) as
-    /// live, so a replace that re-priced an order to a crossing level and
+    /// [`replace_order_full`](crate::orderbook::OptionOrderBook::replace_order_full))
+    /// as live, so a replace that re-priced an order to a crossing level and
     /// rematched live rematches identically on replay, rebuilding the same
     /// resting book. Journaled `trade` payloads carried in
-    /// [`OptionChainResult::OrderAdded`] results are ignored by replay: replay
+    /// [`OptionChainResult::OrderAdded`] and
+    /// [`OptionChainResult::OrderReplaced`] results are ignored by replay: replay
     /// re-executes commands and keeps the freshly produced results, so the
-    /// non-replay-stable trade ids / engine-seqs in the journal never influence
-    /// the rebuilt state.
+    /// journaled trade ids / engine-seqs never influence the rebuilt state. (When
+    /// the clock and trade-ID namespace are injected, those payloads are stable
+    /// across identical live runs — see the fields' docs — but replay does not
+    /// depend on that.)
     ///
     /// Returns the number of events replayed.
     ///
@@ -3314,7 +3405,8 @@ mod tests {
                     trade: Some(deterministic_trade_result()),
                 },
             },
-            // ReplaceOrder + OrderReplaced (#148).
+            // ReplaceOrder + OrderReplaced that rested without crossing (#148;
+            // trade None on the #153 field).
             OptionChainEvent {
                 sequence_num: 10,
                 timestamp_ns: 1_700_000_000_000_000_009,
@@ -3325,7 +3417,10 @@ mod tests {
                     quantity: 7,
                     side: Side::Buy,
                 },
-                result: OptionChainResult::OrderReplaced { order_id: oid },
+                result: OptionChainResult::OrderReplaced {
+                    order_id: oid,
+                    trade: None,
+                },
             },
             // PostOnly AddOrder that rested (#151): non-default kind, trade None.
             OptionChainEvent {
@@ -3364,6 +3459,23 @@ mod tests {
                     hidden_quantity: Some(20),
                 },
                 result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: Some(deterministic_trade_result()),
+                },
+            },
+            // ReplaceOrder whose repriced order rematched on entry (#153): the
+            // OrderReplaced result carries the replacement's own fills.
+            OptionChainEvent {
+                sequence_num: 13,
+                timestamp_ns: 1_700_000_000_000_000_012,
+                command: OptionChainCommand::ReplaceOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    price: 130,
+                    quantity: 4,
+                    side: Side::Buy,
+                },
+                result: OptionChainResult::OrderReplaced {
                     order_id: oid,
                     trade: Some(deterministic_trade_result()),
                 },
@@ -3495,6 +3607,23 @@ mod tests {
                     reason: "iceberg add requires hidden_quantity >= 1".to_string(),
                 },
             },
+            // Replace whose repriced order rematched on entry (#153): the
+            // OrderReplaced result carries the replacement's own fills.
+            OptionChainEvent {
+                sequence_num: 5,
+                timestamp_ns: 1_700_000_000_000_000_104,
+                command: OptionChainCommand::ReplaceOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::sequential(42),
+                    price: 130,
+                    quantity: 4,
+                    side: Side::Buy,
+                },
+                result: OptionChainResult::OrderReplaced {
+                    order_id: OrderId::sequential(42),
+                    trade: Some(deterministic_trade_result()),
+                },
+            },
         ]
     }
 
@@ -3600,7 +3729,7 @@ mod tests {
 
         let decoded: Vec<OptionChainEvent> =
             serde_json::from_str(FIXTURE).expect("v0.9.0 journal fixture must decode");
-        assert_eq!(decoded.len(), 4, "fixture should hold four events");
+        assert_eq!(decoded.len(), 5, "fixture should hold five events");
 
         // Spot-check the #151 shapes.
         assert!(matches!(
@@ -3643,6 +3772,15 @@ mod tests {
                 hidden_quantity: None,
                 ..
             }
+        ));
+        // #153: a replace whose repriced order rematched carries its fills.
+        assert!(matches!(
+            decoded[4].command,
+            OptionChainCommand::ReplaceOrder { price: 130, .. }
+        ));
+        assert!(matches!(
+            decoded[4].result,
+            OptionChainResult::OrderReplaced { trade: Some(_), .. }
         ));
 
         // Strict re-encode: the current schema is fully materialized in the
@@ -3740,11 +3878,10 @@ mod tests {
         ));
 
         // Patch-defaults re-encode: the frozen v0.8.0 fixture predates the #151
-        // `kind` / `hidden_quantity` fields, which the current schema always
-        // emits. Inject those defaults into the two AddOrder command objects
-        // (events 0 and 8) before comparing byte-for-byte — same sanctioned
-        // pattern the v0.5.0 test uses for the #148 fields. The frozen file is
-        // untouched.
+        // `kind` / `hidden_quantity` fields on `AddOrder` and the #153 `trade`
+        // field on `OrderReplaced`, which the current schema always emits. Inject
+        // those defaults before comparing byte-for-byte — same sanctioned pattern
+        // the v0.5.0 test uses. The frozen file is untouched.
         let reencoded: serde_json::Value =
             serde_json::to_value(&decoded).expect("re-encode decoded events");
         let mut on_disk: serde_json::Value =
@@ -3756,10 +3893,16 @@ mod tests {
             add_cmd.insert("kind".to_string(), serde_json::json!("Limit"));
             add_cmd.insert("hidden_quantity".to_string(), serde_json::Value::Null);
         }
+        // Event 9 is the ReplaceOrder + OrderReplaced; inject the #153 trade
+        // default.
+        let replaced = on_disk[9]["result"]["OrderReplaced"]
+            .as_object_mut()
+            .expect("fixture event 9 result must be OrderReplaced");
+        replaced.insert("trade".to_string(), serde_json::Value::Null);
         assert_eq!(
             reencoded, on_disk,
             "re-encoded journal diverged from the checked-in v0.8.0 wire format \
-             (beyond the known #151 additive fields)"
+             (beyond the known #151/#153 additive fields)"
         );
     }
 
@@ -3892,11 +4035,13 @@ mod tests {
         );
 
         // Extra field inside the #148 OrderReplaced result struct-variant.
+        // Unknown field alongside the #153 `trade` field on OrderReplaced must be
+        // rejected (proving `trade` did not weaken deny_unknown_fields).
         let in_replaced_result = r#"{
             "sequence_num": 1,
             "timestamp_ns": 2,
             "command": { "CancelOrder": { "symbol": "BTC-20240329-50000-C", "order_id": "42" } },
-            "result": { "OrderReplaced": { "order_id": "42", "extra": 1 } }
+            "result": { "OrderReplaced": { "order_id": "42", "trade": null, "extra": 1 } }
         }"#;
         assert!(
             serde_json::from_str::<OptionChainEvent>(in_replaced_result).is_err(),
@@ -4146,10 +4291,11 @@ mod tests {
         assert_eq!(value, expected, "OrderAdded-with-trade wire format drifted");
     }
 
-    /// Pins the #148 `ReplaceOrder` / `OrderReplaced` wire format and proves the
-    /// old-binary-reads-new-journal asymmetry: a binary that predates the
-    /// variant rejects the new tag (unknown variant), independent of
-    /// `deny_unknown_fields`.
+    /// Pins the `ReplaceOrder` / `OrderReplaced` wire format — including the
+    /// #153 `trade` field on `OrderReplaced` (`null` when the replacement rested,
+    /// always emitted) — and proves the old-binary-reads-new-journal asymmetry: a
+    /// binary that predates the variant rejects the new tag (unknown variant),
+    /// independent of `deny_unknown_fields`.
     #[test]
     fn test_replace_order_wire_format_pinned() {
         let event = OptionChainEvent {
@@ -4164,6 +4310,7 @@ mod tests {
             },
             result: OptionChainResult::OrderReplaced {
                 order_id: OrderId::sequential(42),
+                trade: None,
             },
         };
         let value = serde_json::to_value(&event).expect("serialize");
@@ -4177,7 +4324,7 @@ mod tests {
                 "quantity": 7,
                 "side": "BUY"
             } },
-            "result": { "OrderReplaced": { "order_id": "42" } }
+            "result": { "OrderReplaced": { "order_id": "42", "trade": null } }
         });
         assert_eq!(value, expected, "ReplaceOrder wire format drifted");
 
@@ -4515,6 +4662,19 @@ mod tests {
     }
 
     #[test]
+    fn test_order_replaced_without_trade_decodes_as_none() {
+        // A pre-#153 OrderReplaced result has no trade field. It must decode to
+        // `trade: None` so old journals decode and replay unchanged.
+        let no_trade = r#"{ "OrderReplaced": { "order_id": "1" } }"#;
+        let result: OptionChainResult =
+            serde_json::from_str(no_trade).expect("tradeless OrderReplaced must decode");
+        match result {
+            OptionChainResult::OrderReplaced { trade, .. } => assert!(trade.is_none()),
+            other => panic!("expected OrderReplaced, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_order_added_carries_trade_when_add_fills() {
         // The fixture seeds a resting call sell@110 qty5; a marketable buy@110
         // crosses it and executes a fill, so OrderAdded carries the trade.
@@ -4564,8 +4724,48 @@ mod tests {
             .submit_replace_order(symbol, oid, 105, 7, Side::Buy)
             .expect("submit replace");
         match &receipt.result {
-            OptionChainResult::OrderReplaced { order_id } => assert_eq!(*order_id, oid),
+            OptionChainResult::OrderReplaced { order_id, .. } => assert_eq!(*order_id, oid),
             other => panic!("expected OrderReplaced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sequenced_replace_with_fills_carries_trade_in_receipt() {
+        // A replace that re-prices a resting buy up to a crossing ask rematches on
+        // entry; the receipt's OrderReplaced carries the replacement's own fills,
+        // attributed to the replaced order id (the taker of the rematch).
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        let symbol = "BTC-20240329-50000-C";
+        let maker = OrderId::sequential(1);
+        let taker = OrderId::sequential(2);
+        book.submit_add_order(symbol, maker, Side::Sell, 100, 5)
+            .expect("seed resting ask");
+        book.submit_add_order(symbol, taker, Side::Buy, 90, 5)
+            .expect("seed resting buy below the ask");
+
+        // Re-price the buy up to the ask so it crosses and rematches.
+        let receipt = book
+            .submit_replace_order(symbol, taker, 100, 5, Side::Buy)
+            .expect("submit replace");
+        match &receipt.result {
+            OptionChainResult::OrderReplaced { order_id, trade } => {
+                assert_eq!(*order_id, taker);
+                let trade = trade
+                    .as_ref()
+                    .expect("a crossing replacement must carry its fills");
+                assert!(
+                    !trade.match_result.trades().is_empty(),
+                    "trade payload must record at least one fill"
+                );
+                // The fills are attributed to the replacement (the taker of the
+                // rematch), proving the leaf's taker-id filter kept the right trade.
+                assert_eq!(
+                    trade.match_result.order_id(),
+                    taker,
+                    "the captured trade's taker id must be the replaced order id"
+                );
+            }
+            other => panic!("expected OrderReplaced with fills, got {other:?}"),
         }
     }
 

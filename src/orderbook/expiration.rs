@@ -19,6 +19,7 @@ use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::{Hash32, TimestampMs};
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 use super::book::TerminalOrderSummary;
 #[cfg(feature = "nats")]
@@ -262,6 +263,34 @@ impl ExpirationOrderBook {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.chain.clock()
+    }
+
+    /// Sets the root trade-ID namespace for all future option books created
+    /// within this expiration.
+    ///
+    /// Delegates to [`OptionChainOrderBook::set_trade_id_namespace`](super::chain::OptionChainOrderBook::set_trade_id_namespace).
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.chain.set_trade_id_namespace(namespace);
+    }
+
+    /// Clears the root trade-ID namespace, so future option books use the
+    /// upstream default random namespace.
+    ///
+    /// Delegates to [`OptionChainOrderBook::clear_trade_id_namespace`](super::chain::OptionChainOrderBook::clear_trade_id_namespace).
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.chain.clear_trade_id_namespace();
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.chain.trade_id_namespace()
     }
 
     /// Propagates the per-contract NATS listener factory down to this
@@ -657,6 +686,10 @@ pub struct ExpirationOrderBookManager {
     /// the upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
     /// time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Root trade-ID namespace propagated to newly created expiration books.
+    /// `None` keeps the upstream default random namespace; a set root makes
+    /// trade IDs reproducible across runs sharing the root.
+    trade_id_root_namespace: Shared<Option<Uuid>>,
     /// Per-contract NATS listener factory propagated to newly created
     /// expiration books (and onward to their strikes). `None` (the default)
     /// reproduces the non-NATS path exactly.
@@ -682,6 +715,7 @@ impl ExpirationOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -712,6 +746,7 @@ impl ExpirationOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -740,6 +775,7 @@ impl ExpirationOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
         }
@@ -845,6 +881,35 @@ impl ExpirationOrderBookManager {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// Sets the root trade-ID namespace for all future expiration books created
+    /// by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will have this root propagated down
+    /// to their chains and strikes, where each leaf derives `UUIDv5(root, symbol)`.
+    #[inline]
+    pub fn set_trade_id_namespace(&self, namespace: Uuid) {
+        self.trade_id_root_namespace.set(Some(namespace));
+    }
+
+    /// Clears the root trade-ID namespace so future expiration books use the
+    /// upstream default random namespace.
+    ///
+    /// Existing books are not affected. Only newly created books via
+    /// [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_trade_id_namespace(&self) {
+        self.trade_id_root_namespace.set(None);
+    }
+
+    /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use the upstream default random namespace.
+    #[must_use]
+    #[inline]
+    pub fn trade_id_namespace(&self) -> Option<Uuid> {
+        self.trade_id_root_namespace.get()
     }
 
     /// Stores the per-contract NATS listener factory propagated from the top of
@@ -961,6 +1026,9 @@ impl ExpirationOrderBookManager {
         }
         if let Some(clock) = self.clock.get() {
             fresh.set_clock(clock);
+        }
+        if let Some(ns) = self.trade_id_root_namespace.get() {
+            fresh.set_trade_id_namespace(ns);
         }
         // Propagate the per-contract NATS factory down to the fresh chain/strike
         // manager BEFORE publishing, so the configured-before-visible invariant
@@ -1945,5 +2013,18 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         let purged = book.purge_terminal_states(Duration::from_millis(1));
         assert_eq!(purged, 2);
+    }
+
+    #[test]
+    fn test_expiration_set_trade_id_namespace_delegates() {
+        let expiration = ExpirationOrderBook::new("BTC", test_expiration());
+        assert!(expiration.trade_id_namespace().is_none());
+
+        let root = Uuid::from_u128(0x0BAD_C0DE);
+        expiration.set_trade_id_namespace(root);
+        assert_eq!(expiration.trade_id_namespace(), Some(root));
+
+        expiration.clear_trade_id_namespace();
+        assert!(expiration.trade_id_namespace().is_none());
     }
 }

@@ -42,6 +42,7 @@ thiserror = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 dashmap = "6.2"
 pricelevel = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 default = []
@@ -69,7 +70,8 @@ crate-type = ["rlib"]
 
 [workspace.dependencies]
 optionstratlib = { version = "0.17", default-features = false }
-orderbook-rs = { version = "0.10", features = ["special_orders"] }
+orderbook-rs = { version = "0.11", features = ["special_orders"] }
+uuid = { version = "1.23", features = ["v5"] }
 async-nats = "0.49"
 bytes = "1.12"
 tokio = { version = "1.52", features = ["rt", "sync"] }

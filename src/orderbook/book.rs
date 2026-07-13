@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Pre-built NATS publisher listeners to install on the inner order book
 /// *before* it is wrapped in `Arc`.
@@ -153,6 +154,15 @@ pub(crate) struct BookConfig {
     /// Inject a deterministic clock (e.g. `StubClock`) to make time-in-force
     /// admission (`GTD`/`Day`) reproducible for sequencer replay.
     pub clock: Option<Arc<dyn Clock>>,
+    /// Root trade-ID namespace from which the per-leaf namespace is derived.
+    ///
+    /// `None` keeps the upstream default (a random per-book namespace).
+    /// When set, [`new_with_config`](OptionOrderBook::new_with_config) derives
+    /// the leaf's own namespace as `UUIDv5(root, symbol_bytes)` before the inner
+    /// book is frozen in `Arc`, so call and put — with distinct symbols — receive
+    /// distinct namespaces. Combined with an injected deterministic clock this
+    /// makes trade IDs byte-identical across runs sharing the same root.
+    pub trade_id_root_namespace: Option<Uuid>,
     /// Pre-built NATS publisher listeners installed before the inner book is
     /// wrapped in `Arc` (feature `nats`). `None` for every non-NATS path.
     #[cfg(feature = "nats")]
@@ -167,7 +177,8 @@ impl std::fmt::Debug for BookConfig {
             .field("stp_mode", &self.stp_mode)
             .field("fee_schedule", &self.fee_schedule)
             .field("enable_state_tracking", &self.enable_state_tracking)
-            .field("clock", &self.clock);
+            .field("clock", &self.clock)
+            .field("trade_id_root_namespace", &self.trade_id_root_namespace);
         // The NATS listeners are boxed closures and carry no `Debug`; surface
         // only whether they are present so the impl stays informative.
         #[cfg(feature = "nats")]
@@ -185,6 +196,7 @@ impl Default for BookConfig {
             fee_schedule: None,
             enable_state_tracking: true,
             clock: None,
+            trade_id_root_namespace: None,
             #[cfg(feature = "nats")]
             nats_listeners: None,
         }
@@ -351,6 +363,23 @@ pub struct OptionOrderBook {
     /// `[min_price, max_price]` band checked in
     /// [`check_price_band`](Self::check_price_band).
     min_price: Option<u128>,
+    /// Dedicated single-slot capture used only by
+    /// [`replace_order_full`](Self::replace_order_full) to recover the fills a
+    /// crossing replacement produces (the engine's `update_order` returns the
+    /// resting order, not a `TradeResult`).
+    ///
+    /// Independent of [`last_trade_result`](Self::last_trade_result): a replace
+    /// clears, arms, runs, disarms, and takes this slot around the single
+    /// `update_order` call so continuous capture is never disturbed.
+    replace_capture: Arc<Mutex<Option<TradeResult>>>,
+    /// Cheap armed flag gating the [`replace_capture`](Self::replace_capture)
+    /// clone+lock on the match hot path.
+    ///
+    /// Disarmed by default: the shared trade listener performs one extra relaxed
+    /// atomic load per match and, when disarmed, returns without touching the
+    /// replace slot. Armed only for the duration of a single
+    /// [`replace_order_full`](Self::replace_order_full) call.
+    replace_capture_armed: Arc<AtomicBool>,
 }
 
 impl OptionOrderBook {
@@ -401,6 +430,19 @@ impl OptionOrderBook {
         if let Some(clock) = config.clock.clone() {
             book.set_clock(clock);
         }
+        // Derive this leaf's trade-ID namespace from the configured root, while
+        // the book is still owned mutably (pre-`Arc`). The derivation contract is
+        // `UUIDv5(root, leaf_symbol_bytes)`: because call and put carry distinct
+        // symbols, they receive distinct namespaces from the same root, and the
+        // same (root, symbol) pair always yields the same namespace across runs.
+        // Combined with a deterministic clock this makes the leaf's trade IDs
+        // byte-identical run-to-run. The upstream counter-restart caveat on
+        // `set_trade_id_namespace` is moot here: it is applied exactly once, at
+        // construction, before any order is submitted. `None` keeps the upstream
+        // default random namespace.
+        if let Some(root) = config.trade_id_root_namespace {
+            book.set_trade_id_namespace(Uuid::new_v5(&root, symbol.as_bytes()));
+        }
 
         // Install the continuous-capture listener backing the opt-in
         // `arm_trade_capture` / `last_trade_result` accessor. The clone+lock is
@@ -411,10 +453,24 @@ impl OptionOrderBook {
         // `add_*_with_result` return value.
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
         let armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Dedicated replace-capture slot, wired into the SAME listener so a
+        // crossing `replace_order_full` can recover its fills. Disarmed by
+        // default: the branch below is one relaxed load on the match path.
+        let replace_capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
+        let replace_armed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let capture_clone = Arc::clone(&capture);
         let armed_clone = Arc::clone(&armed);
+        let replace_capture_clone = Arc::clone(&replace_capture);
+        let replace_armed_clone = Arc::clone(&replace_armed);
         let capture_listener: TradeListener = Arc::new(move |tr: &TradeResult| {
-            // Record only while continuous capture is armed.
+            // Record into the replace slot only while a replace is in flight.
+            if replace_armed_clone.load(Ordering::Relaxed) {
+                let mut guard = replace_capture_clone
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *guard = Some(tr.clone());
+            }
+            // Record into the continuous-capture slot only while it is armed.
             if !armed_clone.load(Ordering::Relaxed) {
                 return;
             }
@@ -478,6 +534,8 @@ impl OptionOrderBook {
             terminal_counters,
             max_price,
             min_price,
+            replace_capture,
+            replace_capture_armed: replace_armed,
         }
     }
 
@@ -1619,7 +1677,9 @@ impl OptionOrderBook {
     /// crosses the book, the replacement may rematch and fill immediately;
     /// those fills reach only the installed trade listener (and thus the NATS
     /// publisher / order-state tracker), **never this return value** — this call
-    /// reports placement, not fills.
+    /// reports placement, not fills. Use
+    /// [`replace_order_full`](Self::replace_order_full) to also recover the
+    /// crossing fills as a [`TradeResult`].
     ///
     /// # Arguments
     ///
@@ -1662,6 +1722,121 @@ impl OptionOrderBook {
         }) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Atomically replaces a resting order and reports any fills the replacement
+    /// produced on entry.
+    ///
+    /// Identical placement semantics to [`replace_order`](Self::replace_order)
+    /// (validate-first: the original survives any rejection; queue priority is
+    /// lost). The difference is the return value: when the repriced order crosses
+    /// the book, the engine's `update_order` still returns only the resting
+    /// order — not a [`TradeResult`] — so this method recovers the fills from a
+    /// **dedicated single-slot capture** wired into the book's trade listener.
+    ///
+    /// The capture is cleared, then armed for exactly the one `update_order`
+    /// call, then disarmed on every exit path (a drop guard disarms even when an
+    /// engine error propagates, so the armed flag never leaks). The captured
+    /// trade is returned **only** when its taker order id equals `order_id` and
+    /// it carries fills; otherwise the trade component is `None`.
+    ///
+    /// # Attribution & contamination contract
+    ///
+    /// When called from the sequenced path, the capture runs inside the
+    /// sequencer's submit gate, so within the sequenced command stream there is
+    /// no concurrent writer and attribution is exact. A concurrent **non**-
+    /// sequenced direct **add** on the same book is bounded to
+    /// **missing-never-wrong**: such a trade is either discarded by the
+    /// taker-id filter (its taker id differs from the replaced order's), or it
+    /// overwrites this replace's own capture so the fills are reported as
+    /// `None` despite having reached the listener. One case sits OUTSIDE that
+    /// bound: a concurrent non-sequenced **replace of the same `order_id`**
+    /// produces fills carrying the identical taker id, which the filter cannot
+    /// distinguish — such a race can mis-attribute the other call's fills to
+    /// this one. The operating model is therefore strictly single-writer per
+    /// book; do not mix sequenced and direct replaces of the same order. Book
+    /// state and the returned `bool` are never affected either way — only the
+    /// captured `TradeResult` audit payload. The upstream
+    /// `update_order_with_result` primitive would remove the caveat entirely;
+    /// it does not exist yet.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok((true, Some(trade)))` — replaced, and the replacement's own fills;
+    /// - `Ok((true, None))` — replaced but rested without crossing (no fills);
+    /// - `Ok((false, None))` — no order with `order_id` was resting;
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
+    /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream engine rejects the
+    ///   replacement; the original order survives.
+    pub fn replace_order_full(
+        &self,
+        order_id: OrderId,
+        price: u128,
+        quantity: u64,
+        side: Side,
+    ) -> Result<(bool, Option<TradeResult>)> {
+        self.check_active()?;
+        self.check_price_band(price)?;
+
+        // Clear any stale capture before arming, so we only observe fills from
+        // this call.
+        {
+            let mut guard = self
+                .replace_capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = None;
+        }
+
+        // Arm for exactly this call. The drop guard disarms on EVERY exit path —
+        // including the `?`-propagated error below — so the armed flag can never
+        // leak past the call (the classic arm-leak bug).
+        struct DisarmGuard<'a>(&'a AtomicBool);
+        impl Drop for DisarmGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        self.replace_capture_armed.store(true, Ordering::Relaxed);
+        let _disarm = DisarmGuard(&self.replace_capture_armed);
+
+        let outcome = self.book.update_order(OrderUpdate::Replace {
+            order_id,
+            price: Price::new(price),
+            quantity: Quantity::new(quantity),
+            side,
+        });
+
+        // Take whatever the listener recorded during the call, regardless of the
+        // outcome (a rejection leaves the slot empty).
+        let captured = {
+            let mut guard = self
+                .replace_capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+
+        match outcome {
+            Ok(Some(_)) => {
+                // Keep the trade only if it is THIS replacement's own fills:
+                // taker id matches and there were actual trades. This is the
+                // missing-never-wrong filter.
+                let trade = captured.filter(|tr| {
+                    tr.match_result.order_id() == order_id && !tr.match_result.trades().is_empty()
+                });
+                Ok((true, trade))
+            }
+            Ok(None) => Ok((false, None)),
             Err(e) => Err(e.into()),
         }
     }
@@ -4042,6 +4217,7 @@ mod tests {
                 fee_schedule: Some(schedule),
                 enable_state_tracking: true,
                 clock: None,
+                trade_id_root_namespace: None,
                 #[cfg(feature = "nats")]
                 nats_listeners: None,
             },
@@ -5204,5 +5380,195 @@ mod tests {
         assert!(res.is_ok(), "post-only convenience should rest: {res:?}");
         assert_eq!(book.best_bid(), Some(100));
         assert_eq!(book.order_count(), 1);
+    }
+
+    // ── replace_order_full (dedicated capture) + trade-ID namespace ─────
+
+    #[test]
+    fn test_replace_order_full_rematch_returns_own_fills() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 90, 5)
+            .expect("rest buy");
+
+        let (replaced, trade) = book
+            .replace_order_full(id, 100, 5, Side::Buy)
+            .expect("replace");
+        assert!(replaced);
+        let trade = trade.expect("a crossing replace returns its own fills");
+        assert_eq!(trade.match_result.order_id(), id);
+        assert!(!trade.match_result.trades().is_empty());
+    }
+
+    #[test]
+    fn test_replace_order_full_no_cross_returns_none_trade() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("rest buy");
+
+        // Reprice up with no opposite liquidity: rests, no fills.
+        let (replaced, trade) = book
+            .replace_order_full(id, 105, 20, Side::Buy)
+            .expect("replace");
+        assert!(replaced);
+        assert!(trade.is_none(), "a non-crossing replace reports no fills");
+        assert_eq!(book.best_bid(), Some(105));
+    }
+
+    #[test]
+    fn test_replace_order_full_unknown_id_returns_false_none() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let (replaced, trade) = book
+            .replace_order_full(OrderId::new(), 100, 10, Side::Buy)
+            .expect("replace");
+        assert!(!replaced);
+        assert!(trade.is_none());
+    }
+
+    #[test]
+    fn test_replace_order_full_engine_reject_preserves_original_and_disarms() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(ValidationConfig::new().with_tick_size(10)),
+                ..BookConfig::default()
+            },
+        );
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add at valid tick");
+
+        // 105 is not a multiple of the tick: the engine rejects the replacement.
+        let res = book.replace_order_full(id, 105, 10, Side::Buy);
+        assert!(
+            matches!(res, Err(Error::OrderBookEngine(_))),
+            "a tick violation must be an engine rejection: {res:?}"
+        );
+        // The drop guard disarmed the capture even on the error path.
+        assert!(
+            !book.replace_capture_armed.load(Ordering::Relaxed),
+            "the replace-capture flag must be disarmed after an error"
+        );
+        // Validate-first: the original survives untouched.
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_order_full_does_not_disturb_continuous_capture() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("rest sell");
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 90, 5)
+            .expect("rest buy");
+
+        // Continuous capture is DISARMED (default). A crossing replace uses its
+        // own dedicated slot and must not leak into the continuous slot.
+        let (_, trade) = book
+            .replace_order_full(id, 100, 5, Side::Buy)
+            .expect("replace");
+        assert!(
+            trade.is_some(),
+            "the crossing replace captured its own fills"
+        );
+        assert!(
+            book.last_trade_result().is_none(),
+            "the replace capture must not populate the continuous-capture slot"
+        );
+
+        // Continuous capture still works normally afterward.
+        book.arm_trade_capture(true);
+        book.add_limit_order(OrderId::new(), Side::Sell, 95, 5)
+            .expect("rest sell");
+        book.add_limit_order(OrderId::new(), Side::Buy, 95, 5)
+            .expect("cross");
+        assert!(
+            book.take_trade_result().is_some(),
+            "continuous capture is unaffected by the replace path"
+        );
+    }
+
+    /// Builds a leaf with a fixed trade-ID root namespace and a fresh StubClock,
+    /// so its trade IDs and timestamps are deterministic run-to-run.
+    fn deterministic_leaf(symbol: &str, style: OptionStyle, root: Uuid) -> OptionOrderBook {
+        use orderbook_rs::StubClock;
+        OptionOrderBook::new_with_config(
+            symbol,
+            style,
+            BookConfig {
+                clock: Some(Arc::new(StubClock::new()) as Arc<dyn Clock>),
+                trade_id_root_namespace: Some(root),
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    /// Drives a fixed crossing sequence and returns the serialized TradeResult.
+    fn crossing_trade_json(book: &OptionOrderBook) -> String {
+        book.add_limit_order(OrderId::from_u64(1), Side::Sell, 100, 10)
+            .expect("rest sell");
+        let trade = book
+            .add_limit_order_full(OrderId::from_u64(2), Side::Buy, 100, 5)
+            .expect("crossing buy");
+        serde_json::to_string(&trade).expect("serialize trade result")
+    }
+
+    /// Drives a fixed crossing sequence and returns the first fill's trade ID.
+    fn crossing_first_trade_id(book: &OptionOrderBook) -> pricelevel::Id {
+        book.add_limit_order(OrderId::from_u64(1), Side::Sell, 100, 10)
+            .expect("rest sell");
+        let trade = book
+            .add_limit_order_full(OrderId::from_u64(2), Side::Buy, 100, 5)
+            .expect("crossing buy");
+        trade
+            .match_result
+            .trades()
+            .as_vec()
+            .first()
+            .expect("at least one fill")
+            .trade_id()
+    }
+
+    #[test]
+    fn test_book_config_namespace_derives_per_leaf_v5() {
+        let root = Uuid::from_u128(0x00C0_FFEE);
+        // Two independently-built, identically-configured leaves (same root, a
+        // fresh StubClock each) driven through the same crossing sequence must
+        // produce byte-identical serialized TradeResults — including trade IDs.
+        let first = crossing_trade_json(&deterministic_leaf(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            root,
+        ));
+        let second = crossing_trade_json(&deterministic_leaf(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            root,
+        ));
+        assert_eq!(
+            first, second,
+            "same root + clock + order ids must yield byte-identical trade results"
+        );
+    }
+
+    #[test]
+    fn test_leaf_namespaces_differ_between_call_and_put() {
+        let root = Uuid::from_u128(0x00C0_FFEE);
+        // Call and put carry distinct symbols, so `UUIDv5(root, symbol)` gives
+        // them distinct namespaces and therefore distinct trade IDs — compared
+        // directly (the serialized results also differ by symbol, which would not
+        // by itself prove the IDs diverge).
+        let call = deterministic_leaf("BTC-20240329-50000-C", OptionStyle::Call, root);
+        let put = deterministic_leaf("BTC-20240329-50000-P", OptionStyle::Put, root);
+        assert_ne!(
+            crossing_first_trade_id(&call),
+            crossing_first_trade_id(&put),
+            "call and put must derive distinct trade-ID namespaces from distinct symbols"
+        );
     }
 }
