@@ -36,18 +36,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an iceberg with a missing/zero hidden reserve, or a limit/post-only add with a
   hidden reserve, is a deterministic `Rejected`. A post-only add that would cross
   is journaled as a deterministic `PriceCrossing` rejection.
+- **Deterministic trade-ID namespace + replace fills (#153).** The upstream
+  namespace seam (orderbook-rs 0.11, upstream #199/#200) is now threaded end to
+  end: `SequencedUnderlyingOrderBook::set_trade_id_namespace(root)` propagates a
+  root namespace down the hierarchy, and each leaf derives its own
+  `UUIDv5(root, symbol)` at construction (call and put get distinct namespaces).
+  With a root namespace and an injected clock (`set_clock`) both set before the
+  first submit, two identically-seeded sequenced runs on fresh instances produce
+  identical trade payloads — trade ids, engine trade timestamps, and `engine_seq`
+  included (the sequencer's wall-clock event-envelope `timestamp_ns` is the one
+  exception). `uuid` is now a direct dependency and `Uuid` is re-exported from
+  the crate root. New leaf `OptionOrderBook::replace_order_full` recovers a
+  replacement's on-entry fills via a dedicated capture slot (taker-id filtered,
+  missing-never-wrong); `OptionChainResult::OrderReplaced` gained
+  `trade: Option<TradeResult>` (`#[serde(default)]`, always emitted), and
+  `execute_replace_order` now carries the replacement's fills.
+
+### Changed
+
+- **Breaking for co-pinners: `orderbook-rs` public dependency `0.10` → `0.11`.**
+  `orderbook-rs` is a public dependency, so this pin move is breaking for
+  downstream crates that co-pin it (same precedent as the 0.6.0 `0.9` → `0.10`
+  bump). The only breaking changes in orderbook-rs 0.11 are in
+  `ReplayBookConfig` / `ReplayError`, which this crate does not use, so the
+  hierarchy and sequencer surface is otherwise unchanged.
 
 ### Wire compatibility
 
-- The new `AddOrder` fields (`kind` / `hidden_quantity`) are backward-compatible
-  **for self-describing encodings (JSON)**: they carry `#[serde(default)]`, so a
-  pre-#151 JSON journal decodes to a plain limit add (`OrderKind::Limit`, no
-  hidden reserve) and replays identically (pinned by the frozen v0.5.0 and v0.8.0
-  fixture tests, which patch these defaults in). Positional codecs such as
-  bincode cannot apply a missing-field default, so pre-#151 *binary* journal
-  records must be re-journaled or migrated. An unknown `OrderKind` variant tag
-  written by a newer binary is rejected by an older one — the same additive
-  forward-compat asymmetry as the command/result enums.
+- The new `AddOrder` fields (`kind` / `hidden_quantity`) and the
+  `OrderReplaced.trade` field are backward-compatible **for self-describing
+  encodings (JSON)**: they carry `#[serde(default)]`, so a pre-#151/#153 JSON
+  journal decodes to a plain limit add (`OrderKind::Limit`, no hidden reserve)
+  and a trade-less `OrderReplaced` respectively, and replays identically (pinned
+  by the frozen v0.5.0 and v0.8.0 fixture tests, which patch these defaults in).
+  Positional codecs such as bincode cannot apply a missing-field default, so
+  pre-#151/#153 *binary* journal records must be re-journaled or migrated. An
+  unknown `OrderKind` variant tag written by a newer binary is rejected by an
+  older one — the same additive forward-compat asymmetry as the command/result
+  enums. A journal carrying `trade` on `OrderReplaced` is undecodable by a 0.8.0
+  binary that predates the field (documented asymmetry).
 
 ## [0.8.0] - 2026-07-12
 

@@ -34,6 +34,7 @@
 //! asserted byte-for-byte equal to each other and to live.
 
 use option_chain_orderbook::SymbolParser;
+use option_chain_orderbook::orderbook::Uuid;
 use option_chain_orderbook::orderbook::{
     InMemoryOptionChainJournal, InstrumentRegistry, InstrumentStatus, MassCancelScope,
     MassCancelType, OptionChainEvent, OptionChainJournal, OptionChainResult, OptionOrderBook,
@@ -1073,5 +1074,115 @@ fn test_replay_rejected_after_fills_ioc_remainder_equals_live() {
         live_snapshot,
         snapshot(&replay),
         "replayed error-after-fills state must equal live"
+    );
+}
+
+// ── #153 deterministic trade-ID namespace ──────────────────────────────────
+
+/// A fixed root namespace for the determinism tests (any stable UUID works).
+fn trade_id_root() -> Uuid {
+    Uuid::from_u128(0x0153_0153_0153_0153_0153_0153_0153_0153)
+}
+
+/// Drives a small prefix that exercises every trade-ID-bearing result shape: a
+/// crossing add that fills (`OrderAdded.trade` Some) and a replace that reprices
+/// a resting order up to a crossing level so it rematches (`OrderReplaced.trade`
+/// Some).
+fn drive_trade_id_prefix(book: &SequencedUnderlyingOrderBook) {
+    let symbol = "BTC-20240329-50000-C";
+    // Crossing add that fills: rest an ask, then a marketable buy at the ask.
+    book.submit_add_order(symbol, oid(1), Side::Sell, 100, 5)
+        .expect("rest ask");
+    book.submit_add_order(symbol, oid(2), Side::Buy, 100, 5)
+        .expect("crossing buy fills");
+    // Rematching replace: rest an ask and a buy below it, then reprice the buy up.
+    book.submit_add_order(symbol, oid(3), Side::Sell, 120, 4)
+        .expect("rest ask 2");
+    book.submit_add_order(symbol, oid(4), Side::Buy, 110, 4)
+        .expect("rest buy below ask 2");
+    book.submit_replace_order(symbol, oid(4), 120, 4, Side::Buy)
+        .expect("replace reprices up and rematches");
+}
+
+#[test]
+fn test_sequenced_identical_runs_produce_identical_trade_ids() {
+    // HEADLINE: two fully independent sequenced instances, each configured BEFORE
+    // the first submit with a fresh `StubClock` and the SAME root trade-ID
+    // namespace, driven through the identical command stream, produce identical
+    // command + result payloads — trade ids, engine trade timestamps, and
+    // engine_seq included. The namespace fixes the trade-ID root (each leaf
+    // derives UUIDv5(root, symbol)) and the stub clock fixes the engine
+    // timestamps.
+    //
+    // The ONLY field excluded from the comparison is each event's envelope
+    // `timestamp_ns`: the sequencer stamps that from `nanos_since_epoch()` (wall
+    // clock) at ingestion — it is orthogonal to trade-ID determinism and is not
+    // driven by the injected engine clock. It is normalized to 0 below so the
+    // assertion targets exactly the payloads #153 makes deterministic.
+    fn run(root: Uuid) -> Vec<serde_json::Value> {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        book.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+        book.set_trade_id_namespace(root);
+        drive_trade_id_prefix(&book);
+        journal
+            .read_from(0)
+            .expect("read journal")
+            .iter()
+            .map(|event| {
+                let mut value = serde_json::to_value(event).expect("serialize event");
+                value["timestamp_ns"] = serde_json::json!(0);
+                value
+            })
+            .collect()
+    }
+
+    let first = run(trade_id_root());
+    let second = run(trade_id_root());
+    assert!(!first.is_empty(), "the prefix must journal some events");
+    // The fill payloads must actually be present, or the test would pass
+    // vacuously without exercising trade ids.
+    assert!(
+        first
+            .iter()
+            .any(|e| serde_json::to_string(e).unwrap().contains("\"trade_id\"")),
+        "the prefix must produce at least one fill carrying a trade id"
+    );
+    assert_eq!(
+        first, second,
+        "two identically-seeded sequenced runs must produce identical command + \
+         result payloads (trade ids, engine trade timestamps, engine_seq included)"
+    );
+}
+
+#[test]
+fn test_replay_with_injected_clock_and_namespace_equals_live() {
+    // With both determinism seams injected on the live AND the replay instance
+    // (fresh StubClock + same root namespace, set before driving / replaying),
+    // the full-state oracle equality still holds: the seams do not perturb the
+    // rebuilt order-book state.
+    let journal = Arc::new(InMemoryOptionChainJournal::new());
+
+    let live = fresh_book(&journal);
+    live.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    live.set_trade_id_namespace(trade_id_root());
+    let submitted = drive_command_prefix(&live);
+    let live_snapshot = snapshot(&live);
+
+    let replay = fresh_book(&journal);
+    replay.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+    replay.set_trade_id_namespace(trade_id_root());
+    let replayed = replay
+        .replay(0)
+        .expect("replay under injected clock + namespace");
+    assert_eq!(
+        replayed, submitted,
+        "replay must re-run every journaled command"
+    );
+
+    assert_eq!(
+        live_snapshot,
+        snapshot(&replay),
+        "replayed state under injected clock + namespace must equal live state"
     );
 }

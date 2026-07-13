@@ -114,5 +114,50 @@
         "reason": "iceberg add requires hidden_quantity >= 1"
       }
     }
+  },
+  {
+    "sequence_num": 5,
+    "timestamp_ns": 1700000000000000104,
+    "command": {
+      "ReplaceOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "price": 130,
+        "quantity": 4,
+        "side": "BUY"
+      }
+    },
+    "result": {
+      "OrderReplaced": {
+        "order_id": "42",
+        "trade": {
+          "symbol": "BTC-20240329-50000-C",
+          "match_result": {
+            "order_id": "42",
+            "trades": {
+              "trades": [
+                {
+                  "trade_id": "9001",
+                  "taker_order_id": "42",
+                  "maker_order_id": "43",
+                  "price": 100,
+                  "quantity": 4,
+                  "taker_side": "BUY",
+                  "timestamp": 1700000000000
+                }
+              ]
+            },
+            "remaining_quantity": 0,
+            "is_complete": true,
+            "filled_order_ids": [],
+            "outcome": "filled"
+          },
+          "total_maker_fees": 0,
+          "total_taker_fees": 0,
+          "engine_seq": 0,
+          "quote_notional": 400
+        }
+      }
+    }
   }
 ]
