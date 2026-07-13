@@ -47,14 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included (the sequencer's wall-clock event-envelope `timestamp_ns` is the one
   exception). `uuid` is now a direct dependency and `Uuid` is re-exported from
   the crate root. New leaf `OptionOrderBook::replace_order_full` recovers a
-  replacement's on-entry fills via a dedicated capture slot (taker-id filtered,
-  missing-never-wrong); `OptionChainResult::OrderReplaced` gained
+  replacement's on-entry fills via a dedicated capture slot (taker-id filtered;
+  missing-never-wrong under the documented single-writer model — a concurrent
+  non-sequenced replace of the same order id sits outside that bound, see the
+  method docs); `OptionChainResult::OrderReplaced` gained
   `trade: Option<TradeResult>` (`#[serde(default)]`, always emitted), and
   `execute_replace_order` now carries the replacement's fills.
 
-### Changed
+### ⚠️ Breaking Changes
 
-- **Breaking for co-pinners: `orderbook-rs` public dependency `0.10` → `0.11`.**
+- **`orderbook-rs` public dependency `0.10` → `0.11` (breaking for co-pinners).**
   `orderbook-rs` is a public dependency, so this pin move is breaking for
   downstream crates that co-pin it (same precedent as the 0.6.0 `0.9` → `0.10`
   bump). The only breaking changes in orderbook-rs 0.11 are in

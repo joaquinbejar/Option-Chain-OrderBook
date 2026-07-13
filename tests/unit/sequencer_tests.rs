@@ -1143,9 +1143,9 @@ fn test_sequenced_identical_runs_produce_identical_trade_ids() {
     // The fill payloads must actually be present, or the test would pass
     // vacuously without exercising trade ids.
     assert!(
-        first
-            .iter()
-            .any(|e| serde_json::to_string(e).unwrap().contains("\"trade_id\"")),
+        first.iter().any(|e| serde_json::to_string(e)
+            .expect("serialize event")
+            .contains("\"trade_id\"")),
         "the prefix must produce at least one fill carrying a trade id"
     );
     assert_eq!(

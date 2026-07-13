@@ -1747,13 +1747,20 @@ impl OptionOrderBook {
     /// When called from the sequenced path, the capture runs inside the
     /// sequencer's submit gate, so within the sequenced command stream there is
     /// no concurrent writer and attribution is exact. A concurrent **non**-
-    /// sequenced direct add on the same book is the only contamination source,
-    /// and it is bounded to **missing-never-wrong**: such a trade is either
-    /// discarded by the taker-id filter (never mis-attributed to this replace),
-    /// or it overwrites this replace's own capture so the fills are reported as
-    /// `None` despite having reached the listener. The operating model is
-    /// therefore single-writer per book. The upstream `update_order_with_result`
-    /// primitive would remove the caveat entirely; it does not exist yet.
+    /// sequenced direct **add** on the same book is bounded to
+    /// **missing-never-wrong**: such a trade is either discarded by the
+    /// taker-id filter (its taker id differs from the replaced order's), or it
+    /// overwrites this replace's own capture so the fills are reported as
+    /// `None` despite having reached the listener. One case sits OUTSIDE that
+    /// bound: a concurrent non-sequenced **replace of the same `order_id`**
+    /// produces fills carrying the identical taker id, which the filter cannot
+    /// distinguish — such a race can mis-attribute the other call's fills to
+    /// this one. The operating model is therefore strictly single-writer per
+    /// book; do not mix sequenced and direct replaces of the same order. Book
+    /// state and the returned `bool` are never affected either way — only the
+    /// captured `TradeResult` audit payload. The upstream
+    /// `update_order_with_result` primitive would remove the caveat entirely;
+    /// it does not exist yet.
     ///
     /// # Returns
     ///
