@@ -136,9 +136,13 @@ matching engine itself is `orderbook-rs`. On top of that engine it provides:
   [`orderbook::ContractSpecs`], [`orderbook::StrikeGenerator`], and
   [`orderbook::StrikeRangeConfig`] for fast lookup and strike management.
 - **Order policy hooks**: a crate-local [`orderbook::ValidationConfig`]
-  (order/price/qty limits) plus the upstream [`orderbook::FeeSchedule`] and
-  self-trade prevention [`orderbook::STPMode`] — all applied by `orderbook-rs`
-  at the leaf engine.
+  (order/qty limits and an inclusive `[min_price, max_price]` price band)
+  plus the upstream [`orderbook::FeeSchedule`] and self-trade prevention
+  [`orderbook::STPMode`]. Tick/lot/size limits, fees, and STP are applied by
+  `orderbook-rs` at the leaf engine; the price band is enforced crate-side
+  (the engine has no price-bound hook) and, when both a
+  [`orderbook::ContractSpecs`] band and a validation band apply to the same
+  contract, they are merged tightest-wins.
 - **Optional eventing**: NATS publishing (`nats` feature) and a
   command/event/journal/replay sequencer (`sequencer` feature).
 

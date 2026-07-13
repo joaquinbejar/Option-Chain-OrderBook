@@ -1,7 +1,7 @@
 //! Integration tests for the orderbook module.
 
 use option_chain_orderbook::orderbook::{
-    OptionOrderBook, UnderlyingOrderBookManager, ValidationConfig,
+    ContractSpecs, OptionOrderBook, UnderlyingOrderBookManager, ValidationConfig,
 };
 use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -266,5 +266,77 @@ fn test_replace_order_through_hierarchy_handles() {
         .unwrap_or_else(|err| panic!("replace failed: {err}"));
     assert!(replaced, "replace should report a hit");
     assert_eq!(strike.call().best_bid(), Some(110));
+    assert_eq!(strike.call().order_count(), 1);
+}
+
+#[test]
+fn test_hierarchy_set_specs_price_band_propagates_to_new_strikes() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+
+    let btc = manager.get_or_create("BTC");
+    // A contract-spec band set at the underlying level is derived into the
+    // validation config and reaches every leaf vivified afterwards.
+    let specs = ContractSpecs::builder()
+        .min_price(100)
+        .max_price(1_000)
+        .build()
+        .expect("valid specs");
+    btc.set_specs(specs);
+
+    let exp = btc.get_or_create_expiration(exp_date);
+    let strike = exp.get_or_create_strike(50000);
+
+    // Within-band add succeeds; out-of-band adds are rejected crate-side.
+    strike
+        .call()
+        .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+        .unwrap_or_else(|err| panic!("within-band add failed: {err}"));
+    assert!(
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 1_001, 10)
+            .is_err(),
+        "above-band add must be rejected"
+    );
+    assert!(
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 99, 10)
+            .is_err(),
+        "below-band add must be rejected"
+    );
+    assert_eq!(strike.call().order_count(), 1);
+}
+
+#[test]
+fn test_hierarchy_chain_set_specs_band_activates_at_leaf() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+
+    let btc = manager.get_or_create("BTC");
+    let exp = btc.get_or_create_expiration(exp_date);
+    let chain = exp.chain();
+
+    // Setting specs directly on the chain (not through the underlying
+    // derivation) still activates the band at leaves via effective_validation.
+    let specs = ContractSpecs::builder()
+        .max_price(2_000)
+        .build()
+        .expect("valid specs");
+    chain.set_specs(specs);
+
+    let strike = chain.get_or_create_strike(50000);
+    strike
+        .call()
+        .add_limit_order(OrderId::new(), Side::Buy, 1_500, 10)
+        .unwrap_or_else(|err| panic!("within-band add failed: {err}"));
+    assert!(
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 2_001, 10)
+            .is_err(),
+        "above-band add must be rejected once the chain-level band is set"
+    );
     assert_eq!(strike.call().order_count(), 1);
 }
