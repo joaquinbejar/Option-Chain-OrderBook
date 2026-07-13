@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.9.1] - 2026-07-13
+
+### Added
+
+- **Injectable event-envelope timestamp source (#157).** The sequencer's
+  per-event `timestamp_ns` envelope was the last wall-clock read in the
+  journal: `OptionChainSequencer::assign()` stamped it from
+  `nanos_since_epoch()`, so the headline byte-identity test had to normalize
+  that one field. New
+  `SequencedUnderlyingOrderBook::set_timestamp_ns_source(Arc<dyn Fn() -> u64 + Send + Sync>)`
+  (gate-linearized, like `set_clock` / `set_trade_id_namespace`) swaps the
+  source; the default remains the wall clock and the wire format is
+  unchanged — only the value's origin becomes injectable. With clock, root
+  namespace, and envelope source all injected before the first submit, two
+  identically-seeded sequenced runs on fresh instances now produce **fully
+  byte-identical journals** with zero field normalization (the headline test
+  asserts exactly that). Replay is unaffected (it re-executes commands and
+  never re-journals).
+
 ## [0.9.0] - 2026-07-13
 
 ### Added
