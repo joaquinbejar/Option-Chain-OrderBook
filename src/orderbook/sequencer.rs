@@ -3717,10 +3717,10 @@ mod tests {
     /// an iceberg missing-hidden rejection. The fixture is the current schema, so
     /// the re-encode is strict with no patching.
     ///
-    /// NOTE: this fixture is **unfrozen** until the release that ships #151 — it
-    /// tracks the in-development schema and may be regenerated. #153 will append
-    /// its `trade`-on-`OrderReplaced` events here; once released it freezes like
-    /// v0.5.0 / v0.8.0, and later schema additions patch defaults instead.
+    /// NOTE: this fixture is **frozen** as of the 0.9.0 release (it shipped the
+    /// #151 order-kind schema plus #153's `trade`-on-`OrderReplaced` events).
+    /// Do not regenerate it; later schema additions patch defaults into the
+    /// parsed value before the strict comparison, like v0.5.0 / v0.8.0.
     ///
     /// The fixture lives at `tests/fixtures/journal_event_v0.9.0.json`.
     #[test]

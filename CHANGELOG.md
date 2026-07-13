@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
-## [Unreleased]
+## [0.9.0] - 2026-07-13
 
 ### Added
 
@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `execute_replace_order` now carries the replacement's fills.
 
 ### ⚠️ Breaking Changes
+
+A full upgrade walkthrough lives in [`MIGRATING-0.9.0.md`](./MIGRATING-0.9.0.md).
 
 - **`orderbook-rs` public dependency `0.10` → `0.11` (breaking for co-pinners).**
   `orderbook-rs` is a public dependency, so this pin move is breaking for
