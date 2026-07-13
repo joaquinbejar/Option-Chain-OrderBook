@@ -381,8 +381,11 @@ impl UnderlyingOrderBook {
     /// Sets the contract specifications for this underlying.
     ///
     /// Automatically derives and applies a [`ValidationConfig`] from the specs'
-    /// tick size, lot size, min/max order size fields. This validation config
-    /// is propagated to all future expirations and strikes.
+    /// tick size, lot size, min/max order size fields **and the optional
+    /// `[min_price, max_price]` price band** (via
+    /// [`ContractSpecs::to_validation_config`]). This validation config is
+    /// propagated to all future expirations and strikes, so a spec band set here
+    /// is enforced crate-side at every leaf created afterwards.
     ///
     /// Existing expiration books and strikes are not affected by the derived
     /// validation config.
@@ -3935,5 +3938,45 @@ mod tests {
         assert_eq!(manager.symbol_index().len(), 4);
         assert!(manager.symbol_index().contains(&btc_call));
         assert!(manager.symbol_index().contains(&eth_put));
+    }
+
+    #[test]
+    fn test_underlying_set_specs_band_reaches_vivified_leaf() {
+        // A price band on the underlying's contract specs must be derived into
+        // the validation config and enforced crate-side at every leaf vivified
+        // afterwards (the D5 zero-change derivation path).
+        let book = UnderlyingOrderBook::new("BTC");
+        let specs = ContractSpecs::builder()
+            .min_price(100)
+            .max_price(1_000)
+            .build()
+            .expect("valid specs");
+        book.set_specs(specs);
+
+        let leaf = book
+            .get_or_create_expiration(test_expiration())
+            .get_or_create_strike(50000);
+
+        // Within-band admitted; below and above the band rejected crate-side.
+        leaf.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+            .expect("within-band add");
+        assert!(
+            leaf.call()
+                .add_limit_order(OrderId::new(), Side::Buy, 99, 10)
+                .is_err(),
+            "below the band must be rejected"
+        );
+        assert!(
+            leaf.call()
+                .add_limit_order(OrderId::new(), Side::Buy, 1_001, 10)
+                .is_err(),
+            "above the band must be rejected"
+        );
+
+        // The band round-trips through the leaf's validation readback.
+        let config = leaf.call().validation_config().expect("config present");
+        assert_eq!(config.min_price(), Some(100));
+        assert_eq!(config.max_price(), Some(1_000));
     }
 }

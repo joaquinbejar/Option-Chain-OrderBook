@@ -341,8 +341,15 @@ pub struct OptionOrderBook {
     /// Crate-side maximum order price (smallest price units); orders priced
     /// above are rejected before reaching the engine. The upstream engine has
     /// no price-bound hook, so this bound cannot be delegated and is enforced
-    /// here. `None` disables the bound.
+    /// here. `None` disables the upper bound.
     max_price: Option<u128>,
+    /// Crate-side minimum order price (smallest price units); orders priced
+    /// below are rejected before reaching the engine. Same rationale as
+    /// [`max_price`](Self::max_price): the engine has no price-bound hook.
+    /// `None` disables the lower bound. Together the two form an inclusive
+    /// `[min_price, max_price]` band checked in
+    /// [`check_price_band`](Self::check_price_band).
+    min_price: Option<u128>,
 }
 
 impl OptionOrderBook {
@@ -372,12 +379,17 @@ impl OptionOrderBook {
         if let Some(ref validation) = config.validation {
             Self::apply_validation(&mut book, validation);
         }
-        // The max-price bound is enforced crate-side (no engine hook), so keep a
-        // copy on the book rather than delegating it to the inner order book.
+        // The price band is enforced crate-side (no engine hook), so keep a copy
+        // of each bound on the book rather than delegating it to the inner order
+        // book.
         let max_price = config
             .validation
             .as_ref()
             .and_then(ValidationConfig::max_price);
+        let min_price = config
+            .validation
+            .as_ref()
+            .and_then(ValidationConfig::min_price);
         if let Some(schedule) = config.fee_schedule {
             book.set_fee_schedule(Some(schedule));
         }
@@ -464,6 +476,7 @@ impl OptionOrderBook {
             trade_capture_armed: armed,
             terminal_counters,
             max_price,
+            min_price,
         }
     }
 
@@ -571,9 +584,10 @@ impl OptionOrderBook {
         if let Some(max) = config.max_order_size() {
             book.set_max_order_size(max);
         }
-        // `max_price` is intentionally NOT delegated to the engine: `orderbook_rs`
-        // exposes no price-bound setter, so the bound is stored on the leaf and
-        // enforced crate-side in `check_max_price`.
+        // The price band (`min_price` / `max_price`) is intentionally NOT
+        // delegated to the engine: `orderbook_rs` exposes no price-bound setter,
+        // so the bounds are stored on the leaf and enforced crate-side in
+        // `check_price_band`.
     }
 
     /// Returns the current validation configuration read back from the underlying book,
@@ -593,11 +607,14 @@ impl OptionOrderBook {
         if let Some(max) = self.book.max_order_size() {
             config = config.with_max_order_size(max);
         }
-        // The price bound lives on the leaf, not the engine, so merge it back in
-        // before the emptiness check so a book configured with only a max_price
-        // still reports its config.
+        // The price band lives on the leaf, not the engine, so merge both bounds
+        // back in before the emptiness check so a book configured with only a
+        // band still reports its config.
         if let Some(bound) = self.max_price {
             config = config.with_max_price(bound);
+        }
+        if let Some(bound) = self.min_price {
+            config = config.with_min_price(bound);
         }
         if config.is_empty() {
             None
@@ -1007,17 +1024,24 @@ impl OptionOrderBook {
         }
     }
 
-    /// Rejects an order priced above the crate-side `max_price` bound.
+    /// Rejects an order priced outside the crate-side `[min_price, max_price]`
+    /// band.
     ///
-    /// The happy path (no bound, or price within the bound) is allocation-free;
-    /// the error construction is offloaded to a `#[cold]` helper so the check
-    /// stays branch-predictable on the submission hot path.
+    /// Checks the upper bound first, then the lower bound — at most two `Option`
+    /// compares. The happy path (no band, or price within the band) is
+    /// allocation-free; each error construction is offloaded to a `#[cold]`
+    /// helper so the check stays branch-predictable on the submission hot path.
     #[inline]
-    fn check_max_price(&self, price: u128) -> Result<()> {
+    fn check_price_band(&self, price: u128) -> Result<()> {
         if let Some(bound) = self.max_price
             && price > bound
         {
             return Err(self.max_price_exceeded(price, bound));
+        }
+        if let Some(bound) = self.min_price
+            && price < bound
+        {
+            return Err(self.min_price_violated(price, bound));
         }
         Ok(())
     }
@@ -1029,6 +1053,17 @@ impl OptionOrderBook {
     fn max_price_exceeded(&self, price: u128, bound: u128) -> Error {
         Error::validation(format!(
             "price {price} exceeds max_price {bound} for {}",
+            self.symbol
+        ))
+    }
+
+    /// Builds the `min_price` violation error. Cold + un-inlined so the common
+    /// in-bounds path carries none of the formatting code.
+    #[cold]
+    #[inline(never)]
+    fn min_price_violated(&self, price: u128, bound: u128) -> Error {
+        Error::validation(format!(
+            "price {price} is below min_price {bound} for {}",
             self.symbol
         ))
     }
@@ -1046,8 +1081,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     pub fn add_limit_order(
         &self,
         order_id: OrderId,
@@ -1056,7 +1091,7 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<()> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         self.book
             .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)?;
         Ok(())
@@ -1076,8 +1111,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     pub fn add_limit_order_with_tif(
         &self,
         order_id: OrderId,
@@ -1087,7 +1122,7 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<()> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         self.book
             .add_limit_order(order_id, price, quantity, side, tif, None)?;
         Ok(())
@@ -1110,8 +1145,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (e.g., `MissingUserId` when STP is enabled and `user_id` is zero).
     pub fn add_limit_order_with_user(
@@ -1123,7 +1158,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<()> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         self.book.add_limit_order_with_user(
             order_id,
             price,
@@ -1153,8 +1188,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     pub fn add_limit_order_with_tif_and_user(
         &self,
@@ -1166,7 +1201,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<()> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         self.book
             .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)?;
         Ok(())
@@ -1209,8 +1244,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order.
     ///
     /// On an error-after-fills path (an unfillable IOC remainder, or a
@@ -1226,7 +1261,7 @@ impl OptionOrderBook {
         quantity: u64,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         let (_order, trade) = self.book.add_limit_order_with_result(
             order_id,
             price,
@@ -1248,8 +1283,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_full(
@@ -1261,7 +1296,7 @@ impl OptionOrderBook {
         tif: TimeInForce,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         let (_order, trade) = self
             .book
             .add_limit_order_with_result(order_id, price, quantity, side, tif, None)?;
@@ -1278,8 +1313,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_user_full(
@@ -1291,7 +1326,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id,
             price,
@@ -1315,8 +1350,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream book rejects the order
     ///   (including error-after-fills paths, where executed fills reach only the trade listener).
     pub fn add_limit_order_with_tif_and_user_full(
@@ -1329,7 +1364,7 @@ impl OptionOrderBook {
         user_id: Hash32,
     ) -> Result<TradeResult> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id, price, quantity, side, tif, user_id, None,
         )?;
@@ -1397,8 +1432,8 @@ impl OptionOrderBook {
     ///
     /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
     ///   [`Active`](InstrumentStatus::Active).
-    /// - [`ValidationError`](crate::Error::ValidationError) if `price` exceeds the
-    ///   configured `max_price` bound.
+    /// - [`ValidationError`](crate::Error::ValidationError) if `price` falls outside
+    ///   the configured `[min_price, max_price]` band.
     /// - [`OrderBookEngine`](crate::Error::OrderBookEngine) if the upstream engine rejects the
     ///   replacement (e.g. a tick/lot shape violation or a risk/STP rejection);
     ///   on any such rejection the original order survives.
@@ -1410,7 +1445,7 @@ impl OptionOrderBook {
         side: Side,
     ) -> Result<bool> {
         self.check_active()?;
-        self.check_max_price(price)?;
+        self.check_price_band(price)?;
         // Map the engine's validate-first replace like `cancel_order`: Some =>
         // replaced, None => the order was not resting, Err => a real engine
         // rejection (with the original left untouched).
@@ -4363,6 +4398,153 @@ mod tests {
             .expect("config present with only max_price");
         assert_eq!(config.max_price(), Some(2_000));
         assert_eq!(config.tick_size(), None);
+    }
+
+    // ── min_price / price-band leaf enforcement ─────────────────────────
+
+    /// Builds a book whose only validation rules are an inclusive price band.
+    fn band_book(min: u128, max: u128) -> OptionOrderBook {
+        OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(
+                    ValidationConfig::new()
+                        .with_min_price(min)
+                        .with_max_price(max),
+                ),
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn test_min_price_add_below_bound_rejected_all_eight_paths() {
+        const MIN: u128 = 500;
+        const MAX: u128 = 5_000;
+        const BELOW: u128 = 499;
+        let user = Hash32::from([4u8; 32]);
+        let book = band_book(MIN, MAX);
+
+        // Every add entry point must apply the lower band bound. Normalize each
+        // return type to `Result<()>` so the eight paths check uniformly.
+        let results: Vec<Result<()>> = vec![
+            book.add_limit_order(OrderId::new(), Side::Buy, BELOW, 10),
+            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, BELOW, 10, TimeInForce::Gtc),
+            book.add_limit_order_with_user(OrderId::new(), Side::Buy, BELOW, 10, user),
+            book.add_limit_order_with_tif_and_user(
+                OrderId::new(),
+                Side::Buy,
+                BELOW,
+                10,
+                TimeInForce::Gtc,
+                user,
+            ),
+            book.add_limit_order_full(OrderId::new(), Side::Buy, BELOW, 10)
+                .map(|_| ()),
+            book.add_limit_order_with_tif_full(
+                OrderId::new(),
+                Side::Buy,
+                BELOW,
+                10,
+                TimeInForce::Gtc,
+            )
+            .map(|_| ()),
+            book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, BELOW, 10, user)
+                .map(|_| ()),
+            book.add_limit_order_with_tif_and_user_full(
+                OrderId::new(),
+                Side::Buy,
+                BELOW,
+                10,
+                TimeInForce::Gtc,
+                user,
+            )
+            .map(|_| ()),
+        ];
+
+        assert_eq!(results.len(), 8);
+        for (i, res) in results.into_iter().enumerate() {
+            assert!(
+                matches!(res, Err(Error::ValidationError { .. })),
+                "add path {i} must reject a below-band price with ValidationError"
+            );
+        }
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_price_band_at_both_bounds_inclusive_accepted() {
+        const MIN: u128 = 500;
+        const MAX: u128 = 5_000;
+        let book = band_book(MIN, MAX);
+        // Both bounds are inclusive.
+        book.add_limit_order(OrderId::new(), Side::Buy, MIN, 10)
+            .expect("price at the lower bound must be accepted");
+        book.add_limit_order(OrderId::new(), Side::Sell, MAX, 10)
+            .expect("price at the upper bound must be accepted");
+        assert_eq!(book.order_count(), 2);
+    }
+
+    #[test]
+    fn test_min_price_unset_never_rejects_low_price() {
+        // No min_price configured (only a max): a very low price is admitted.
+        let book = max_price_book(5_000);
+        let res = book.add_limit_order(OrderId::new(), Side::Buy, 1, 10);
+        assert!(
+            res.is_ok(),
+            "no lower bound means no low-price rejection: {res:?}"
+        );
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_price_band_within_band_accepted() {
+        let book = band_book(500, 5_000);
+        let res = book.add_limit_order(OrderId::new(), Side::Buy, 1_000, 10);
+        assert!(
+            res.is_ok(),
+            "a price inside the band must be accepted: {res:?}"
+        );
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_min_price_enforced_on_replace_order() {
+        let book = band_book(500, 5_000);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 1_000, 10)
+            .expect("add within band");
+        // Reprice below the lower bound: rejected crate-side, original untouched.
+        let res = book.replace_order(id, 499, 10, Side::Buy);
+        assert!(
+            matches!(res, Err(Error::ValidationError { .. })),
+            "replace below the band must be rejected crate-side: {res:?}"
+        );
+        assert_eq!(book.best_bid(), Some(1_000));
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_validation_config_readback_merges_min_price() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(ValidationConfig::new().with_min_price(250)),
+                ..BookConfig::default()
+            },
+        );
+        let config = book.validation_config().expect("config present");
+        assert_eq!(config.min_price(), Some(250));
+    }
+
+    #[test]
+    fn test_validation_config_readback_merges_full_band() {
+        let book = band_book(500, 5_000);
+        let config = book.validation_config().expect("config present");
+        assert_eq!(config.min_price(), Some(500));
+        assert_eq!(config.max_price(), Some(5_000));
     }
 
     // ── trade-capture take / clear ──────────────────────────────────────

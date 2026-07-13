@@ -60,6 +60,15 @@ impl std::fmt::Display for SettlementType {
 /// When set on an `UnderlyingOrderBook`, a [`ValidationConfig`] is automatically
 /// derived from the tick/lot/min/max fields and applied to all future order books.
 ///
+/// # Price band
+///
+/// The optional inclusive `[min_price, max_price]` band (in smallest price
+/// units) is enforced crate-side at the leaf, since the upstream engine has no
+/// price-bound hook. When both a spec band and a validation-slot band apply to
+/// the same leaf they are merged tightest-wins (see
+/// [`ValidationConfig::tightened_price_band`]). Band-free specs serialize to the
+/// exact 0.8.0 wire shape (the two band fields are skipped when unset).
+///
 /// # Examples
 ///
 /// ```
@@ -100,6 +109,16 @@ pub struct ContractSpecs {
     exercise_style: ExerciseStyle,
     /// Settlement currency symbol (e.g., "USDC").
     settlement_currency: String,
+    /// Minimum allowed order price in smallest price units; orders priced below
+    /// are rejected crate-side. `None` disables the lower bound. Serialized only
+    /// when set, so band-free specs keep the 0.8.0 wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_price: Option<u128>,
+    /// Maximum allowed order price in smallest price units; orders priced above
+    /// are rejected crate-side. `None` disables the upper bound. Serialized only
+    /// when set, so band-free specs keep the 0.8.0 wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_price: Option<u128>,
 }
 
 impl Default for ContractSpecs {
@@ -114,6 +133,8 @@ impl Default for ContractSpecs {
             settlement: SettlementType::Cash,
             exercise_style: ExerciseStyle::European,
             settlement_currency: "USDC".to_string(),
+            min_price: None,
+            max_price: None,
         }
     }
 }
@@ -180,10 +201,28 @@ impl ContractSpecs {
         &self.settlement_currency
     }
 
-    /// Derives a [`ValidationConfig`] from this contract's tick/lot/min/max fields.
+    /// Returns the minimum allowed order price (smallest price units), if any.
+    #[must_use]
+    #[inline]
+    pub const fn min_price(&self) -> Option<u128> {
+        self.min_price
+    }
+
+    /// Returns the maximum allowed order price (smallest price units), if any.
+    #[must_use]
+    #[inline]
+    pub const fn max_price(&self) -> Option<u128> {
+        self.max_price
+    }
+
+    /// Derives a [`ValidationConfig`] from this contract's tick/lot/min/max
+    /// fields and its optional price band.
     ///
     /// This is used internally to auto-configure order validation when specs are
-    /// attached to the hierarchy.
+    /// attached to the hierarchy. The `[min_price, max_price]` band is carried
+    /// through via [`ValidationConfig::tightened_price_band`], so a spec band set
+    /// at the underlying level flows into the derived validation config with no
+    /// extra wiring at the derivation site.
     #[must_use]
     pub fn to_validation_config(&self) -> ValidationConfig {
         ValidationConfig::new()
@@ -191,6 +230,7 @@ impl ContractSpecs {
             .with_lot_size(self.lot_size)
             .with_min_order_size(self.min_order_size)
             .with_max_order_size(self.max_order_size)
+            .tightened_price_band(self.min_price, self.max_price)
     }
 
     /// Validates these specifications, rejecting structurally-broken values.
@@ -209,6 +249,9 @@ impl ContractSpecs {
     /// - `contract_size` is zero
     /// - `min_order_size` is zero
     /// - `max_order_size < min_order_size`
+    /// - `min_price` is set to zero, or `max_price` is set to zero
+    /// - both band bounds are set and `min_price > max_price` (an inverted band;
+    ///   `min_price == max_price` is a valid single-price band)
     pub fn validate(&self) -> Result<()> {
         if self.tick_size == 0 {
             return Err(Error::configuration(format!(
@@ -240,6 +283,23 @@ impl ContractSpecs {
                 self.max_order_size, self.min_order_size
             )));
         }
+        if self.min_price == Some(0) {
+            return Err(Error::configuration(
+                "min_price must be at least 1 (got 0); leave it unset to disable the lower price bound",
+            ));
+        }
+        if self.max_price == Some(0) {
+            return Err(Error::configuration(
+                "max_price must be at least 1 (got 0); leave it unset to disable the upper price bound",
+            ));
+        }
+        if let (Some(min), Some(max)) = (self.min_price, self.max_price)
+            && min > max
+        {
+            return Err(Error::configuration(format!(
+                "min_price ({min}) must be less than or equal to max_price ({max})"
+            )));
+        }
         Ok(())
     }
 }
@@ -248,7 +308,7 @@ impl std::fmt::Display for ContractSpecs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ContractSpecs(tick={}, lot={}, contract={}, min={}, max={}, {}, {}, {})",
+            "ContractSpecs(tick={}, lot={}, contract={}, min={}, max={}, {}, {}, {}",
             self.tick_size,
             self.lot_size,
             self.contract_size,
@@ -257,7 +317,14 @@ impl std::fmt::Display for ContractSpecs {
             self.settlement,
             self.exercise_style,
             self.settlement_currency,
-        )
+        )?;
+        if let Some(min_price) = self.min_price {
+            write!(f, ", min_price={min_price}")?;
+        }
+        if let Some(max_price) = self.max_price {
+            write!(f, ", max_price={max_price}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -345,13 +412,34 @@ impl ContractSpecsBuilder {
         self
     }
 
+    /// Sets the minimum allowed order price (smallest price units).
+    ///
+    /// Orders priced below this bound are rejected crate-side. Leave unset to
+    /// disable the lower bound.
+    #[inline]
+    pub const fn min_price(mut self, min_price: u128) -> Self {
+        self.inner.min_price = Some(min_price);
+        self
+    }
+
+    /// Sets the maximum allowed order price (smallest price units).
+    ///
+    /// Orders priced above this bound are rejected crate-side. Leave unset to
+    /// disable the upper bound.
+    #[inline]
+    pub const fn max_price(mut self, max_price: u128) -> Self {
+        self.inner.max_price = Some(max_price);
+        self
+    }
+
     /// Consumes the builder and returns a validated [`ContractSpecs`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::ConfigurationError`]
     /// if the assembled specs are structurally invalid (zero tick / lot /
-    /// contract / minimum size, or an inverted `[min, max]` order-size window);
+    /// contract / minimum size, an inverted `[min, max]` order-size window, a
+    /// zero price bound, or an inverted `[min_price, max_price]` band);
     /// see [`ContractSpecs::validate`].
     pub fn build(self) -> Result<ContractSpecs> {
         self.inner.validate()?;
@@ -653,5 +741,140 @@ mod tests {
     fn test_contract_specs_validate_default_ok() {
         let specs = ContractSpecs::default();
         assert!(specs.validate().is_ok());
+    }
+
+    // ========== ContractSpecs price band tests ==========
+
+    #[test]
+    fn test_builder_sets_price_band() {
+        let specs = ContractSpecs::builder()
+            .min_price(100)
+            .max_price(1_000)
+            .build()
+            .expect("valid band");
+        assert_eq!(specs.min_price(), Some(100));
+        assert_eq!(specs.max_price(), Some(1_000));
+    }
+
+    #[test]
+    fn test_default_specs_have_no_price_band() {
+        let specs = ContractSpecs::default();
+        assert_eq!(specs.min_price(), None);
+        assert_eq!(specs.max_price(), None);
+    }
+
+    #[test]
+    fn test_to_validation_config_carries_price_band() {
+        let specs = ContractSpecs::builder()
+            .tick_size(10)
+            .min_price(100)
+            .max_price(1_000)
+            .build()
+            .expect("valid band");
+        let config = specs.to_validation_config();
+        assert_eq!(config.min_price(), Some(100));
+        assert_eq!(config.max_price(), Some(1_000));
+        // The non-band fields still derive as before.
+        assert_eq!(config.tick_size(), Some(10));
+    }
+
+    #[test]
+    fn test_validate_zero_min_price_rejected() {
+        let result = ContractSpecs::builder().min_price(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero min_price to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("min_price"));
+        assert!(err.to_string().contains('0'));
+    }
+
+    #[test]
+    fn test_validate_zero_max_price_rejected() {
+        let result = ContractSpecs::builder().max_price(0).build();
+        let err = match result {
+            Ok(_) => panic!("expected zero max_price to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("max_price"));
+    }
+
+    #[test]
+    fn test_validate_inverted_price_band_rejected() {
+        let result = ContractSpecs::builder()
+            .min_price(1_000)
+            .max_price(500)
+            .build();
+        let err = match result {
+            Ok(_) => panic!("expected an inverted band to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("min_price"));
+        assert!(msg.contains("500"));
+        assert!(msg.contains("1000"));
+    }
+
+    #[test]
+    fn test_validate_degenerate_price_band_ok() {
+        let specs = ContractSpecs::builder()
+            .min_price(750)
+            .max_price(750)
+            .build();
+        assert!(specs.is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_v080_json_without_band_fields_ok() {
+        // A hand-written 0.8.0-shape payload (no band fields at all) must still
+        // deserialize, with the band defaulting to None via serde(default).
+        let json = r#"{"tick_size":100,"lot_size":10,"contract_size":1,"min_order_size":1,"max_order_size":10000,"settlement":"Cash","exercise_style":"European","settlement_currency":"USDC"}"#;
+        let specs: ContractSpecs =
+            serde_json::from_str(json).expect("v0.8.0 specs json must deserialize");
+        assert_eq!(specs.min_price(), None);
+        assert_eq!(specs.max_price(), None);
+        assert_eq!(specs.tick_size(), 100);
+        assert_eq!(specs.settlement_currency(), "USDC");
+    }
+
+    #[test]
+    fn test_band_free_specs_serialize_without_band_fields() {
+        // skip_serializing_if keeps the 0.8.0 wire shape for band-free specs.
+        let specs = ContractSpecs::default();
+        let json = serde_json::to_string(&specs).expect("serialize");
+        assert!(
+            !json.contains("min_price"),
+            "band-free specs must omit min_price: {json}"
+        );
+        assert!(
+            !json.contains("max_price"),
+            "band-free specs must omit max_price: {json}"
+        );
+    }
+
+    #[test]
+    fn test_display_includes_price_band_when_set() {
+        let specs = ContractSpecs::builder()
+            .min_price(100)
+            .max_price(900)
+            .build()
+            .expect("valid band");
+        let display = format!("{specs}");
+        assert!(display.contains("min_price=100"));
+        assert!(display.contains("max_price=900"));
+    }
+
+    #[test]
+    fn test_serialization_roundtrip_with_price_band() {
+        let specs = ContractSpecs::builder()
+            .min_price(100)
+            .max_price(1_000)
+            .build()
+            .expect("valid band");
+        let json = serde_json::to_string(&specs).expect("serialize");
+        let back: ContractSpecs = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(specs, back);
+        assert_eq!(back.min_price(), Some(100));
+        assert_eq!(back.max_price(), Some(1_000));
     }
 }

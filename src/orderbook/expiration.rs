@@ -749,6 +749,8 @@ impl ExpirationOrderBookManager {
     ///
     /// Existing expiration books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    /// The specs' `[min_price, max_price]` price band is enforced crate-side at
+    /// the leaf (see [`OptionChainOrderBook::set_specs`](super::chain::OptionChainOrderBook::set_specs)).
     pub fn set_specs(&self, specs: ContractSpecs) {
         self.contract_specs.set(Some(specs));
     }

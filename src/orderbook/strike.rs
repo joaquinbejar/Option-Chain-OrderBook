@@ -1033,8 +1033,14 @@ impl StrikeOrderBookManager {
     /// Sets the contract specs associated with this manager.
     ///
     /// These specs are stored on the manager and can be retrieved later
-    /// via [`specs`](Self::specs). This does not modify any existing
-    /// strike books or automatically apply to newly created ones.
+    /// via [`specs`](Self::specs). Existing strike books are not modified.
+    ///
+    /// **Band exception:** unlike the specs' tick / lot / order-size fields
+    /// (which reach the leaf only through a derived [`ValidationConfig`]), the
+    /// specs' `[min_price, max_price]` price band IS applied to option books
+    /// created by a later [`get_or_create`](Self::get_or_create), merged
+    /// tightest-wins with any validation-slot band by this manager's internal
+    /// `effective_validation` merge.
     pub fn set_specs(&self, specs: ContractSpecs) {
         self.contract_specs.set(Some(specs));
     }
@@ -1057,6 +1063,62 @@ impl StrikeOrderBookManager {
     #[must_use]
     pub fn validation_config(&self) -> Option<ValidationConfig> {
         self.validation_config.get()
+    }
+
+    /// Computes the effective [`ValidationConfig`] for option books this manager
+    /// creates, merging the validation slot with the contract-specs price band.
+    ///
+    /// The `[min_price, max_price]` band from the stored [`ContractSpecs`] is
+    /// merged into the validation slot's band tightest-wins (see
+    /// [`ValidationConfig::tightened_price_band`]); only the band fields are
+    /// taken from the specs (their tick / lot / order-size fields reach the leaf
+    /// through the validation slot, derived at the underlying level). When a
+    /// contract-spec band is present with no validation slot, a band-only config
+    /// is synthesized so the band still reaches the leaf.
+    ///
+    /// This is the single merge point consumed by both `BookConfig` assembly
+    /// sites, so the two option legs (call/put) of a strike share one effective
+    /// config. The merge is pure and side-effect-free apart from a `WARN`: if the
+    /// two sources combine into an inverted band (`min_price > max_price`), it is
+    /// logged at creation and the created books reject every order — the
+    /// incoherence is surfaced, not silently repaired.
+    ///
+    /// Returns `None` only when neither a validation slot nor a spec band is
+    /// configured, preserving the pre-band behavior for band-free managers.
+    #[must_use]
+    fn effective_validation(&self) -> Option<ValidationConfig> {
+        let validation = self.validation_config.get();
+        let band = self
+            .contract_specs
+            .get()
+            .map(|specs| (specs.min_price(), specs.max_price()));
+
+        let merged = match (validation, band) {
+            (Some(config), Some((min, max))) => Some(config.tightened_price_band(min, max)),
+            (Some(config), None) => Some(config),
+            // Specs carry a band but there is no validation slot: synthesize a
+            // band-only config so the band still reaches the leaf.
+            (None, Some((min, max))) if min.is_some() || max.is_some() => {
+                Some(ValidationConfig::new().tightened_price_band(min, max))
+            }
+            (None, _) => None,
+        };
+
+        if let Some(ref config) = merged
+            && let (Some(min), Some(max)) = (config.min_price(), config.max_price())
+            && min > max
+        {
+            tracing::warn!(
+                underlying = %self.underlying,
+                expiration = %self.expiration,
+                min_price = min,
+                max_price = max,
+                "incoherent cross-source price band (min_price > max_price); \
+                 option books created at this strike will reject every order"
+            );
+        }
+
+        merged
     }
 
     /// Sets the STP mode for all future option books created by this manager.
@@ -1276,7 +1338,7 @@ impl StrikeOrderBookManager {
             contract_symbols(&self.underlying, &self.expiration, strike);
 
         let base_config = BookConfig {
-            validation: self.validation_config.get(),
+            validation: self.effective_validation(),
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
@@ -1404,7 +1466,7 @@ impl StrikeOrderBookManager {
     #[cfg(feature = "nats")]
     fn book_config_with_listeners(&self, listeners: Option<PreparedNatsListeners>) -> BookConfig {
         BookConfig {
-            validation: self.validation_config.get(),
+            validation: self.effective_validation(),
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
@@ -2718,5 +2780,161 @@ mod tests {
             "book created after set_clock uses the stub and admits the GTD: {admitted:?}"
         );
         assert_eq!(strike_b.call().order_count(), 1);
+    }
+
+    // ── effective_validation: validation-slot ⊕ specs-band precedence ────
+
+    fn band_manager() -> StrikeOrderBookManager {
+        StrikeOrderBookManager::new("BTC", test_expiration())
+    }
+
+    #[test]
+    fn test_effective_validation_specs_cap_tightens_validation() {
+        let m = band_manager();
+        m.set_validation(ValidationConfig::new().with_max_price(2_000));
+        m.set_specs(
+            ContractSpecs::builder()
+                .max_price(1_000)
+                .build()
+                .expect("valid specs"),
+        );
+        let eff = m.effective_validation().expect("merged config");
+        // The tighter (smaller) upper bound wins: the specs cap.
+        assert_eq!(eff.max_price(), Some(1_000));
+    }
+
+    #[test]
+    fn test_effective_validation_validation_cap_tightens_specs() {
+        let m = band_manager();
+        m.set_validation(ValidationConfig::new().with_max_price(800));
+        m.set_specs(
+            ContractSpecs::builder()
+                .max_price(1_000)
+                .build()
+                .expect("valid specs"),
+        );
+        let eff = m.effective_validation().expect("merged config");
+        // The tighter (smaller) upper bound wins: the validation cap.
+        assert_eq!(eff.max_price(), Some(800));
+    }
+
+    #[test]
+    fn test_effective_validation_specs_floor_tightens_validation() {
+        let m = band_manager();
+        m.set_validation(ValidationConfig::new().with_min_price(100));
+        m.set_specs(
+            ContractSpecs::builder()
+                .min_price(300)
+                .build()
+                .expect("valid specs"),
+        );
+        let eff = m.effective_validation().expect("merged config");
+        // The tighter (larger) lower bound wins: the specs floor.
+        assert_eq!(eff.min_price(), Some(300));
+    }
+
+    #[test]
+    fn test_effective_validation_tick_survives_band_merge() {
+        let m = band_manager();
+        m.set_validation(
+            ValidationConfig::new()
+                .with_tick_size(10)
+                .with_max_price(2_000),
+        );
+        m.set_specs(
+            ContractSpecs::builder()
+                .min_price(100)
+                .max_price(1_000)
+                .build()
+                .expect("valid specs"),
+        );
+        let eff = m.effective_validation().expect("merged config");
+        // Non-band fields from the validation slot are preserved.
+        assert_eq!(eff.tick_size(), Some(10));
+        assert_eq!(eff.min_price(), Some(100));
+        assert_eq!(eff.max_price(), Some(1_000));
+    }
+
+    #[test]
+    fn test_effective_validation_no_band_leaves_config_unchanged() {
+        // Validation slot with no band and no specs: returned unchanged.
+        let m = band_manager();
+        let validation = ValidationConfig::new().with_tick_size(10);
+        m.set_validation(validation.clone());
+        assert_eq!(m.effective_validation(), Some(validation));
+
+        // Neither a validation slot nor a spec band: nothing to apply.
+        let empty = band_manager();
+        assert_eq!(empty.effective_validation(), None);
+    }
+
+    #[test]
+    fn test_effective_validation_incoherent_band_creates_rejecting_book() {
+        let m = band_manager();
+        // Validation floor 600 above the specs cap 500 → merged inverted band.
+        m.set_validation(ValidationConfig::new().with_min_price(600));
+        m.set_specs(
+            ContractSpecs::builder()
+                .max_price(500)
+                .build()
+                .expect("valid specs"),
+        );
+        let eff = m.effective_validation().expect("merged config");
+        assert_eq!(eff.min_price(), Some(600));
+        assert_eq!(eff.max_price(), Some(500));
+
+        // A leaf built from this incoherent band rejects every price: nothing
+        // satisfies 600 <= price <= 500.
+        let strike = m.get_or_create(50000);
+        let at_cap = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 500, 10);
+        let at_floor = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 600, 10);
+        assert!(
+            at_cap.is_err(),
+            "price at the cap is below the floor: rejected"
+        );
+        assert!(
+            at_floor.is_err(),
+            "price at the floor is above the cap: rejected"
+        );
+        assert_eq!(strike.call().order_count(), 0);
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    fn test_effective_validation_band_reaches_leaf_on_nats_path() {
+        // A per-contract factory that installs no publishers still routes strike
+        // creation through the NATS BookConfig site
+        // (`book_config_with_listeners`), which must apply the same effective
+        // band as the non-NATS site.
+        let manager = band_manager();
+        let factory: ContractNatsListenerFactory = Arc::new(|_symbol: &str| None);
+        manager.set_nats_factory(Some(factory));
+        manager.set_validation(
+            ValidationConfig::new()
+                .with_min_price(100)
+                .with_max_price(1_000),
+        );
+
+        let strike = manager.get_or_create(50000);
+        let config = strike.call().validation_config().expect("config present");
+        assert_eq!(config.min_price(), Some(100));
+        assert_eq!(config.max_price(), Some(1_000));
+
+        // Enforcement is live on the NATS-path leaf.
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 99, 10)
+                .is_err(),
+            "below-band add must be rejected on the NATS path"
+        );
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+            .expect("within-band add on the NATS path");
     }
 }

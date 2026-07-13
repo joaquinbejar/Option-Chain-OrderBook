@@ -178,6 +178,14 @@ impl OptionChainOrderBook {
     /// Sets the contract specifications for this chain.
     ///
     /// Also propagates the specs to the strike manager for newly created strikes.
+    ///
+    /// **Band exception:** the specs' `[min_price, max_price]` price band IS
+    /// applied to option books created afterwards (merged tightest-wins by the
+    /// strike manager's internal effective-validation merge), even though the
+    /// other spec fields reach the leaf only through a derived
+    /// [`ValidationConfig`](super::validation::ValidationConfig) at the
+    /// underlying level. Setting specs directly here therefore activates the
+    /// band without going through the underlying derivation.
     pub fn set_specs(&self, specs: ContractSpecs) {
         self.strikes.set_specs(specs);
     }
@@ -1029,6 +1037,8 @@ impl OptionChainOrderBookManager {
     ///
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    /// The specs' `[min_price, max_price]` price band is enforced crate-side at
+    /// the leaf (see [`OptionChainOrderBook::set_specs`]).
     pub fn set_specs(&self, specs: ContractSpecs) {
         self.contract_specs.set(Some(specs));
     }
