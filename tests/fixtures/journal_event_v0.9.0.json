@@ -1,0 +1,118 @@
+[
+  {
+    "sequence_num": 1,
+    "timestamp_ns": 1700000000000000100,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "side": "BUY",
+        "price": 90,
+        "quantity": 6,
+        "tif": "GTC",
+        "user_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "PostOnly",
+        "hidden_quantity": null
+      }
+    },
+    "result": {
+      "OrderAdded": {
+        "order_id": "42",
+        "trade": null
+      }
+    }
+  },
+  {
+    "sequence_num": 2,
+    "timestamp_ns": 1700000000000000101,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "43",
+        "side": "SELL",
+        "price": 100,
+        "quantity": 3,
+        "tif": "GTC",
+        "user_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "PostOnly",
+        "hidden_quantity": null
+      }
+    },
+    "result": {
+      "Rejected": {
+        "reason": "order-book engine error: Price crossing: SELL 100 would cross opposite at 100"
+      }
+    }
+  },
+  {
+    "sequence_num": 3,
+    "timestamp_ns": 1700000000000000102,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "42",
+        "side": "SELL",
+        "price": 130,
+        "quantity": 5,
+        "tif": "GTC",
+        "user_id": "0707070707070707070707070707070707070707070707070707070707070707",
+        "kind": "Iceberg",
+        "hidden_quantity": 20
+      }
+    },
+    "result": {
+      "OrderAdded": {
+        "order_id": "42",
+        "trade": {
+          "symbol": "BTC-20240329-50000-C",
+          "match_result": {
+            "order_id": "42",
+            "trades": {
+              "trades": [
+                {
+                  "trade_id": "9001",
+                  "taker_order_id": "42",
+                  "maker_order_id": "43",
+                  "price": 100,
+                  "quantity": 4,
+                  "taker_side": "BUY",
+                  "timestamp": 1700000000000
+                }
+              ]
+            },
+            "remaining_quantity": 0,
+            "is_complete": true,
+            "filled_order_ids": [],
+            "outcome": "filled"
+          },
+          "total_maker_fees": 0,
+          "total_taker_fees": 0,
+          "engine_seq": 0,
+          "quote_notional": 400
+        }
+      }
+    }
+  },
+  {
+    "sequence_num": 4,
+    "timestamp_ns": 1700000000000000103,
+    "command": {
+      "AddOrder": {
+        "symbol": "BTC-20240329-50000-C",
+        "order_id": "44",
+        "side": "BUY",
+        "price": 95,
+        "quantity": 5,
+        "tif": "GTC",
+        "user_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "Iceberg",
+        "hidden_quantity": null
+      }
+    },
+    "result": {
+      "Rejected": {
+        "reason": "iceberg add requires hidden_quantity >= 1"
+      }
+    }
+  }
+]

@@ -130,7 +130,10 @@
 //!   [`orderbook::ContractSpecs`] band and a validation band apply to the same
 //!   contract, they are merged tightest-wins.
 //! - **Optional eventing**: NATS publishing (`nats` feature) and a
-//!   command/event/journal/replay sequencer (`sequencer` feature).
+//!   command/event/journal/replay sequencer (`sequencer` feature). The
+//!   sequenced add path carries order-kind variety — limit, post-only, and
+//!   iceberg ([`orderbook::OrderKind`]) — through the journal so replay
+//!   reconstructs the exact order shape.
 //!
 //! ## Limitations
 //!
@@ -367,7 +370,7 @@ pub use orderbook::{
 #[cfg(feature = "sequencer")]
 pub use orderbook::{
     InMemoryOptionChainJournal, MassCancelScope, MassCancelType, OptionChainCommand,
-    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult,
+    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult, OrderKind,
     SequencedUnderlyingOrderBook,
 };
 

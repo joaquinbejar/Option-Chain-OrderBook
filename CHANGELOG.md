@@ -11,6 +11,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [Unreleased]
+
+### Added
+
+- **Per-contract price banding on `ContractSpecs` (#152).** `ContractSpecs` and
+  `ValidationConfig` gained an inclusive absolute `[min_price, max_price]` band
+  (`Option<u128>` each, smallest price units). The engine has no price-bound
+  hook, so the band is enforced crate-side on every add and replace, after the
+  active check. When both a `ContractSpecs` band and a validation band apply to
+  the same contract they merge tightest-wins (`ValidationConfig::tightened_price_band`).
+  The `ContractSpecs` band fields carry `#[serde(default, skip_serializing_if)]`,
+  so band-free specs keep their pre-0.8.0 wire shape; specs that DO carry a band
+  are unreadable by 0.8.0 consumers (documented asymmetry).
+- **Order-kind variety through the sequenced path (#151).** New
+  `OrderKind` enum (`Limit` / `PostOnly` / `Iceberg`, `#[non_exhaustive]`),
+  re-exported from the crate root. `OptionChainCommand::AddOrder` gained
+  `kind: OrderKind` and `hidden_quantity: Option<u64>` (both `#[serde(default)]`,
+  always emitted). New `SequencedUnderlyingOrderBook::submit_add_order_kind`
+  wrapper carries the kind and hidden reserve into the journal so replay
+  reconstructs the exact order shape; `submit_add_order` / `submit_add_order_with`
+  now delegate through it (their 0.8.0 signatures are unchanged). For an iceberg,
+  `quantity` is the visible tranche and `hidden_quantity` the reserve behind it;
+  an iceberg with a missing/zero hidden reserve, or a limit/post-only add with a
+  hidden reserve, is a deterministic `Rejected`. A post-only add that would cross
+  is journaled as a deterministic `PriceCrossing` rejection.
+
+### Wire compatibility
+
+- The new `AddOrder` fields (`kind` / `hidden_quantity`) are backward-compatible
+  **for self-describing encodings (JSON)**: they carry `#[serde(default)]`, so a
+  pre-#151 JSON journal decodes to a plain limit add (`OrderKind::Limit`, no
+  hidden reserve) and replays identically (pinned by the frozen v0.5.0 and v0.8.0
+  fixture tests, which patch these defaults in). Positional codecs such as
+  bincode cannot apply a missing-field default, so pre-#151 *binary* journal
+  records must be re-journaled or migrated. An unknown `OrderKind` variant tag
+  written by a newer binary is rejected by an older one — the same additive
+  forward-compat asymmetry as the command/result enums.
+
 ## [0.8.0] - 2026-07-12
 
 ### ⚠️ Breaking Changes

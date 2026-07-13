@@ -134,6 +134,46 @@ fn default_add_order_tif() -> TimeInForce {
     TimeInForce::Gtc
 }
 
+/// The kind of add a journaled [`OptionChainCommand::AddOrder`] performs.
+///
+/// A single `AddOrder` command carries one of these to select the leaf add path:
+/// a plain limit add, a post-only (maker-only) add, or an iceberg add. This is a
+/// journaled (on-disk) type: variant tags are pinned to `PascalCase`, and the
+/// enum is `#[non_exhaustive]` so future kinds can be appended without a source
+/// break (a `match` on it outside this crate must carry a wildcard arm).
+///
+/// # Wire compatibility
+///
+/// `AddOrder` gained this field in #151 with `#[serde(default)]`, so a journal
+/// written before then decodes to [`OrderKind::Limit`] — the only kind that
+/// existed. As with the other defaulted `AddOrder` fields, that missing-field
+/// default only applies in self-describing encodings (JSON); a positional codec
+/// such as bincode cannot detect an absent trailing field, so pre-#151 *binary*
+/// records must be re-journaled or migrated rather than decoded against the new
+/// shape. An unknown variant tag (a kind a newer binary wrote) is rejected by a
+/// binary that predates it — the same forward-compat asymmetry as the command
+/// enum itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum OrderKind {
+    /// A standard limit order: rests if it does not cross, matches if it does.
+    #[default]
+    Limit,
+    /// A post-only (maker-only) order: rejected with a `PriceCrossing` engine
+    /// error if it would cross and take liquidity, so it can only ever rest.
+    PostOnly,
+    /// An iceberg order: only a visible tranche ([`AddOrder::quantity`] — see the
+    /// field's note) is exposed at a time while a hidden reserve
+    /// ([`AddOrder::hidden_quantity`]) is replenished behind it. Can cross and
+    /// trade on entry like a limit order.
+    ///
+    /// [`AddOrder::quantity`]: OptionChainCommand::AddOrder
+    /// [`AddOrder::hidden_quantity`]: OptionChainCommand::AddOrder
+    Iceberg,
+}
+
 /// Command for the option chain sequencer with hierarchy routing.
 ///
 /// Each variant represents an operation that can be sequenced through
@@ -202,6 +242,31 @@ pub enum OptionChainCommand {
         /// every add was attributed to the zero user. Serializes as a hex string.
         #[serde(default)]
         user_id: Hash32,
+        /// The kind of add to perform: limit, post-only, or iceberg.
+        ///
+        /// Defaults to [`OrderKind::Limit`] (via `#[serde(default)]`, which
+        /// `OrderKind` derives) when absent, so a journal written before #151
+        /// decodes and replays as a plain limit add — the only kind that then
+        /// existed. Same JSON-only default caveat as `tif`: a positional binary
+        /// codec cannot supply the missing trailing field, so pre-#151 binary
+        /// records must be re-journaled instead.
+        #[serde(default)]
+        kind: OrderKind,
+        /// Hidden reserve for an iceberg add, in quantity units.
+        ///
+        /// **For an iceberg add, `quantity` above is the VISIBLE tranche and this
+        /// is the hidden reserve behind it — the resting order's total size is
+        /// `quantity + hidden_quantity`, and its `quantity()` accessor reports
+        /// only the visible tranche.** Required as `Some(h)` with `h >= 1` when
+        /// `kind` is [`Iceberg`](OrderKind::Iceberg); MUST be `None` for
+        /// [`Limit`](OrderKind::Limit) / [`PostOnly`](OrderKind::PostOnly). A
+        /// mismatch is a deterministic [`Rejected`](OptionChainResult::Rejected),
+        /// never a silent field drop (see the validation in `execute_add_order`).
+        /// Defaults to `None` (via `#[serde(default)]`) when absent, so pre-#151
+        /// journals decode as non-iceberg. Same JSON-only default caveat as the
+        /// other appended fields.
+        #[serde(default)]
+        hidden_quantity: Option<u64>,
     },
     /// Cancel an order in a specific option book.
     CancelOrder {
@@ -1087,12 +1152,13 @@ impl SequencedUnderlyingOrderBook {
     /// Submits an add order command with an explicit time-in-force and user
     /// identity.
     ///
-    /// This is the full-fidelity add: it carries the `tif` and `user_id` into the
-    /// journaled [`OptionChainCommand::AddOrder`] so replay reproduces the same
-    /// eviction behavior (for `Gtd`/`Day`, in concert with the injected engine
-    /// clock) and the same by-user attribution. On success the receipt's
+    /// This is the full-fidelity limit add: it carries the `tif` and `user_id`
+    /// into the journaled [`OptionChainCommand::AddOrder`] so replay reproduces
+    /// the same eviction behavior (for `Gtd`/`Day`, in concert with the injected
+    /// engine clock) and the same by-user attribution. On success the receipt's
     /// [`OptionChainResult::OrderAdded`] carries the fills the add produced (see
-    /// that variant's replay caveat).
+    /// that variant's replay caveat). For a post-only or iceberg add, use
+    /// [`submit_add_order_kind`](Self::submit_add_order_kind).
     ///
     /// # Arguments
     ///
@@ -1121,6 +1187,73 @@ impl SequencedUnderlyingOrderBook {
         tif: TimeInForce,
         user_id: Hash32,
     ) -> Result<OptionChainReceipt, Error> {
+        // Delegate with the pre-#151 defaults (a plain limit add, no hidden
+        // reserve) so the 0.8.0 signature stays a convenience wrapper and cannot
+        // drift from the full order-kind path.
+        self.submit_add_order_kind(
+            symbol,
+            order_id,
+            side,
+            price,
+            quantity,
+            tif,
+            user_id,
+            OrderKind::Limit,
+            None,
+        )
+    }
+
+    /// Submits an add order command with an explicit order kind (limit,
+    /// post-only, or iceberg).
+    ///
+    /// This is the widest add entry point: beyond `tif` and `user_id`, it carries
+    /// the [`OrderKind`] and, for an iceberg, the `hidden_quantity` into the
+    /// journaled [`OptionChainCommand::AddOrder`], so replay reconstructs the
+    /// exact same order shape.
+    ///
+    /// # `quantity` vs `hidden_quantity`
+    ///
+    /// For an [`Iceberg`](OrderKind::Iceberg) add, `quantity` is the VISIBLE
+    /// tranche and `hidden_quantity` (`Some(h)`, `h >= 1`) is the hidden reserve;
+    /// the resting order's total size is `quantity + hidden_quantity`. For a
+    /// [`Limit`](OrderKind::Limit) or [`PostOnly`](OrderKind::PostOnly) add,
+    /// `hidden_quantity` MUST be `None`. A mismatched pairing is journaled as a
+    /// deterministic [`Rejected`](OptionChainResult::Rejected) rather than
+    /// silently dropping the field.
+    ///
+    /// A post-only add that would cross the book is rejected by the engine with a
+    /// `PriceCrossing` error and journaled as `Rejected` (deterministic).
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol (e.g., "BTC-20240329-50000-C")
+    /// * `order_id` - Unique order identifier
+    /// * `side` - Buy or Sell
+    /// * `price` - Limit price
+    /// * `quantity` - Order quantity (the visible tranche for an iceberg)
+    /// * `tif` - Time-in-force policy for the order
+    /// * `user_id` - Owning user identity
+    /// * `kind` - The kind of add: limit, post-only, or iceberg
+    /// * `hidden_quantity` - Hidden reserve for an iceberg add; `None` otherwise
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    // The order kind and hidden reserve are two more intrinsic order attributes on
+    // top of the full add; a struct would only obscure the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_add_order_kind(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+        kind: OrderKind,
+        hidden_quantity: Option<u64>,
+    ) -> Result<OptionChainReceipt, Error> {
         let command = OptionChainCommand::AddOrder {
             symbol: symbol.to_string(),
             order_id,
@@ -1129,6 +1262,8 @@ impl SequencedUnderlyingOrderBook {
             quantity,
             tif,
             user_id,
+            kind,
+            hidden_quantity,
         };
         self.submit(command)
     }
@@ -1289,9 +1424,19 @@ impl SequencedUnderlyingOrderBook {
                 quantity,
                 tif,
                 user_id,
-            } => {
-                self.execute_add_order(symbol, *order_id, *side, *price, *quantity, *tif, *user_id)
-            }
+                kind,
+                hidden_quantity,
+            } => self.execute_add_order(
+                symbol,
+                *order_id,
+                *side,
+                *price,
+                *quantity,
+                *tif,
+                *user_id,
+                *kind,
+                *hidden_quantity,
+            ),
             OptionChainCommand::CancelOrder { symbol, order_id } => {
                 self.execute_cancel_order(symbol, *order_id)
             }
@@ -1324,6 +1469,23 @@ impl SequencedUnderlyingOrderBook {
     /// symbol still yields [`OptionChainResult::BookNotFound`]; a cross-underlying
     /// symbol is rejected before anything is created.
     ///
+    /// # Order kind and `hidden_quantity`
+    ///
+    /// The [`OrderKind`] selects the leaf add path: [`Limit`](OrderKind::Limit)
+    /// and [`PostOnly`](OrderKind::PostOnly) take `quantity` alone;
+    /// [`Iceberg`](OrderKind::Iceberg) treats `quantity` as the visible tranche
+    /// and requires `hidden_quantity` to be `Some(h)` with `h >= 1`. The pairing
+    /// is validated strictly and deterministically BEFORE the book is resolved,
+    /// so an invalid pairing is journaled as [`OptionChainResult::Rejected`] with
+    /// no book mutation and never silently drops the field:
+    ///
+    /// - Iceberg with `hidden_quantity` `None` or `Some(0)` → rejected.
+    /// - Limit / PostOnly with `hidden_quantity` `Some(_)` → rejected.
+    ///
+    /// A post-only add that would cross is rejected by the engine with a
+    /// `PriceCrossing` error and surfaced as `Rejected` — deterministic, so it
+    /// replays identically.
+    ///
     /// # Fills and the error-after-fills caveat
     ///
     /// On success the result's `trade` is `Some` iff the add crossed and executed
@@ -1335,8 +1497,8 @@ impl SequencedUnderlyingOrderBook {
     /// only; they are deterministic, so replay reproduces the same rejection and
     /// the same fills, but a venue consumer must not read `Rejected` as "nothing
     /// happened".
-    // Mirrors the full add attribute set (see `submit_add_order_with`); the count
-    // is intrinsic to a limit-order add, not accidental.
+    // Mirrors the full add attribute set (see `submit_add_order_kind`); the count
+    // is intrinsic to a full add, not accidental.
     #[allow(clippy::too_many_arguments)]
     fn execute_add_order(
         &self,
@@ -1347,7 +1509,28 @@ impl SequencedUnderlyingOrderBook {
         quantity: u64,
         tif: TimeInForce,
         user_id: Hash32,
+        kind: OrderKind,
+        hidden_quantity: Option<u64>,
     ) -> OptionChainResult {
+        // Strict kind/hidden validation runs first, before any book resolution or
+        // mutation, so an invalid pairing is a pure deterministic rejection. This
+        // exhaustive match is over this crate's own `#[non_exhaustive]` enum, so
+        // it is exhaustive here even though downstream matches need a wildcard.
+        let resolved_hidden = match (kind, hidden_quantity) {
+            (OrderKind::Iceberg, Some(h)) if h >= 1 => Some(h),
+            (OrderKind::Iceberg, _) => {
+                return OptionChainResult::Rejected {
+                    reason: "iceberg add requires hidden_quantity >= 1".to_string(),
+                };
+            }
+            (OrderKind::Limit | OrderKind::PostOnly, Some(_)) => {
+                return OptionChainResult::Rejected {
+                    reason: "hidden_quantity is only valid for iceberg adds".to_string(),
+                };
+            }
+            (OrderKind::Limit | OrderKind::PostOnly, None) => None,
+        };
+
         let book = match self.find_or_create_book_by_symbol(symbol) {
             Ok(book) => book,
             // A cross-underlying command must be rejected with the typed reason,
@@ -1366,9 +1549,31 @@ impl SequencedUnderlyingOrderBook {
             }
         };
 
-        match book
-            .add_limit_order_with_tif_and_user_full(order_id, side, price, quantity, tif, user_id)
-        {
+        // Dispatch to the leaf add path for the requested kind. Each returns the
+        // same `Result<TradeResult, _>` shape, so fill attribution is uniform.
+        let outcome = match kind {
+            OrderKind::Limit => book.add_limit_order_with_tif_and_user_full(
+                order_id, side, price, quantity, tif, user_id,
+            ),
+            OrderKind::PostOnly => book.add_post_only_order_with_tif_and_user_full(
+                order_id, side, price, quantity, tif, user_id,
+            ),
+            OrderKind::Iceberg => {
+                // `resolved_hidden` is `Some(h >= 1)` for Iceberg by construction
+                // above; fall back to the same typed rejection defensively rather
+                // than unwrap.
+                let Some(hidden) = resolved_hidden else {
+                    return OptionChainResult::Rejected {
+                        reason: "iceberg add requires hidden_quantity >= 1".to_string(),
+                    };
+                };
+                book.add_iceberg_order_with_tif_and_user_full(
+                    order_id, side, price, quantity, hidden, tif, user_id,
+                )
+            }
+        };
+
+        match outcome {
             Ok(trade) => OptionChainResult::OrderAdded {
                 order_id,
                 // Carry the fills only when the add actually crossed; an empty
@@ -2732,6 +2937,8 @@ mod tests {
                 quantity: 10,
                 tif: TimeInForce::Gtc,
                 user_id: Hash32::zero(),
+                kind: OrderKind::Limit,
+                hidden_quantity: None,
             },
             result: OptionChainResult::OrderAdded {
                 order_id: OrderId::new(),
@@ -2982,7 +3189,7 @@ mod tests {
             .expect("canonical expiry");
 
         vec![
-            // AddOrder + OrderAdded (default tif/user, rested unfilled → trade None)
+            // AddOrder + OrderAdded (default tif/user/kind, rested → trade None)
             OptionChainEvent {
                 sequence_num: 1,
                 timestamp_ns: 1_700_000_000_000_000_000,
@@ -2994,6 +3201,8 @@ mod tests {
                     quantity: 10,
                     tif: TimeInForce::Gtc,
                     user_id: Hash32::zero(),
+                    kind: OrderKind::Limit,
+                    hidden_quantity: None,
                 },
                 result: OptionChainResult::OrderAdded {
                     order_id: oid,
@@ -3085,7 +3294,7 @@ mod tests {
             },
             // AddOrder with a NON-default tif (Gtd) + nonzero user_id, and an
             // OrderAdded carrying deterministic fills (#148). Exercises the
-            // enriched wire shape end to end.
+            // enriched wire shape end to end. Kind defaults to Limit.
             OptionChainEvent {
                 sequence_num: 9,
                 timestamp_ns: 1_700_000_000_000_000_008,
@@ -3097,6 +3306,8 @@ mod tests {
                     quantity: 4,
                     tif: TimeInForce::Gtd(1_700_000_000_000),
                     user_id: user,
+                    kind: OrderKind::Limit,
+                    hidden_quantity: None,
                 },
                 result: OptionChainResult::OrderAdded {
                     order_id: oid,
@@ -3115,6 +3326,47 @@ mod tests {
                     side: Side::Buy,
                 },
                 result: OptionChainResult::OrderReplaced { order_id: oid },
+            },
+            // PostOnly AddOrder that rested (#151): non-default kind, trade None.
+            OptionChainEvent {
+                sequence_num: 11,
+                timestamp_ns: 1_700_000_000_000_000_010,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Buy,
+                    price: 90,
+                    quantity: 6,
+                    tif: TimeInForce::Gtc,
+                    user_id: Hash32::zero(),
+                    kind: OrderKind::PostOnly,
+                    hidden_quantity: None,
+                },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: None,
+                },
+            },
+            // Iceberg AddOrder (#151): non-default kind + Some(hidden). quantity is
+            // the visible tranche, hidden_quantity the reserve behind it.
+            OptionChainEvent {
+                sequence_num: 12,
+                timestamp_ns: 1_700_000_000_000_000_011,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Sell,
+                    price: 130,
+                    quantity: 5,
+                    tif: TimeInForce::Gtc,
+                    user_id: user,
+                    kind: OrderKind::Iceberg,
+                    hidden_quantity: Some(20),
+                },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: Some(deterministic_trade_result()),
+                },
             },
         ]
     }
@@ -3148,6 +3400,102 @@ mod tests {
             .add_trade(trade)
             .expect("pinned trade must not overfill the match result");
         TradeResult::new("BTC-20240329-50000-C".to_string(), match_result)
+    }
+
+    /// The exact reason string the leaf surfaces when a post-only add would
+    /// cross the book (empirically pinned against orderbook-rs 0.10.3). Kept as a
+    /// named constant so the v0.9.0 fixture and the determinism unit test assert
+    /// against one source of truth.
+    const POST_ONLY_CROSS_REASON: &str =
+        "order-book engine error: Price crossing: SELL 100 would cross opposite at 100";
+
+    /// The #151-schema (v0.9.0) fixture events: the order-kind variety a v0.8.0
+    /// journal could not express. Post-only rest, post-only would-cross reject,
+    /// iceberg add with a deterministic fill, and an iceberg missing-hidden
+    /// reject. Built with deterministic ids so the encoding is byte-stable.
+    fn v0_9_0_fixture_events() -> Vec<OptionChainEvent> {
+        let oid = OrderId::sequential(42);
+        let user = Hash32::from([7u8; 32]);
+        vec![
+            // Post-only add that rested (did not cross) → OrderAdded, trade None.
+            OptionChainEvent {
+                sequence_num: 1,
+                timestamp_ns: 1_700_000_000_000_000_100,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Buy,
+                    price: 90,
+                    quantity: 6,
+                    tif: TimeInForce::Gtc,
+                    user_id: Hash32::zero(),
+                    kind: OrderKind::PostOnly,
+                    hidden_quantity: None,
+                },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: None,
+                },
+            },
+            // Post-only add that would cross → Rejected (pinned PriceCrossing).
+            OptionChainEvent {
+                sequence_num: 2,
+                timestamp_ns: 1_700_000_000_000_000_101,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::sequential(43),
+                    side: Side::Sell,
+                    price: 100,
+                    quantity: 3,
+                    tif: TimeInForce::Gtc,
+                    user_id: Hash32::zero(),
+                    kind: OrderKind::PostOnly,
+                    hidden_quantity: None,
+                },
+                result: OptionChainResult::Rejected {
+                    reason: POST_ONLY_CROSS_REASON.to_string(),
+                },
+            },
+            // Iceberg add carrying deterministic fills → OrderAdded, trade Some.
+            OptionChainEvent {
+                sequence_num: 3,
+                timestamp_ns: 1_700_000_000_000_000_102,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: oid,
+                    side: Side::Sell,
+                    price: 130,
+                    quantity: 5,
+                    tif: TimeInForce::Gtc,
+                    user_id: user,
+                    kind: OrderKind::Iceberg,
+                    hidden_quantity: Some(20),
+                },
+                result: OptionChainResult::OrderAdded {
+                    order_id: oid,
+                    trade: Some(deterministic_trade_result()),
+                },
+            },
+            // Iceberg add with no hidden reserve → deterministic Rejected.
+            OptionChainEvent {
+                sequence_num: 4,
+                timestamp_ns: 1_700_000_000_000_000_103,
+                command: OptionChainCommand::AddOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::sequential(44),
+                    side: Side::Buy,
+                    price: 95,
+                    quantity: 5,
+                    tif: TimeInForce::Gtc,
+                    user_id: Hash32::zero(),
+                    kind: OrderKind::Iceberg,
+                    hidden_quantity: None,
+                },
+                result: OptionChainResult::Rejected {
+                    reason: "iceberg add requires hidden_quantity >= 1".to_string(),
+                },
+            },
+        ]
     }
 
     /// Back-compat / format-pin guard: a checked-in journal sample written under
@@ -3190,17 +3538,19 @@ mod tests {
             }
         ));
 
-        // Re-encoding: the #148 additive fields (`tif` / `user_id` on `AddOrder`,
-        // `trade` on `OrderAdded`) are absent from the frozen v0.5.0 fixture but
-        // are ALWAYS emitted by the current schema (no `skip_serializing_if`), so
-        // a naive `to_value(decoded) == fixture` comparison would fail purely on
-        // the new fields. That is expected and correct: the additive-field
-        // precedent is that an old journal decodes to the field DEFAULTS, and
-        // re-encoding then materializes those defaults. To keep this test a true
-        // wire-stability pin (nothing OTHER than the known additive fields
-        // changed), we patch the parsed fixture with exactly those defaults —
-        // `"tif":"GTC"`, the zero-hex `user_id`, `"trade":null` — and require the
-        // patched fixture to match the re-encode byte-for-byte. Any drift in a
+        // Re-encoding: the additive fields — #148 (`tif` / `user_id` on
+        // `AddOrder`, `trade` on `OrderAdded`) and #151 (`kind` /
+        // `hidden_quantity` on `AddOrder`) — are absent from the frozen v0.5.0
+        // fixture but are ALWAYS emitted by the current schema (no
+        // `skip_serializing_if`), so a naive `to_value(decoded) == fixture`
+        // comparison would fail purely on the new fields. That is expected and
+        // correct: the additive-field precedent is that an old journal decodes to
+        // the field DEFAULTS, and re-encoding then materializes those defaults. To
+        // keep this test a true wire-stability pin (nothing OTHER than the known
+        // additive fields changed), we patch the parsed fixture with exactly those
+        // defaults — `"tif":"GTC"`, the zero-hex `user_id`, `"kind":"Limit"`,
+        // `"hidden_quantity":null`, `"trade":null` — and require the patched
+        // fixture to match the re-encode byte-for-byte. Any drift in a
         // pre-existing field still fails loudly. The frozen fixture file itself
         // is NOT edited.
         let reencoded: serde_json::Value =
@@ -3217,6 +3567,8 @@ mod tests {
             "user_id".to_string(),
             serde_json::json!(Hash32::zero().to_hex()),
         );
+        add_cmd.insert("kind".to_string(), serde_json::json!("Limit"));
+        add_cmd.insert("hidden_quantity".to_string(), serde_json::Value::Null);
         let added_result = on_disk[0]["result"]["OrderAdded"]
             .as_object_mut()
             .expect("fixture event 0 result is OrderAdded");
@@ -3225,7 +3577,92 @@ mod tests {
         assert_eq!(
             reencoded, on_disk,
             "re-encoded journal diverged from the checked-in v0.5.0 wire format \
-             (beyond the known #148 additive fields)"
+             (beyond the known #148/#151 additive fields)"
+        );
+    }
+
+    /// Format-pin guard for the #151 schema, exercising the order-kind variety a
+    /// v0.8.0 journal could not express: a post-only rest (`OrderAdded` with
+    /// `trade: null`), a post-only would-cross rejection (with the pinned
+    /// `PriceCrossing` reason), an iceberg add carrying a deterministic fill, and
+    /// an iceberg missing-hidden rejection. The fixture is the current schema, so
+    /// the re-encode is strict with no patching.
+    ///
+    /// NOTE: this fixture is **unfrozen** until the release that ships #151 — it
+    /// tracks the in-development schema and may be regenerated. #153 will append
+    /// its `trade`-on-`OrderReplaced` events here; once released it freezes like
+    /// v0.5.0 / v0.8.0, and later schema additions patch defaults instead.
+    ///
+    /// The fixture lives at `tests/fixtures/journal_event_v0.9.0.json`.
+    #[test]
+    fn test_journal_event_v0_9_0_fixture_decodes_and_is_stable() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/journal_event_v0.9.0.json");
+
+        let decoded: Vec<OptionChainEvent> =
+            serde_json::from_str(FIXTURE).expect("v0.9.0 journal fixture must decode");
+        assert_eq!(decoded.len(), 4, "fixture should hold four events");
+
+        // Spot-check the #151 shapes.
+        assert!(matches!(
+            decoded[0].command,
+            OptionChainCommand::AddOrder {
+                kind: OrderKind::PostOnly,
+                hidden_quantity: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[0].result,
+            OptionChainResult::OrderAdded { trade: None, .. }
+        ));
+        match &decoded[1].result {
+            OptionChainResult::Rejected { reason } => {
+                assert_eq!(
+                    reason, POST_ONLY_CROSS_REASON,
+                    "PriceCrossing reason drifted"
+                )
+            }
+            other => panic!("event 1 must be a Rejected post-only cross, got {other:?}"),
+        }
+        assert!(matches!(
+            decoded[2].command,
+            OptionChainCommand::AddOrder {
+                kind: OrderKind::Iceberg,
+                hidden_quantity: Some(20),
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[2].result,
+            OptionChainResult::OrderAdded { trade: Some(_), .. }
+        ));
+        assert!(matches!(
+            decoded[3].command,
+            OptionChainCommand::AddOrder {
+                kind: OrderKind::Iceberg,
+                hidden_quantity: None,
+                ..
+            }
+        ));
+
+        // Strict re-encode: the current schema is fully materialized in the
+        // fixture, so no additive-field patching is needed.
+        let reencoded: serde_json::Value =
+            serde_json::to_value(&decoded).expect("re-encode decoded events");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("parse fixture as value");
+        assert_eq!(
+            reencoded, on_disk,
+            "re-encoded journal diverged from the checked-in v0.9.0 wire format"
+        );
+
+        // The frozen file must also match what the code-side builder produces, so
+        // the fixture cannot silently drift from `v0_9_0_fixture_events`.
+        let from_builder: serde_json::Value =
+            serde_json::to_value(v0_9_0_fixture_events()).expect("serialize builder events");
+        assert_eq!(
+            from_builder, on_disk,
+            "the v0.9.0 fixture file diverged from v0_9_0_fixture_events()"
         );
     }
 
@@ -3246,14 +3683,16 @@ mod tests {
 
     /// Format-pin guard for the CURRENT (#148) schema: a checked-in journal
     /// sample written under the enriched schema MUST decode into
-    /// `OptionChainEvent` and re-encode value-identically. Unlike the v0.5.0
-    /// fixture (which predates the additive fields and therefore needs the
-    /// defaults patched in), this fixture already carries `tif` / `user_id` /
-    /// `trade` and the `ReplaceOrder` / `OrderReplaced` variants, so the
-    /// comparison is strict with no patching. It covers `AddOrder` with the
-    /// default and with a non-default `Gtd` tif + nonzero user, `OrderAdded` both
-    /// with `trade: null` and with a deterministic fill payload, and the replace
-    /// pair.
+    /// `OptionChainEvent` and re-encode value-identically. The frozen v0.8.0
+    /// fixture carries the #148 fields (`tif` / `user_id` / `trade`) and the
+    /// `ReplaceOrder` / `OrderReplaced` variants, but predates the #151
+    /// `kind` / `hidden_quantity` fields on `AddOrder`. So — exactly as the
+    /// v0.5.0 test does for the #148 fields — this test patches the #151 defaults
+    /// (`"kind":"Limit"`, `"hidden_quantity":null`) into the parsed fixture's
+    /// AddOrder command objects before the strict compare; the frozen fixture
+    /// file itself is NOT edited. It covers `AddOrder` with the default and with a
+    /// non-default `Gtd` tif + nonzero user, `OrderAdded` both with `trade: null`
+    /// and with a deterministic fill payload, and the replace pair.
     ///
     /// The fixture lives at `tests/fixtures/journal_event_v0.8.0.json`.
     #[test]
@@ -3264,15 +3703,26 @@ mod tests {
             serde_json::from_str(FIXTURE).expect("v0.8.0 journal fixture must decode");
         assert_eq!(decoded.len(), 10, "fixture should hold ten events");
 
-        // Spot-check the #148 shapes landed as expected.
+        // Spot-check the #148 shapes landed as expected, plus that the #151
+        // fields defaulted (the fixture predates them).
         assert!(matches!(
             decoded[0].result,
             OptionChainResult::OrderAdded { trade: None, .. }
         ));
         assert!(matches!(
+            decoded[0].command,
+            OptionChainCommand::AddOrder {
+                kind: OrderKind::Limit,
+                hidden_quantity: None,
+                ..
+            }
+        ));
+        assert!(matches!(
             decoded[8].command,
             OptionChainCommand::AddOrder {
                 tif: TimeInForce::Gtd(1_700_000_000_000),
+                kind: OrderKind::Limit,
+                hidden_quantity: None,
                 ..
             }
         ));
@@ -3289,15 +3739,27 @@ mod tests {
             OptionChainResult::OrderReplaced { .. }
         ));
 
-        // Strict re-encode: the current schema is fully materialized in the
-        // fixture, so no additive-field patching is needed.
+        // Patch-defaults re-encode: the frozen v0.8.0 fixture predates the #151
+        // `kind` / `hidden_quantity` fields, which the current schema always
+        // emits. Inject those defaults into the two AddOrder command objects
+        // (events 0 and 8) before comparing byte-for-byte — same sanctioned
+        // pattern the v0.5.0 test uses for the #148 fields. The frozen file is
+        // untouched.
         let reencoded: serde_json::Value =
             serde_json::to_value(&decoded).expect("re-encode decoded events");
-        let on_disk: serde_json::Value =
+        let mut on_disk: serde_json::Value =
             serde_json::from_str(FIXTURE).expect("parse fixture as value");
+        for idx in [0usize, 8] {
+            let add_cmd = on_disk[idx]["command"]["AddOrder"]
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("fixture event {idx} command must be AddOrder"));
+            add_cmd.insert("kind".to_string(), serde_json::json!("Limit"));
+            add_cmd.insert("hidden_quantity".to_string(), serde_json::Value::Null);
+        }
         assert_eq!(
             reencoded, on_disk,
-            "re-encoded journal diverged from the checked-in v0.8.0 wire format"
+            "re-encoded journal diverged from the checked-in v0.8.0 wire format \
+             (beyond the known #151 additive fields)"
         );
     }
 
@@ -3440,6 +3902,51 @@ mod tests {
             serde_json::from_str::<OptionChainEvent>(in_replaced_result).is_err(),
             "unknown field inside OrderReplaced must be rejected"
         );
+
+        // Extra field alongside the #151 kind / hidden_quantity fields must be
+        // rejected (proving they did not weaken deny_unknown_fields).
+        let in_kinded_add = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 10,
+                "tif": "GTC",
+                "user_id": "0000000000000000000000000000000000000000000000000000000000000000",
+                "kind": "Iceberg",
+                "hidden_quantity": 20,
+                "extra": 1
+            } },
+            "result": { "OrderAdded": { "order_id": "42", "trade": null } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(in_kinded_add).is_err(),
+            "unknown field alongside kind/hidden_quantity must be rejected"
+        );
+
+        // An unknown OrderKind variant tag (a kind a newer binary wrote) must
+        // fail to decode — the same old-binary-rejects-new-tag asymmetry as the
+        // command/result enums, and independent of deny_unknown_fields.
+        let unknown_kind = r#"{
+            "sequence_num": 1,
+            "timestamp_ns": 2,
+            "command": { "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "42",
+                "side": "BUY",
+                "price": 100,
+                "quantity": 10,
+                "kind": "TrailingStop"
+            } },
+            "result": { "OrderAdded": { "order_id": "42" } }
+        }"#;
+        assert!(
+            serde_json::from_str::<OptionChainEvent>(unknown_kind).is_err(),
+            "an unknown OrderKind variant tag must be rejected"
+        );
     }
 
     /// Pins the 0.7.0 wire format of the appended `EvictExpiredOrders` /
@@ -3497,15 +4004,16 @@ mod tests {
         );
     }
 
-    /// Pins the #148 enriched `AddOrder` wire shape: the appended `tif` /
-    /// `user_id` fields, the pricelevel casing of the `Gtd` payload
-    /// (`{"GTD": ms}`, not `snake_case`), and the hex-string `user_id`. Also pins
-    /// that the default `tif`/`user` still serialize explicitly (no
+    /// Pins the enriched `AddOrder` wire shape: the #148 `tif` / `user_id`
+    /// fields, the pricelevel casing of the `Gtd` payload (`{"GTD": ms}`, not
+    /// `snake_case`), the hex-string `user_id`, and the #151 `kind` /
+    /// `hidden_quantity` fields (`PascalCase` kind tag, `null`/number hidden).
+    /// Also pins that the defaults still serialize explicitly (no
     /// `skip_serializing_if`), which is what keeps the JSON/bincode encodings
     /// symmetric across a decode/encode round-trip.
     #[test]
     fn test_add_order_wire_format_pinned() {
-        // Non-default tif (Gtd) + nonzero user.
+        // Non-default tif (Gtd) + nonzero user, default (Limit / None) kind.
         let gtd = OptionChainCommand::AddOrder {
             symbol: "BTC-20240329-50000-C".to_string(),
             order_id: OrderId::sequential(42),
@@ -3514,6 +4022,8 @@ mod tests {
             quantity: 4,
             tif: TimeInForce::Gtd(1_700_000_000_000),
             user_id: Hash32::from([7u8; 32]),
+            kind: OrderKind::Limit,
+            hidden_quantity: None,
         };
         let value = serde_json::to_value(&gtd).expect("serialize");
         let expected = serde_json::json!({
@@ -3524,12 +4034,39 @@ mod tests {
                 "price": 100,
                 "quantity": 4,
                 "tif": { "GTD": 1_700_000_000_000_u64 },
-                "user_id": "0707070707070707070707070707070707070707070707070707070707070707"
+                "user_id": "0707070707070707070707070707070707070707070707070707070707070707",
+                "kind": "Limit",
+                "hidden_quantity": null
             }
         });
         assert_eq!(value, expected, "enriched AddOrder wire format drifted");
 
-        // Default tif/user still serialize explicitly.
+        // An iceberg add pins the PascalCase kind tag and the numeric hidden
+        // reserve (quantity here is the visible tranche).
+        let iceberg = OptionChainCommand::AddOrder {
+            symbol: "BTC-20240329-50000-C".to_string(),
+            order_id: OrderId::sequential(42),
+            side: Side::Sell,
+            price: 130,
+            quantity: 5,
+            tif: TimeInForce::Gtc,
+            user_id: Hash32::zero(),
+            kind: OrderKind::Iceberg,
+            hidden_quantity: Some(20),
+        };
+        let iceberg_value = serde_json::to_value(&iceberg).expect("serialize iceberg");
+        assert_eq!(
+            iceberg_value["AddOrder"]["kind"],
+            serde_json::json!("Iceberg"),
+            "iceberg kind tag must serialize as \"Iceberg\""
+        );
+        assert_eq!(
+            iceberg_value["AddOrder"]["hidden_quantity"],
+            serde_json::json!(20),
+            "hidden_quantity must serialize as a plain number"
+        );
+
+        // Defaults (tif / user / kind / hidden) still serialize explicitly.
         let default = OptionChainCommand::AddOrder {
             symbol: "BTC-20240329-50000-C".to_string(),
             order_id: OrderId::sequential(42),
@@ -3538,6 +4075,8 @@ mod tests {
             quantity: 5,
             tif: TimeInForce::Gtc,
             user_id: Hash32::zero(),
+            kind: OrderKind::Limit,
+            hidden_quantity: None,
         };
         let default_value = serde_json::to_value(&default).expect("serialize default");
         assert_eq!(
@@ -3549,6 +4088,16 @@ mod tests {
             default_value["AddOrder"]["user_id"],
             serde_json::json!(Hash32::zero().to_hex()),
             "default user_id must serialize as the zero hex string"
+        );
+        assert_eq!(
+            default_value["AddOrder"]["kind"],
+            serde_json::json!("Limit"),
+            "default kind must serialize as \"Limit\""
+        );
+        assert_eq!(
+            default_value["AddOrder"]["hidden_quantity"],
+            serde_json::Value::Null,
+            "default hidden_quantity must serialize as null"
         );
     }
 
@@ -3939,6 +4488,33 @@ mod tests {
     }
 
     #[test]
+    fn test_add_order_without_kind_decodes_as_limit() {
+        // A pre-#151 AddOrder command has no kind / hidden_quantity fields. It
+        // must decode to a plain limit add (kind Limit, hidden None) so old
+        // journals replay as they did before order-kind variety existed.
+        let no_kind = r#"{ "AddOrder": {
+            "symbol": "BTC-20240329-50000-C",
+            "order_id": "1",
+            "side": "BUY",
+            "price": 100,
+            "quantity": 10
+        } }"#;
+        let command: OptionChainCommand =
+            serde_json::from_str(no_kind).expect("kindless AddOrder wire must decode");
+        match command {
+            OptionChainCommand::AddOrder {
+                kind,
+                hidden_quantity,
+                ..
+            } => {
+                assert_eq!(kind, OrderKind::Limit);
+                assert_eq!(hidden_quantity, None);
+            }
+            other => panic!("expected AddOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_order_added_carries_trade_when_add_fills() {
         // The fixture seeds a resting call sell@110 qty5; a marketable buy@110
         // crosses it and executes a fill, so OrderAdded carries the trade.
@@ -4082,6 +4658,157 @@ mod tests {
                 );
             }
             other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    // ── Submit: order kinds (#151) ───────────────────────────────────────
+
+    #[test]
+    fn test_execute_add_order_iceberg_missing_hidden_rejected() {
+        // An iceberg add with no hidden reserve is a deterministic rejection,
+        // caught by the strict validation before any book resolution — so the
+        // hierarchy is not even vivified.
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        for hidden in [None, Some(0)] {
+            let receipt = book
+                .submit_add_order_kind(
+                    "BTC-20240329-50000-C",
+                    OrderId::sequential(1),
+                    Side::Buy,
+                    100,
+                    5,
+                    TimeInForce::Gtc,
+                    Hash32::zero(),
+                    OrderKind::Iceberg,
+                    hidden,
+                )
+                .expect("submit");
+            match &receipt.result {
+                OptionChainResult::Rejected { reason } => assert_eq!(
+                    reason, "iceberg add requires hidden_quantity >= 1",
+                    "unexpected reason for hidden={hidden:?}"
+                ),
+                other => panic!("expected Rejected for hidden={hidden:?}, got {other:?}"),
+            }
+        }
+        // Validation runs before resolution, so nothing was materialized.
+        assert_eq!(book.expiration_count(), 0);
+        assert_eq!(book.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_add_order_hidden_on_limit_rejected() {
+        // A hidden reserve is only meaningful for an iceberg; supplying it on a
+        // limit or post-only add is a deterministic rejection, never a silent
+        // field drop.
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        for kind in [OrderKind::Limit, OrderKind::PostOnly] {
+            let receipt = book
+                .submit_add_order_kind(
+                    "BTC-20240329-50000-C",
+                    OrderId::sequential(1),
+                    Side::Buy,
+                    100,
+                    5,
+                    TimeInForce::Gtc,
+                    Hash32::zero(),
+                    kind,
+                    Some(10),
+                )
+                .expect("submit");
+            match &receipt.result {
+                OptionChainResult::Rejected { reason } => assert_eq!(
+                    reason, "hidden_quantity is only valid for iceberg adds",
+                    "unexpected reason for kind={kind:?}"
+                ),
+                other => panic!("expected Rejected for kind={kind:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(book.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_add_order_post_only_would_cross_rejected_deterministic() {
+        // A post-only add that would cross is rejected by the engine with a
+        // `PriceCrossing` error. Two identically-prepared books must produce the
+        // byte-identical rejection reason — the determinism the journal relies on.
+        fn run() -> OptionChainResult {
+            let book = SequencedUnderlyingOrderBook::new("BTC");
+            let symbol = "BTC-20240329-50000-C";
+            // Resting bid at 100; a post-only SELL at 100 would cross it.
+            book.submit_add_order(symbol, OrderId::sequential(1), Side::Buy, 100, 5)
+                .expect("seed bid");
+            book.submit_add_order_kind(
+                symbol,
+                OrderId::sequential(2),
+                Side::Sell,
+                100,
+                3,
+                TimeInForce::Gtc,
+                Hash32::zero(),
+                OrderKind::PostOnly,
+                None,
+            )
+            .expect("submit post-only")
+            .result
+        }
+
+        let (first, second) = (run(), run());
+        let first_reason = match &first {
+            OptionChainResult::Rejected { reason } => reason.clone(),
+            other => panic!("expected Rejected post-only cross, got {other:?}"),
+        };
+        let second_reason = match &second {
+            OptionChainResult::Rejected { reason } => reason.clone(),
+            other => panic!("expected Rejected post-only cross, got {other:?}"),
+        };
+        assert_eq!(
+            first_reason, second_reason,
+            "post-only would-cross rejection reason must be deterministic across runs"
+        );
+        assert!(
+            first_reason.contains("Price crossing"),
+            "reason should be a PriceCrossing error, got {first_reason:?}"
+        );
+    }
+
+    #[test]
+    fn test_submit_add_order_kind_journals_kind_and_hidden() {
+        // The order kind and hidden reserve are carried verbatim into the
+        // journaled command so replay reconstructs the exact order shape.
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        let receipt = book
+            .submit_add_order_kind(
+                "BTC-20240329-50000-C",
+                OrderId::sequential(1),
+                Side::Sell,
+                130,
+                5,
+                TimeInForce::Gtc,
+                Hash32::zero(),
+                OrderKind::Iceberg,
+                Some(20),
+            )
+            .expect("submit iceberg");
+        assert!(receipt.result.is_success(), "got {:?}", receipt.result);
+
+        let events = journal.read_from(0).expect("read journal");
+        assert_eq!(events.len(), 1);
+        match &events[0].command {
+            OptionChainCommand::AddOrder {
+                kind,
+                hidden_quantity,
+                quantity,
+                ..
+            } => {
+                assert_eq!(*kind, OrderKind::Iceberg);
+                assert_eq!(*hidden_quantity, Some(20));
+                // quantity is the visible tranche for an iceberg.
+                assert_eq!(*quantity, 5);
+            }
+            other => panic!("expected AddOrder, got {other:?}"),
         }
     }
 
