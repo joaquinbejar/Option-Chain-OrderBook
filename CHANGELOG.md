@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [0.10.0] - 2026-07-23
+
+### Changed
+
+- **Dependency refresh to the latest stable releases**, with every requirement
+  expressed as a two-component `X.Y` range:
+  - `optionstratlib` `0.17` → `0.18`
+  - `orderbook-rs` `0.11` → `0.12`
+  - `pricelevel` `0.8.4` → `0.9`
+  - `uuid` `1.23` → `1.24`
+  - `tokio` `1.52` → `1.53`
+  - `proptest` `1` → `1.11`
+
+  No source changes were required: the public API, the journal wire format, and
+  the sequencer replay semantics are unchanged. `async-nats` stays on `0.49`
+  because `orderbook-rs 0.12` depends on that line — taking `0.50` here would
+  pull a second copy of the crate and break the `jetstream::Context` types the
+  NATS publishers exchange with `orderbook-rs`.
+
 ## [0.9.1] - 2026-07-13
 
 ### Added

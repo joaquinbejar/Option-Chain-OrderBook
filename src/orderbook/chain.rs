@@ -184,7 +184,7 @@ impl OptionChainOrderBook {
     /// applied to option books created afterwards (merged tightest-wins by the
     /// strike manager's internal effective-validation merge), even though the
     /// other spec fields reach the leaf only through a derived
-    /// [`ValidationConfig`](super::validation::ValidationConfig) at the
+    /// [`ValidationConfig`] at the
     /// underlying level. Setting specs directly here therefore activates the
     /// band without going through the underlying derivation.
     pub fn set_specs(&self, specs: ContractSpecs) {

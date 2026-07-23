@@ -132,7 +132,7 @@
 //! - **Optional eventing**: NATS publishing (`nats` feature) and a
 //!   command/event/journal/replay sequencer (`sequencer` feature). The
 //!   sequenced add path carries order-kind variety — limit, post-only, and
-//!   iceberg ([`orderbook::OrderKind`]) — through the journal so replay
+//!   iceberg (`OrderKind`) — through the journal so replay
 //!   reconstructs the exact order shape.
 //!
 //! ## Limitations
@@ -171,7 +171,7 @@
 //!   fully byte-identical (with only namespace + clock injected, the trade
 //!   payloads are identical but the wall-clock envelope `timestamp_ns` still
 //!   differs). Without namespace and clock the old caveat applies. Either way
-//!   [`replay`](orderbook::SequencedUnderlyingOrderBook::replay) discards
+//!   `SequencedUnderlyingOrderBook::replay` discards
 //!   journaled results, so the replay oracle compares book state and never diffs
 //!   trade payloads.
 //! - **Time-in-force replay determinism requires an injected clock.** `GTD` /

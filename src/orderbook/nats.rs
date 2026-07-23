@@ -250,9 +250,9 @@ impl OptionChainSubjectBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidSymbol`](crate::error::Error::InvalidSymbol) if
+    /// Returns [`Error::InvalidSymbol`] if
     /// the symbol does not match the expected grammar, or
-    /// [`Error::NatsSubject`](crate::error::Error::NatsSubject) if the
+    /// [`Error::NatsSubject`] if the
     /// (already grammar-valid) underlying carries a reserved NATS subject
     /// character (`.`, `*`, `>`).
     ///
@@ -303,7 +303,7 @@ impl OptionChainSubjectBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NatsSubject`](crate::error::Error::NatsSubject) if any
+    /// Returns [`Error::NatsSubject`] if any
     /// of `underlying`, `expiry`, or `strike` is empty or carries a reserved
     /// NATS subject character (`.`, `*`, `>`), or if `option_type` is not a
     /// recognized `C`/`Call`/`P`/`Put` value.
@@ -480,7 +480,7 @@ impl std::fmt::Debug for NatsPublisherHandles {
 /// is still owned mutably — i.e. *before* it is wrapped in `Arc`. This function
 /// constructs both publishers, converts them into their `orderbook_rs`-native
 /// listener callbacks, and threads those callbacks into the contract order book
-/// at construction time via [`OptionOrderBook::new_with_config`]. The trade
+/// at construction time via the crate-internal `OptionOrderBook::new_with_config`. The trade
 /// publisher listener is multiplexed with the internal trade-capture listener.
 ///
 /// The dependency direction is `nats` → `book`: this eventing-layer function
@@ -505,9 +505,9 @@ impl std::fmt::Debug for NatsPublisherHandles {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidSymbol`](crate::error::Error::InvalidSymbol) if the
+/// Returns [`Error::InvalidSymbol`] if the
 /// symbol cannot be parsed into its `{underlying}-{expiry}-{strike}-{type}`
-/// components, or [`Error::NatsSubject`](crate::error::Error::NatsSubject) if a
+/// components, or [`Error::NatsSubject`] if a
 /// (grammar-valid) component carries a reserved NATS subject character.
 #[must_use = "the returned order book and publisher handles must be retained; \
               dropping them tears the publishers down"]

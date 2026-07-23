@@ -45,7 +45,7 @@
 //! propagates down the hierarchy, and each leaf derives its own
 //! `UUIDv5(root, symbol)` at construction (so a strike's call and put get
 //! distinct namespaces from their distinct symbols). Set the root — and an
-//! injected [`Clock`](orderbook_rs::Clock) via
+//! injected [`Clock`] via
 //! [`set_clock`](SequencedUnderlyingOrderBook::set_clock) — BEFORE the first
 //! [`submit`](SequencedUnderlyingOrderBook::submit).
 //!
