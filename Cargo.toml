@@ -69,12 +69,14 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [workspace.dependencies]
-optionstratlib = { version = "0.18", default-features = false }
-orderbook-rs = { version = "0.12", features = ["special_orders"] }
+optionstratlib = { version = "0.21", default-features = false }
+orderbook-rs = { version = "0.12.1", features = ["special_orders"] }
 uuid = { version = "1.24", features = ["v5"] }
-# Pinned to 0.49 to share `jetstream::Context` with orderbook-rs 0.12 (which depends on
-# async-nats 0.49); bumping to 0.50 here duplicates the crate and breaks the publisher types.
-async-nats = "0.49"
+# Must track the `async-nats` line orderbook-rs uses, so both crates share one
+# `jetstream::Context`: orderbook-rs 0.12.1 moved to async-nats 0.50 (0.12.0 was on
+# 0.49), hence the 0.12.1 floor above. A mismatch duplicates the crate and breaks the
+# publisher types.
+async-nats = "0.50"
 bytes = "1.12"
 tokio = { version = "1.53", features = ["rt", "sync"] }
 tracing = "0.1"
