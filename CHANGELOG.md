@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required" for this change because it only inspects this crate's own
   rustdoc; the break lives in the identity of the upstream types, which is why
   it is stated here rather than detected there.
+- **`async-nats` public dependency `0.49` → `0.50`, and the `orderbook-rs`
+  floor raised to `0.12.1`.** `OptionChainNatsConfig::jetstream()` returns
+  `&async_nats::jetstream::Context`, and that `Context` must be the same type
+  `orderbook-rs`'s publishers accept. `orderbook-rs 0.12.1` moved to
+  `async-nats 0.50` in a patch release, so a fresh resolution (this repo does
+  not track `Cargo.lock`, and CI resolves from scratch) paired
+  `orderbook-rs 0.12.1` with this crate's `async-nats 0.49` pin and failed to
+  compile the `nats` feature with two copies of `jetstream::Context`. The
+  0.12.1 floor keeps the two lines paired. `async-nats 0.50` only adds an
+  optional `chrono` backend; the `connect`, `jetstream::new` and
+  `jetstream::Context` surface this crate uses is unchanged. Breaking for
+  downstream crates that co-pin `async-nats 0.49`, and covered by the same
+  `0.11.0` bump.
 
 ### Changed
 
@@ -45,11 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0.3.0` and no journaled type carries a bare `Positive`; and the `0.19`
   vanna-at-expiry change is unreachable behind the engine's `tte > 0` guard.
   The frozen `v0.5.0` / `v0.8.0` / `v0.9.0` journal fixtures decode unchanged.
-- Resolver side effects of the bump: `rand 0.8` leaves the graph (`rand 0.9`
-  via `proptest` / `pricelevel` and `rand 0.10` via `optionstratlib` remain,
-  neither on this crate's public surface), and `uuid` resolves to `1.26`
-  within the existing `1.24` requirement. `orderbook-rs 0.12`, `pricelevel
-  0.9` and `async-nats 0.49` are unchanged.
+- Resolver side effects of the bump (default features): `rand 0.8` leaves the
+  graph (`rand 0.9` via `proptest` / `pricelevel` and `rand 0.10` via
+  `optionstratlib` remain, neither on this crate's public surface), and
+  `uuid` resolves to `1.26` within the existing `1.24` requirement.
+  `pricelevel 0.9` is unchanged.
 
 ## [0.10.0] - 2026-07-23
 
