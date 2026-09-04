@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`optionstratlib` public dependency `0.18` → `0.21` (breaking for
   co-pinners).** `optionstratlib` is a *public* dependency: `ExpirationDate`,
-  `Positive`, `Greek`, `OptionStyle`, `ExpirationDateError` and `DecimalError`
-  appear in this crate's public signatures and in the `Error` enum. Moving to
+  `Positive`, `Greek` and `OptionStyle` appear in this crate's public
+  signatures, and `ExpirationDateError` and `DecimalError` are carried by the
+  `Error::ExpirationDateError` and `Error::OptionStratLibDecimal` variants.
+  Moving to
   `0.21` pulls `expiration_date` `0.2` → `0.3` and `positive` `0.5` → `0.6`
   with it, so `ExpirationDate`, `Positive`, `Greek`, `ExpirationDateError` and
   `DecimalError` are new types from the point of view of a downstream crate
