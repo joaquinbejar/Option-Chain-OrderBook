@@ -116,10 +116,11 @@ check-cargo-readme:
 
 .PHONY: check-spanish
 check-spanish:
-	@rg -n --pcre2 -e '^\s*(//|///|//!|#|/\*|\*).*?[áéíóúÁÉÍÓÚñÑ¿¡]' \
+	@if rg -n --pcre2 -e '^\s*(//|///|//!|#|/\*|\*).*?[áéíóúÁÉÍÓÚñÑ¿¡]' \
     	    --glob '!target/*' \
     	    --glob '!**/*.png' \
-    	    . || (echo "❌  Spanish comments found"; exit 1)
+    	    . ; then echo "❌  Spanish comments found"; exit 1; \
+    	else echo "✅  No Spanish comments"; fi
 
 .PHONY: zip
 zip:
