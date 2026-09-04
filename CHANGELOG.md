@@ -11,6 +11,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [Unreleased]
+
+### ⚠️ Breaking Changes
+
+- **`optionstratlib` public dependency `0.18` → `0.21` (breaking for
+  co-pinners).** `optionstratlib` is a *public* dependency: `ExpirationDate`,
+  `Positive`, `Greek`, `OptionStyle`, `ExpirationDateError` and `DecimalError`
+  appear in this crate's public signatures and in the `Error` enum. Moving to
+  `0.21` pulls `expiration_date` `0.2` → `0.3` and `positive` `0.5` → `0.6`
+  with it, so `ExpirationDate`, `Positive`, `Greek`, `ExpirationDateError` and
+  `DecimalError` are new types from the point of view of a downstream crate
+  still pinned to `optionstratlib 0.18`: the two copies will not unify, and
+  downstream must move its own pin to `0.21` in the same update (same
+  precedent as the `0.6.0` and `0.9.0` `orderbook-rs` bumps). `OptionStyle`
+  and `Side` are the one exception: both `optionstratlib` lines re-export them
+  from `financial_types 0.2`, so `OptionOrderBook::new(symbol, OptionStyle)`
+  keeps unifying across the bump. The next release must therefore be a minor,
+  `0.11.0`, not a patch. `cargo semver-checks` reports "no semver update
+  required" for this change because it only inspects this crate's own
+  rustdoc; the break lives in the identity of the upstream types, which is why
+  it is stated here rather than detected there.
+
+### Changed
+
+- No source changes were required by the bump. Every `optionstratlib` symbol
+  this crate uses exists unchanged in `0.21.1`, and the behaviour this crate
+  observes is identical: the `0.19` change that signs every Greek by `Side`
+  does not reach `GreeksEngine`, which prices `Side::Long` at quantity one;
+  the `positive 0.6` serde change (a `Positive` now serialises as a decimal
+  string) does not touch the journal wire format, because `ExpirationDate`'s
+  own serialiser is byte-identical between `expiration_date 0.2.1` and
+  `0.3.0` and no journaled type carries a bare `Positive`; and the `0.19`
+  vanna-at-expiry change is unreachable behind the engine's `tte > 0` guard.
+  The frozen `v0.5.0` / `v0.8.0` / `v0.9.0` journal fixtures decode unchanged.
+- Resolver side effects of the bump: `rand 0.8` leaves the graph (`rand 0.9`
+  via `proptest` / `pricelevel` and `rand 0.10` via `optionstratlib` remain,
+  neither on this crate's public surface), and `uuid` resolves to `1.26`
+  within the existing `1.24` requirement. `orderbook-rs 0.12`, `pricelevel
+  0.9` and `async-nats 0.49` are unchanged.
+
 ## [0.10.0] - 2026-07-23
 
 ### Changed
