@@ -2398,13 +2398,13 @@ impl OptionOrderBook {
     /// Returns the number of bid price levels.
     #[must_use]
     pub fn bid_level_count(&self) -> usize {
-        self.book.get_bids().len()
+        self.book.levels_with_cumulative_depth(Side::Buy).count()
     }
 
     /// Returns the number of ask price levels.
     #[must_use]
     pub fn ask_level_count(&self) -> usize {
-        self.book.get_asks().len()
+        self.book.levels_with_cumulative_depth(Side::Sell).count()
     }
 
     /// Returns the total number of orders in the book.

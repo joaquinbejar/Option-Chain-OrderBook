@@ -70,19 +70,18 @@ crate-type = ["rlib"]
 
 [workspace.dependencies]
 optionstratlib = { version = "0.21", default-features = false }
-orderbook-rs = { version = "0.12.1", features = ["special_orders"] }
-uuid = { version = "1.24", features = ["v5"] }
+orderbook-rs = { version = "0.13", features = ["special_orders"] }
+uuid = { version = "1.26", features = ["v5"] }
 # Must track the `async-nats` line orderbook-rs uses, so both crates share one
-# `jetstream::Context`: orderbook-rs 0.12.1 moved to async-nats 0.50 (0.12.0 was on
-# 0.49), hence the 0.12.1 floor above. A mismatch duplicates the crate and breaks the
-# publisher types.
+# `jetstream::Context`: orderbook-rs 0.13 (like 0.12.1) is on async-nats 0.50 (0.12.0
+# was on 0.49). A mismatch duplicates the crate and breaks the publisher types.
 async-nats = "0.50"
 bytes = "1.12"
 tokio = { version = "1.53", features = ["rt", "sync"] }
 tracing = "0.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-rust_decimal = { version = "1.42", features = ["serde-with-float", "maths"] }
+rust_decimal = { version = "1.43", features = ["serde-with-float", "maths"] }
 rust_decimal_macros = "1.40"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
