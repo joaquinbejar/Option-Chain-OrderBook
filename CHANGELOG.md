@@ -11,6 +11,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `0.4.4`. A full upgrade walkthrough lives in
 > [`MIGRATING-0.5.0.md`](./MIGRATING-0.5.0.md).
 
+## [Unreleased]
+
+## [0.12.0] - 2026-09-18
+
+### ⚠️ Breaking Changes
+
+- **`orderbook-rs` public dependency `0.12.1` → `0.13` (breaking for
+  co-pinners).** `orderbook-rs` is a *public* dependency: `CancelReason`,
+  `Clock`, `FeeSchedule`, `MassCancelResult`, `MonotonicClock`, `OrderId`,
+  `OrderStateTracker`, `OrderStatus`, `OrderType`, `STPMode`, `Side`,
+  `StubClock`, `TimeInForce` and `TradeResult` are re-exported at this crate's
+  root, `OptionOrderBook::snapshot` returns `orderbook_rs::OrderBookSnapshot`,
+  and `Error::OrderBookEngine` wraps `orderbook_rs::prelude::OrderBookError`.
+  From the point of view of a downstream crate still pinned to
+  `orderbook-rs 0.12` these are new types: the two copies will not unify, and
+  downstream must move its own pin to `0.13` in the same update (same
+  precedent as the `0.6.0`, `0.9.0` and `0.11.0` public-dependency bumps).
+  `cargo semver-checks` reports "no semver update required" for this change
+  because it only inspects this crate's own rustdoc; the break lives in the
+  identity of the upstream types, which is why it is stated here rather than
+  detected there.
+- Migration notes for direct `orderbook-rs` users: `0.13.0` removed
+  `OrderBook::get_bids` / `OrderBook::get_asks` (they handed out live
+  `PriceLevel` handles that could bypass the submit gate). This crate's own
+  API is unchanged; its two read-only callers (`OptionOrderBook::bid_level_count`
+  / `ask_level_count`) now count `levels_with_cumulative_depth(side)`, which
+  walks every level of the side unfiltered, so the counts are identical.
+
+### Changed
+
+- Dependencies updated to latest stable versions (#163): `orderbook-rs 0.13`
+  (resolves to `0.13.1`), `uuid 1.26`, `rust_decimal 1.43`. `optionstratlib 0.21`
+  (`0.21.1`), `pricelevel 0.9` (`0.9.2`) and `async-nats 0.50` are unchanged
+  requirements; `orderbook-rs 0.13` stays on `async-nats 0.50`, so the single
+  `jetstream::Context` pairing documented in `0.11.0` still holds.
+
 ## [0.11.0] - 2026-09-04
 
 A full upgrade walkthrough lives in [`MIGRATING-0.11.0.md`](./MIGRATING-0.11.0.md).
