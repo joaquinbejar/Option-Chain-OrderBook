@@ -70,7 +70,7 @@ impl OptionChainOrderBook {
             strikes: Arc::new(StrikeOrderBookManager::new(&underlying, expiration)),
             underlying,
             expiration,
-            id: OrderId::new(),
+            id: OrderId::from_uuid(Uuid::new_v4()),
             registry: None,
             symbol_index: None,
         }
@@ -102,7 +102,7 @@ impl OptionChainOrderBook {
             )),
             underlying,
             expiration,
-            id: OrderId::new(),
+            id: OrderId::from_uuid(Uuid::new_v4()),
             registry: Some(registry),
             symbol_index: None,
         }
@@ -134,7 +134,7 @@ impl OptionChainOrderBook {
             )),
             underlying,
             expiration,
-            id: OrderId::new(),
+            id: OrderId::from_uuid(Uuid::new_v4()),
             registry: Some(registry),
             symbol_index: Some(symbol_index),
         }
@@ -302,6 +302,7 @@ impl OptionChainOrderBook {
     }
 
     /// Returns the current root trade-ID namespace, or `None` when future books
+    /// use option_chain_orderbook::Uuid;
     /// use the upstream default random namespace.
     #[must_use]
     #[inline]
@@ -1366,15 +1367,18 @@ mod tests {
 
         {
             let strike = chain.get_or_create_strike(50000);
-            if let Err(err) = strike
-                .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            {
+            if let Err(err) = strike.call().add_limit_order(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            ) {
                 panic!("add order failed: {}", err);
             }
-            if let Err(err) = strike
-                .put()
-                .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
+            if let Err(err) =
+                strike
+                    .put()
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 50, 5)
             {
                 panic!("add order failed: {}", err);
             }
@@ -1389,27 +1393,33 @@ mod tests {
 
         {
             let strike = chain.get_or_create_strike(50000);
-            if let Err(err) = strike
-                .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            if let Err(err) = strike.call().add_limit_order(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            ) {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) = strike.call().add_limit_order(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Sell,
+                101,
+                5,
+            ) {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) =
+                strike
+                    .put()
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
             {
                 panic!("add order failed: {}", err);
             }
-            if let Err(err) = strike
-                .call()
-                .add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-            {
-                panic!("add order failed: {}", err);
-            }
-            if let Err(err) = strike
-                .put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
-            {
-                panic!("add order failed: {}", err);
-            }
-            if let Err(err) = strike
-                .put()
-                .add_limit_order(OrderId::new(), Side::Sell, 51, 5)
+            if let Err(err) =
+                strike
+                    .put()
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 51, 5)
             {
                 panic!("add order failed: {}", err);
             }
@@ -1647,9 +1657,10 @@ mod tests {
 
         let chain = manager.get_or_create(test_expiration());
         let strike = chain.get_or_create_strike(50000);
-        if let Err(err) = strike
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
         {
             panic!("add order failed: {}", err);
         }
@@ -1672,13 +1683,13 @@ mod tests {
         assert!(
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 10)
                 .is_ok()
         );
         assert!(
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 10)
                 .is_err()
         );
     }
@@ -1701,13 +1712,13 @@ mod tests {
         assert!(
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 10)
                 .is_ok()
         );
         assert!(
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 10)
                 .is_err()
         );
     }
@@ -1717,19 +1728,25 @@ mod tests {
         let chain = OptionChainOrderBook::new("BTC", test_expiration());
 
         let s1 = chain.get_or_create_strike(50000);
-        if let Err(err) = s1
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        if let Err(err) =
+            s1.call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
         {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = s1.put().add_limit_order(OrderId::new(), Side::Sell, 60, 5) {
+        if let Err(err) =
+            s1.put()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 60, 5)
+        {
             panic!("add order failed: {}", err);
         }
         drop(s1);
 
         let s2 = chain.get_or_create_strike(52000);
-        if let Err(err) = s2.call().add_limit_order(OrderId::new(), Side::Buy, 80, 10) {
+        if let Err(err) =
+            s2.call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 80, 10)
+        {
             panic!("add order failed: {}", err);
         }
         drop(s2);
@@ -1754,22 +1771,25 @@ mod tests {
         let chain = OptionChainOrderBook::new("BTC", test_expiration());
 
         let s1 = chain.get_or_create_strike(50000);
-        if let Err(err) = s1
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        if let Err(err) =
+            s1.call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
         {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = s1
-            .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        if let Err(err) =
+            s1.call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 5)
         {
             panic!("add order failed: {}", err);
         }
         drop(s1);
 
         let s2 = chain.get_or_create_strike(52000);
-        if let Err(err) = s2.put().add_limit_order(OrderId::new(), Side::Buy, 50, 10) {
+        if let Err(err) =
+            s2.put()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
+        {
             panic!("add order failed: {}", err);
         }
         drop(s2);
@@ -1792,25 +1812,34 @@ mod tests {
         let user_b = Hash32::from([2u8; 32]);
 
         let s1 = chain.get_or_create_strike(50000);
-        if let Err(err) =
-            s1.call()
-                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
-        {
+        if let Err(err) = s1.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
         drop(s1);
 
         let s2 = chain.get_or_create_strike(52000);
-        if let Err(err) =
-            s2.put()
-                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_a)
-        {
+        if let Err(err) = s2.put().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            60,
+            5,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) =
-            s2.call()
-                .add_limit_order_with_user(OrderId::new(), Side::Buy, 80, 10, user_b)
-        {
+        if let Err(err) = s2.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            80,
+            10,
+            user_b,
+        ) {
             panic!("add order failed: {}", err);
         }
         drop(s2);
@@ -1841,7 +1870,7 @@ mod tests {
         assert!(
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 10)
                 .is_ok()
         );
 
@@ -1851,7 +1880,7 @@ mod tests {
         assert!(
             strike2
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 10)
                 .is_err()
         );
     }
@@ -1861,7 +1890,7 @@ mod tests {
     #[test]
     fn test_chain_find_order_across_strikes() {
         let chain = OptionChainOrderBook::new("BTC", test_expiration());
-        let order_id = OrderId::new();
+        let order_id = OrderId::from_uuid(Uuid::new_v4());
 
         let s1 = chain.get_or_create_strike(50000);
         s1.call()
@@ -1876,7 +1905,7 @@ mod tests {
     #[test]
     fn test_chain_find_order_not_found() {
         let chain = OptionChainOrderBook::new("BTC", test_expiration());
-        let result = chain.find_order(OrderId::new());
+        let result = chain.find_order(OrderId::from_uuid(Uuid::new_v4()));
         assert!(result.is_none());
     }
 
@@ -1886,13 +1915,13 @@ mod tests {
 
         let s1 = chain.get_or_create_strike(50000);
         s1.call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add s1");
         drop(s1);
 
         let s2 = chain.get_or_create_strike(52000);
         s2.put()
-            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 80, 5)
             .expect("add s2");
         drop(s2);
 
@@ -1907,16 +1936,28 @@ mod tests {
 
         let s1 = chain.get_or_create_strike(50000);
         s1.call()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+                user_a,
+            )
             .expect("add a1");
         drop(s1);
 
         let s2 = chain.get_or_create_strike(52000);
         s2.put()
-            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Sell,
+                80,
+                5,
+                user_a,
+            )
             .expect("add a2");
         s2.call()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 90, 5, user_b)
+            .add_limit_order_with_user(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 90, 5, user_b)
             .expect("add b1");
         drop(s2);
 
@@ -1933,10 +1974,10 @@ mod tests {
 
         let s1 = chain.get_or_create_strike(50000);
         s1.call()
-            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add maker");
         s1.call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add taker");
         drop(s1);
 
@@ -1954,10 +1995,10 @@ mod tests {
 
         let s1 = chain.get_or_create_strike(50000);
         s1.call()
-            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add maker");
         s1.call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add taker");
         drop(s1);
 
@@ -1975,13 +2016,13 @@ mod tests {
         let chain = OptionChainOrderBook::new("BTC", test_expiration());
 
         // Create strikes out of order to prove the sweep walks them ascending.
-        let id_high = OrderId::new();
+        let id_high = OrderId::from_uuid(Uuid::new_v4());
         chain
             .get_or_create_strike(51000)
             .call()
             .add_limit_order_with_tif(id_high, Side::Buy, 100, 1, TimeInForce::Gtd(GTD_EXPIRED))
             .expect("add high strike gtd");
-        let id_low = OrderId::new();
+        let id_low = OrderId::from_uuid(Uuid::new_v4());
         chain
             .get_or_create_strike(50000)
             .put()
@@ -1991,7 +2032,7 @@ mod tests {
         chain
             .get_or_create_strike(50000)
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 130, 2)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 130, 2)
             .expect("add gtc survivor");
 
         let result = chain.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));

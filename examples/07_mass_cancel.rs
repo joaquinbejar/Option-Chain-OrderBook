@@ -11,6 +11,7 @@ use optionstratlib::prelude::pos_or_panic;
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -97,21 +98,36 @@ fn main() {
         let strike = exp.get_or_create_strike(3000);
 
         // Add orders for user A
-        let _ = strike
-            .call()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a);
-        let _ =
-            strike
-                .call()
-                .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 10, user_a);
+        let _ = strike.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_a,
+        );
+        let _ = strike.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            110,
+            10,
+            user_a,
+        );
 
         // Add orders for user B
-        let _ = strike
-            .put()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 50, 10, user_b);
-        let _ = strike
-            .put()
-            .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 10, user_b);
+        let _ = strike.put().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            50,
+            10,
+            user_b,
+        );
+        let _ = strike.put().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            60,
+            10,
+            user_b,
+        );
 
         drop(strike);
 
@@ -192,20 +208,32 @@ fn setup_orders(manager: &UnderlyingOrderBookManager) {
                 let strike = exp_book.get_or_create_strike(strike_price);
 
                 // Add call orders
-                let _ = strike
-                    .call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10);
-                let _ = strike
-                    .call()
-                    .add_limit_order(OrderId::new(), Side::Sell, 110, 10);
+                let _ = strike.call().add_limit_order(
+                    OrderId::from_uuid(Uuid::new_v4()),
+                    Side::Buy,
+                    100,
+                    10,
+                );
+                let _ = strike.call().add_limit_order(
+                    OrderId::from_uuid(Uuid::new_v4()),
+                    Side::Sell,
+                    110,
+                    10,
+                );
 
                 // Add put orders
-                let _ = strike
-                    .put()
-                    .add_limit_order(OrderId::new(), Side::Buy, 50, 10);
-                let _ = strike
-                    .put()
-                    .add_limit_order(OrderId::new(), Side::Sell, 60, 10);
+                let _ = strike.put().add_limit_order(
+                    OrderId::from_uuid(Uuid::new_v4()),
+                    Side::Buy,
+                    50,
+                    10,
+                );
+                let _ = strike.put().add_limit_order(
+                    OrderId::from_uuid(Uuid::new_v4()),
+                    Side::Sell,
+                    60,
+                    10,
+                );
             }
         }
     }
@@ -218,12 +246,18 @@ fn setup_orders(manager: &UnderlyingOrderBookManager) {
         for strike_price in [2800, 3000, 3200] {
             let strike = exp_book.get_or_create_strike(strike_price);
 
-            let _ = strike
-                .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10);
-            let _ = strike
-                .call()
-                .add_limit_order(OrderId::new(), Side::Sell, 110, 10);
+            let _ = strike.call().add_limit_order(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            );
+            let _ = strike.call().add_limit_order(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Sell,
+                110,
+                10,
+            );
         }
     }
 }

@@ -10,6 +10,7 @@ use optionstratlib::ExpirationDate;
 use optionstratlib::prelude::{Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -36,16 +37,16 @@ fn main() {
         for strike in [48000, 49000, 50000, 51000, 52000] {
             let s = exp_book.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 500, 10)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 520, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 520, 8)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 300, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 300, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 320, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 320, 8)
                 .unwrap();
         }
         info!("Week {}: 5 strikes, 20 orders", week);
@@ -60,16 +61,16 @@ fn main() {
         for strike in (40000..=60000).step_by(2500) {
             let s = exp_book.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 600, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 600, 15)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 650, 12)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 650, 12)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 400, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 400, 15)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 450, 12)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 450, 12)
                 .unwrap();
         }
         info!("Month {}: 9 strikes, 36 orders", month);
@@ -145,10 +146,10 @@ fn main() {
             let strike = 50000 + i * 1000;
             let s = exp_book.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                 .unwrap();
         }
         info!("Created {}: 1 expiration, 5 strikes, 10 orders", symbol);
@@ -167,10 +168,10 @@ fn main() {
                 let strike = 100 + i * 10;
                 let s = exp_book.get_or_create_strike(strike);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 5, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 5, 10)
                     .unwrap();
                 s.put()
-                    .add_limit_order(OrderId::new(), Side::Buy, 3, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 3, 10)
                     .unwrap();
             }
         }

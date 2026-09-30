@@ -4,6 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use option_chain_orderbook::orderbook::{UnderlyingOrderBook, UnderlyingOrderBookManager};
 use optionstratlib::prelude::{ExpirationDate, Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
+use uuid::Uuid;
 
 /// Creates a test expiration date.
 fn test_expiration() -> ExpirationDate {
@@ -70,7 +71,7 @@ pub fn underlying_orderbook_operations(c: &mut Criterion) {
             for strike in (40000..60000).step_by(5000) {
                 let s = exp_book.get_or_create_strike(strike);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
             }
         }
@@ -86,7 +87,7 @@ pub fn underlying_orderbook_operations(c: &mut Criterion) {
             for strike in (40000..60000).step_by(5000) {
                 let s = exp_book.get_or_create_strike(strike);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
             }
         }
@@ -106,11 +107,11 @@ pub fn underlying_orderbook_operations(c: &mut Criterion) {
             for i in 0..250u64 {
                 let s = exp_book.get_or_create_strike(10000 + i * 100);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
                 if i % 2 == 0 {
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Sell, 50, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 50, 10)
                         .unwrap();
                 }
             }
@@ -175,7 +176,7 @@ pub fn underlying_manager_operations(c: &mut Criterion) {
                 for strike in (40000..60000).step_by(10000) {
                     let s = exp_book.get_or_create_strike(strike);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                 }
             }
@@ -194,7 +195,7 @@ pub fn underlying_manager_operations(c: &mut Criterion) {
                 for strike in (40000..60000).step_by(10000) {
                     let s = exp_book.get_or_create_strike(strike);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                 }
             }
@@ -221,7 +222,7 @@ pub fn underlying_manager_operations(c: &mut Criterion) {
                 for strike in [40000u64, 50000, 60000] {
                     let s = exp_book.get_or_create_strike(strike);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                 }
             }

@@ -10,6 +10,7 @@ use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -33,11 +34,11 @@ fn main() {
 
     strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 500, 10)
         .unwrap();
     strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Sell, 520, 8)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 520, 8)
         .unwrap();
     info!("Added call bid: 500 x 10");
     info!("Added call ask: 520 x 8");
@@ -47,11 +48,11 @@ fn main() {
 
     strike
         .put()
-        .add_limit_order(OrderId::new(), Side::Buy, 300, 15)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 300, 15)
         .unwrap();
     strike
         .put()
-        .add_limit_order(OrderId::new(), Side::Sell, 320, 12)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 320, 12)
         .unwrap();
     info!("Added put bid: 300 x 15");
     info!("Added put ask: 320 x 12");
@@ -70,7 +71,7 @@ fn main() {
 
     // === Call Quote ===
     info!("\n--- Call Quote ---");
-    let call_quote = strike.call_quote();
+    let call_quote = strike.call_quote().expect("call quote");
     info!(
         "Call: {} @ {:?} / {} @ {:?}",
         call_quote.bid_size(),
@@ -84,7 +85,7 @@ fn main() {
 
     // === Put Quote ===
     info!("\n--- Put Quote ---");
-    let put_quote = strike.put_quote();
+    let put_quote = strike.put_quote().expect("put quote");
     info!(
         "Put: {} @ {:?} / {} @ {:?}",
         put_quote.bid_size(),
@@ -118,16 +119,16 @@ fn main() {
         let s = manager.get_or_create(strike_price);
         // Add some orders
         s.call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .unwrap();
         s.call()
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 5)
             .unwrap();
         s.put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
             .unwrap();
         s.put()
-            .add_limit_order(OrderId::new(), Side::Sell, 60, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 60, 5)
             .unwrap();
         info!("Created strike {} with orders", strike_price);
     }

@@ -21,6 +21,7 @@ use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -58,21 +59,21 @@ fn main() {
             // Add orders to call
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Sell, 105, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 8)
                 .unwrap();
 
             // Add orders to put
             strike_book
                 .put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 15)
                 .unwrap();
             strike_book
                 .put()
-                .add_limit_order(OrderId::new(), Side::Sell, 55, 12)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 55, 12)
                 .unwrap();
         }
 
@@ -84,11 +85,11 @@ fn main() {
             let strike_book = exp.get_or_create_strike(strike_price);
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 200, 5)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 5)
                 .unwrap();
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Sell, 210, 5)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 210, 5)
                 .unwrap();
         }
     }
@@ -106,11 +107,11 @@ fn main() {
             let strike_book = exp.get_or_create_strike(strike_price);
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 80, 20)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 80, 20)
                 .unwrap();
             strike_book
                 .call()
-                .add_limit_order(OrderId::new(), Side::Sell, 85, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 85, 15)
                 .unwrap();
         }
     }
@@ -134,7 +135,7 @@ fn main() {
         && let Ok(exp) = btc.get_expiration(&exp_mar)
         && let Ok(strike) = exp.get_strike(50000)
     {
-        let call_quote = strike.call_quote();
+        let call_quote = strike.call_quote().expect("call quote");
         info!(
             "Call quote: {} @ {:?} / {} @ {:?}",
             call_quote.bid_size(),
@@ -143,7 +144,7 @@ fn main() {
             call_quote.ask_price()
         );
 
-        let put_quote = strike.put_quote();
+        let put_quote = strike.put_quote().expect("put quote");
         info!(
             "Put quote: {} @ {:?} / {} @ {:?}",
             put_quote.bid_size(),

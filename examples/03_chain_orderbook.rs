@@ -10,6 +10,7 @@ use optionstratlib::ExpirationDate;
 use optionstratlib::prelude::{Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -38,7 +39,7 @@ fn main() {
         strike
             .call()
             .add_limit_order(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 (100 + strike_price / 1000) as u128,
                 10,
@@ -47,7 +48,7 @@ fn main() {
         strike
             .call()
             .add_limit_order(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Sell,
                 (120 + strike_price / 1000) as u128,
                 8,
@@ -58,7 +59,7 @@ fn main() {
         strike
             .put()
             .add_limit_order(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 (50 + strike_price / 2000) as u128,
                 12,
@@ -67,7 +68,7 @@ fn main() {
         strike
             .put()
             .add_limit_order(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Sell,
                 (70 + strike_price / 2000) as u128,
                 6,
@@ -102,8 +103,8 @@ fn main() {
     match chain.get_strike(50000) {
         Ok(strike) => {
             info!("Strike 50000:");
-            let call_quote = strike.call_quote();
-            let put_quote = strike.put_quote();
+            let call_quote = strike.call_quote().expect("call quote");
+            let put_quote = strike.put_quote().expect("put quote");
             info!(
                 "  Call: {} @ {:?} / {} @ {:?}",
                 call_quote.bid_size(),
@@ -155,10 +156,10 @@ fn main() {
         for strike in [3000, 3200, 3400, 3600, 3800] {
             let s = chain.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                 .unwrap();
         }
         info!("Created chain for {:?} with 5 strikes", exp);

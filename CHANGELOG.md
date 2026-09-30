@@ -13,6 +13,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-30
+
+### ⚠️ Breaking Changes
+
+- **`orderbook-rs` public dependency `0.13` → `0.15` and `pricelevel` `0.9` →
+  `0.10` (breaking for co-pinners).** Both are *public* dependencies: `OrderId`,
+  `Side`, `TimeInForce`, `TradeResult`, `OrderStatus` and the other re-exported
+  engine types, `OptionOrderBook::snapshot` (`orderbook_rs::OrderBookSnapshot`)
+  and `Error::OrderBookEngine` (`orderbook_rs::prelude::OrderBookError`) come
+  from them. A downstream crate still pinned to `orderbook-rs 0.13` or
+  `pricelevel 0.9` must move its pins in the same update. `orderbook-rs 0.15`
+  stays on `async-nats 0.50`, so the single `jetstream::Context` pairing still
+  holds.
+- **`OrderId::new()` is gone** (removed upstream in `pricelevel 0.10`, which no
+  longer draws panicking randomness). Build a random id with
+  `OrderId::from_uuid(Uuid::new_v4())`; `Uuid` is re-exported at this crate's
+  root and the `uuid` dependency now enables `v4`. `OrderId::sequential(n)`
+  is unchanged.
+- **Leaf read APIs return `Result`**, following the `orderbook-rs 0.14`
+  panic-policy release, which made the underlying book analytics fallible
+  instead of clamping on overflow: `OptionOrderBook::best_quote`,
+  `snapshot`, `total_bid_depth`, `total_ask_depth`, `imbalance`,
+  `bid_depth_at_price`, `ask_depth_at_price`, `vwap`, `micro_price` and
+  `market_impact`, plus `StrikeOrderBook::call_quote` / `put_quote`, now return
+  `Result<_, Error>` (engine errors as `Error::OrderBookEngine`). Callers add
+  `?` or handle the error.
+- **`OptionOrderBook::evict_expired_orders` returns `Result<Vec<OrderId>>`.**
+  The engine refuses a sweep whose level read fails, with nothing evicted; the
+  per-order failures it now reports are logged at `WARN` (an order that could
+  not be cancelled keeps resting and is retried by a later sweep). The strike
+  and higher sweeps keep their result types: a leaf whose sweep was refused is
+  logged and reported with no evicted ids, and the other books are still swept.
+- **`NatsPublisherHandles::shutdown` returns `Result<()>`** (feature `nats`):
+  both publishers are always shut down, and a publisher task that panicked,
+  was cancelled or timed out is reported as `Error::OrderBookError`.
+- **Engine behaviour changes inherited from `orderbook-rs 0.14` / `0.15`.**
+  Trailing stops (`special_orders`) are pending off-book stops that elect on
+  the last trade price; journaled `TradeResult`s gain `origin_stop_id` and
+  their `MatchResult` gains `error` (both emitted as `null` when unset; older
+  JSON journals still decode); snapshot packages move to format 6. See the
+  `orderbook-rs` changelog for the full list.
+
+### Changed
+
+- Dependencies updated to latest stable versions: `orderbook-rs 0.15`
+  (`0.15.0`), `pricelevel 0.10` (`0.10.2`), `uuid 1.26` now with `v4`. Every
+  other requirement was already on its latest stable release (`dashmap 7` is
+  still a release candidate, so `6.2` is kept).
+
 ## [0.12.0] - 2026-09-18
 
 ### ⚠️ Breaking Changes

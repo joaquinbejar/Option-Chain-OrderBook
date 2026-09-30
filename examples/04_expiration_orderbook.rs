@@ -10,6 +10,7 @@ use optionstratlib::ExpirationDate;
 use optionstratlib::prelude::{Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -38,19 +39,19 @@ fn main() {
         // Simulate market maker quoting
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 450, 20)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 450, 20)
             .unwrap();
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 480, 15)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 480, 15)
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 200, 25)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 25)
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 230, 18)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 230, 18)
             .unwrap();
 
         info!("Strike {}: 4 orders (2 call, 2 put)", strike_price);
@@ -76,8 +77,8 @@ fn main() {
 
             // Get the ATM strike details
             if let Ok(strike) = exp_book.get_strike(atm) {
-                let call_quote = strike.call_quote();
-                let put_quote = strike.put_quote();
+                let call_quote = strike.call_quote().expect("call quote");
+                let put_quote = strike.put_quote().expect("put quote");
                 info!("\nATM Call Quote:");
                 info!(
                     "  Bid: {} @ {:?}",
@@ -147,16 +148,16 @@ fn main() {
         for strike in [4400, 4450, 4500, 4550, 4600] {
             let s = exp_book.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 110, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 8)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 80, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 80, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 90, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 90, 8)
                 .unwrap();
         }
         info!("{} ({} days): 5 strikes, 20 orders", name, days);

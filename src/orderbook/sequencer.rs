@@ -912,6 +912,7 @@ impl Default for OptionChainSequencer {
 /// # Example — listing instruments via registry
 ///
 /// ```rust,ignore
+/// use option_chain_orderbook::Uuid;
 /// use std::sync::Arc;
 /// use option_chain_orderbook::orderbook::{
 ///     InstrumentRegistry, SequencedUnderlyingOrderBook, SymbolIndex,
@@ -932,7 +933,7 @@ impl Default for OptionChainSequencer {
 /// // 3. Submit an order — the hierarchy auto-registers the instrument
 /// let _receipt = book.submit_add_order(
 ///     "BTC-20240329-50000-C",
-///     OrderId::new(),
+///     OrderId::from_uuid(Uuid::new_v4()),
 ///     Side::Buy,
 ///     100,
 ///     10,
@@ -2465,7 +2466,7 @@ mod tests {
     #[test]
     fn test_option_chain_result_is_error() {
         let success = OptionChainResult::OrderAdded {
-            order_id: OrderId::new(),
+            order_id: OrderId::from_uuid(Uuid::new_v4()),
             trade: None,
         };
         let rejected = OptionChainResult::Rejected {
@@ -2515,7 +2516,7 @@ mod tests {
             timestamp_ns: 1000,
             command: OptionChainCommand::CancelOrder {
                 symbol: "BTC-20240329-50000-C".to_string(),
-                order_id: OrderId::new(),
+                order_id: OrderId::from_uuid(Uuid::new_v4()),
             },
             result: OptionChainResult::Rejected {
                 reason: "test".to_string(),
@@ -2541,7 +2542,7 @@ mod tests {
                 timestamp_ns: i * 1000,
                 command: OptionChainCommand::CancelOrder {
                     symbol: "BTC-20240329-50000-C".to_string(),
-                    order_id: OrderId::new(),
+                    order_id: OrderId::from_uuid(Uuid::new_v4()),
                 },
                 result: OptionChainResult::Rejected {
                     reason: "test".to_string(),
@@ -2576,7 +2577,7 @@ mod tests {
                 timestamp_ns: i * 1000,
                 command: OptionChainCommand::CancelOrder {
                     symbol: "BTC-20240329-50000-C".to_string(),
-                    order_id: OrderId::new(),
+                    order_id: OrderId::from_uuid(Uuid::new_v4()),
                 },
                 result: OptionChainResult::Rejected {
                     reason: "test".to_string(),
@@ -2598,7 +2599,7 @@ mod tests {
                 timestamp_ns: i * 1000,
                 command: OptionChainCommand::CancelOrder {
                     symbol: "BTC-20240329-50000-C".to_string(),
-                    order_id: OrderId::new(),
+                    order_id: OrderId::from_uuid(Uuid::new_v4()),
                 },
                 result: OptionChainResult::Rejected {
                     reason: "test".to_string(),
@@ -2640,7 +2641,13 @@ mod tests {
         // A valid AddOrder vivifies its expiration+strike (option (b)), so it
         // succeeds even on a fresh book. The event is journaled regardless.
         let receipt = book
-            .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "BTC-20240329-50000-C",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
 
         assert!(receipt.result.is_success());
@@ -2679,7 +2686,7 @@ mod tests {
                 timestamp_ns: i * 1000,
                 command: OptionChainCommand::CancelOrder {
                     symbol: "BTC-20240329-50000-C".to_string(),
-                    order_id: OrderId::new(),
+                    order_id: OrderId::from_uuid(Uuid::new_v4()),
                 },
                 result: OptionChainResult::BookNotFound {
                     symbol: "BTC-20240329-50000-C".to_string(),
@@ -2709,7 +2716,7 @@ mod tests {
             timestamp_ns: 0,
             command: OptionChainCommand::CancelOrder {
                 symbol: "BTC-20240329-50000-C".to_string(),
-                order_id: OrderId::new(),
+                order_id: OrderId::from_uuid(Uuid::new_v4()),
             },
             result: OptionChainResult::BookNotFound {
                 symbol: "BTC-20240329-50000-C".to_string(),
@@ -2768,11 +2775,11 @@ mod tests {
         let live = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
 
         // Order ids are carried by the commands, so they replay identically.
-        let oid_50c_buy = OrderId::new();
-        let oid_50c_sell = OrderId::new();
-        let oid_50p_buy = OrderId::new();
-        let oid_55c_buy = OrderId::new();
-        let oid_60c_sell = OrderId::new();
+        let oid_50c_buy = OrderId::from_uuid(Uuid::new_v4());
+        let oid_50c_sell = OrderId::from_uuid(Uuid::new_v4());
+        let oid_50p_buy = OrderId::from_uuid(Uuid::new_v4());
+        let oid_55c_buy = OrderId::from_uuid(Uuid::new_v4());
+        let oid_60c_sell = OrderId::from_uuid(Uuid::new_v4());
 
         live.submit_add_order(sym_50c, oid_50c_buy, Side::Buy, 100, 10)
             .expect("add 50c buy");
@@ -2880,7 +2887,7 @@ mod tests {
         // state equals live instead of vivifying a fresh Active strike that
         // accepts the order.
         let sym = "BTC-20240329-50000-C";
-        let oid = OrderId::new();
+        let oid = OrderId::from_uuid(Uuid::new_v4());
 
         // ── Live run ──
         let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
@@ -2941,7 +2948,7 @@ mod tests {
         // Replaying a journal that contains a sequence of status transitions
         // reconstructs the final per-contract status deterministically.
         let sym = "BTC-20240329-50000-C";
-        let oid = OrderId::new();
+        let oid = OrderId::from_uuid(Uuid::new_v4());
 
         let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
         let live = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
@@ -3090,7 +3097,7 @@ mod tests {
             timestamp_ns: 1_000_000,
             command: OptionChainCommand::AddOrder {
                 symbol: "BTC-20240329-50000-C".to_string(),
-                order_id: OrderId::new(),
+                order_id: OrderId::from_uuid(Uuid::new_v4()),
                 side: Side::Buy,
                 price: 100,
                 quantity: 10,
@@ -3100,7 +3107,7 @@ mod tests {
                 hidden_quantity: None,
             },
             result: OptionChainResult::OrderAdded {
-                order_id: OrderId::new(),
+                order_id: OrderId::from_uuid(Uuid::new_v4()),
                 trade: None,
             },
         };
@@ -3249,8 +3256,8 @@ mod tests {
         // AddOrder journals only GTC) and are recreated identically on replay.
         let sym_gtc_before = "BTC-20240329-60000-C";
         let sym_gtc_after = "BTC-20240329-65000-P";
-        let oid_before = OrderId::new();
-        let oid_after = OrderId::new();
+        let oid_before = OrderId::from_uuid(Uuid::new_v4());
+        let oid_after = OrderId::from_uuid(Uuid::new_v4());
 
         // ── Live run: seed GTD, then journal add / evict / add ──
         let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
@@ -3580,6 +3587,7 @@ mod tests {
             .add_trade(trade)
             .expect("pinned trade must not overfill the match result");
         TradeResult::new("BTC-20240329-50000-C".to_string(), match_result)
+            .expect("pinned trade result must build")
     }
 
     /// The exact reason string the leaf surfaces when a post-only add would
@@ -3851,12 +3859,14 @@ mod tests {
             OptionChainResult::OrderReplaced { trade: Some(_), .. }
         ));
 
-        // Strict re-encode: the current schema is fully materialized in the
-        // fixture, so no additive-field patching is needed.
+        // Re-encode: the option-chain schema is fully materialized in the
+        // fixture; only the orderbook-rs 0.14 additive `TradeResult` fields,
+        // which the frozen file predates, are patched in.
         let reencoded: serde_json::Value =
             serde_json::to_value(&decoded).expect("re-encode decoded events");
-        let on_disk: serde_json::Value =
+        let mut on_disk: serde_json::Value =
             serde_json::from_str(FIXTURE).expect("parse fixture as value");
+        patch_orderbook_rs_0_14_trade_fields(&mut on_disk);
         assert_eq!(
             reencoded, on_disk,
             "re-encoded journal diverged from the checked-in v0.9.0 wire format"
@@ -3884,6 +3894,38 @@ mod tests {
                 serde_json::from_str(&json).expect("deserialize round-trip");
             let json2 = serde_json::to_string(&back).expect("re-serialize");
             assert_eq!(json, json2, "round-trip changed the encoding for {event:?}");
+        }
+    }
+
+    /// Injects the orderbook-rs 0.14 additive `TradeResult` fields into a
+    /// frozen journal fixture that predates them, so it can be compared with
+    /// the current encoding: `origin_stop_id: null` on every `TradeResult`
+    /// and `error: null` on its `MatchResult`. Fields already present are
+    /// left untouched.
+    fn patch_orderbook_rs_0_14_trade_fields(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("match_result") && map.contains_key("quote_notional") {
+                    map.entry("origin_stop_id")
+                        .or_insert(serde_json::Value::Null);
+                    if let Some(serde_json::Value::Object(match_result)) =
+                        map.get_mut("match_result")
+                    {
+                        match_result
+                            .entry("error")
+                            .or_insert(serde_json::Value::Null);
+                    }
+                }
+                for child in map.values_mut() {
+                    patch_orderbook_rs_0_14_trade_fields(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    patch_orderbook_rs_0_14_trade_fields(item);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3967,10 +4009,11 @@ mod tests {
             .as_object_mut()
             .expect("fixture event 9 result must be OrderReplaced");
         replaced.insert("trade".to_string(), serde_json::Value::Null);
+        patch_orderbook_rs_0_14_trade_fields(&mut on_disk);
         assert_eq!(
             reencoded, on_disk,
             "re-encoded journal diverged from the checked-in v0.8.0 wire format \
-             (beyond the known #151/#153 additive fields)"
+             (beyond the known #151/#153 and orderbook-rs 0.14 additive fields)"
         );
     }
 
@@ -4347,12 +4390,14 @@ mod tests {
                         "remaining_quantity": 0,
                         "is_complete": true,
                         "filled_order_ids": [],
-                        "outcome": "filled"
+                        "outcome": "filled",
+                        "error": null
                     },
                     "total_maker_fees": 0,
                     "total_taker_fees": 0,
                     "engine_seq": 0,
-                    "quote_notional": 400
+                    "quote_notional": 400,
+                    "origin_stop_id": null
                 }
             }
         });
@@ -4433,15 +4478,15 @@ mod tests {
         let strike = exp_book.get_or_create_strike(50000);
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("seed call buy");
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 5)
             .expect("seed call sell");
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
             .expect("seed put buy");
         drop(strike);
         drop(exp_book);
@@ -4462,7 +4507,13 @@ mod tests {
         let strike = exp_book.get_or_create_strike(50000);
         strike
             .call()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+                user_a,
+            )
             .expect("seed user order");
         drop(strike);
         drop(exp_book);
@@ -4508,7 +4559,13 @@ mod tests {
 
         // Successful add
         let receipt = book
-            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 90, 5)
+            .submit_add_order(
+                &symbol,
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                90,
+                5,
+            )
             .expect("submit");
         assert!(receipt.result.is_success());
         assert_eq!(book.success_count(), 1);
@@ -4516,7 +4573,13 @@ mod tests {
 
         // Rejected: book not found
         let receipt2 = book
-            .submit_add_order("INVALID", OrderId::new(), Side::Buy, 90, 5)
+            .submit_add_order(
+                "INVALID",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                90,
+                5,
+            )
             .expect("submit");
         assert!(receipt2.result.is_error());
         assert_eq!(book.success_count(), 1);
@@ -4559,7 +4622,13 @@ mod tests {
         let (book, _, symbol) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 95, 5)
+            .submit_add_order(
+                &symbol,
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                95,
+                5,
+            )
             .expect("submit");
         assert!(receipt.result.is_success());
         assert_eq!(receipt.sequence_num, 0);
@@ -4575,7 +4644,13 @@ mod tests {
         assert_eq!(book.expiration_count(), 0);
 
         let receipt = book
-            .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "BTC-20240329-50000-C",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
 
         assert!(receipt.result.is_success(), "got {:?}", receipt.result);
@@ -4591,7 +4666,13 @@ mod tests {
         let book = SequencedUnderlyingOrderBook::new("BTC");
 
         let receipt = book
-            .submit_add_order("NOT-A-VALID-SYMBOL", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "NOT-A-VALID-SYMBOL",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(receipt.result.is_error());
         match &receipt.result {
@@ -4749,7 +4830,13 @@ mod tests {
         let (book, _, symbol) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 110, 5)
+            .submit_add_order(
+                &symbol,
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                110,
+                5,
+            )
             .expect("submit");
         match &receipt.result {
             OptionChainResult::OrderAdded { trade, .. } => {
@@ -4770,7 +4857,13 @@ mod tests {
         let (book, _, symbol) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 95, 5)
+            .submit_add_order(
+                &symbol,
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                95,
+                5,
+            )
             .expect("submit");
         assert!(matches!(
             receipt.result,
@@ -5094,7 +5187,7 @@ mod tests {
         let book = SequencedUnderlyingOrderBook::new("BTC");
 
         let receipt = book
-            .submit_cancel_order("BTC-20240329-50000-C", OrderId::new())
+            .submit_cancel_order("BTC-20240329-50000-C", OrderId::from_uuid(Uuid::new_v4()))
             .expect("submit");
         assert!(receipt.result.is_error());
     }
@@ -5107,7 +5200,7 @@ mod tests {
         // The underlying orderbook may treat this as a no-op success
         // or a rejection depending on the implementation.
         let receipt = book
-            .submit_cancel_order(&symbol, OrderId::new())
+            .submit_cancel_order(&symbol, OrderId::from_uuid(Uuid::new_v4()))
             .expect("submit");
         // Verify a receipt is returned with a valid sequence number
         assert_eq!(receipt.sequence_num, 0);
@@ -5364,7 +5457,13 @@ mod tests {
         let strike = exp_book.get_or_create_strike(50000);
         strike
             .call()
-            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+                user_a,
+            )
             .expect("seed");
         drop(strike);
         drop(exp_book);
@@ -5404,7 +5503,13 @@ mod tests {
         let book = SequencedUnderlyingOrderBook::new("BTC");
 
         let receipt = book
-            .submit_add_order("INVALID-FORMAT", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "INVALID-FORMAT",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(receipt.result.is_error());
     }
@@ -5414,7 +5519,13 @@ mod tests {
         let (book, _, _) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order("BTC-20240329-50000-X", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "BTC-20240329-50000-X",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(receipt.result.is_error());
     }
@@ -5426,7 +5537,13 @@ mod tests {
         let book = SequencedUnderlyingOrderBook::new("BTC");
 
         let receipt = book
-            .submit_add_order("BTC-NOTADATE-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "BTC-NOTADATE-50000-C",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(receipt.result.is_error());
     }
@@ -5453,7 +5570,13 @@ mod tests {
         let (book, _, _) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order("ETH-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "ETH-20240329-50000-C",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         match &receipt.result {
             OptionChainResult::Rejected { reason } => {
@@ -5482,7 +5605,13 @@ mod tests {
 
         // The sequencer must route the same YYYYMMDD symbol to that exact book.
         let receipt = book
-            .submit_add_order(symbol, OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                symbol,
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(
             receipt.result.is_success(),
@@ -5505,7 +5634,13 @@ mod tests {
         let (book, _, _) = make_book_with_orders();
 
         let receipt = book
-            .submit_add_order("BTC-20240329-50000-P", OrderId::new(), Side::Buy, 40, 5)
+            .submit_add_order(
+                "BTC-20240329-50000-P",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                40,
+                5,
+            )
             .expect("submit");
         assert!(receipt.result.is_success());
     }
@@ -5587,7 +5722,13 @@ mod tests {
         // Wrap in sequencer and submit an order
         let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
         let receipt = book
-            .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .submit_add_order(
+                "BTC-20240329-50000-C",
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                100,
+                10,
+            )
             .expect("submit");
         assert!(receipt.result.is_success());
 
