@@ -583,6 +583,7 @@ mod tests {
     use crate::orderbook::{StrikeGenerator, StrikeRangeConfig, UnderlyingOrderBook};
     use chrono::{Duration, NaiveDate, NaiveTime, TimeZone};
     use orderbook_rs::{OrderId, Side};
+    use uuid::Uuid;
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -636,11 +637,11 @@ mod tests {
         let strike_book = exp_book.chain().get_strike(first_strike).unwrap();
         strike_book
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .unwrap();
         strike_book
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 200, 3)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 200, 3)
             .unwrap();
 
         underlying
@@ -1268,7 +1269,7 @@ mod tests {
             .get_strike(strikes[0])
             .unwrap()
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .unwrap();
 
         // Setup settling expiration

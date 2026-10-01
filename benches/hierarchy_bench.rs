@@ -7,6 +7,7 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::prelude::{ExpirationDate, Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
+use uuid::Uuid;
 
 /// Benchmarks for full hierarchy traversal operations.
 pub fn hierarchy_operations(c: &mut Criterion) {
@@ -23,7 +24,7 @@ pub fn hierarchy_operations(c: &mut Criterion) {
             let strike = exp_book.get_or_create_strike(50000 + counter * 100);
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             counter += 1;
         });
@@ -62,7 +63,7 @@ pub fn hierarchy_operations(c: &mut Criterion) {
             for strike in (40000..60000).step_by(1000) {
                 let s = exp_book.get_strike(strike).unwrap();
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
             }
         });
@@ -80,10 +81,10 @@ pub fn hierarchy_operations(c: &mut Criterion) {
                 for strike in (40000..60000).step_by(5000) {
                     let s = exp_book.get_or_create_strike(strike);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                         .unwrap();
                 }
             }
@@ -117,17 +118,17 @@ pub fn trading_scenarios(c: &mut Criterion) {
                 let s = exp_book.get_strike(strike).unwrap();
                 // Add bid/ask for call
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Sell, 105, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 10)
                     .unwrap();
                 // Add bid/ask for put
                 s.put()
-                    .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                     .unwrap();
                 s.put()
-                    .add_limit_order(OrderId::new(), Side::Sell, 55, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 55, 10)
                     .unwrap();
             }
         });
@@ -143,16 +144,16 @@ pub fn trading_scenarios(c: &mut Criterion) {
             for strike in (40000..60000).step_by(1000) {
                 let s = exp_book.get_or_create_strike(strike);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
                     .unwrap();
                 s.put()
-                    .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                     .unwrap();
                 s.put()
-                    .add_limit_order(OrderId::new(), Side::Sell, 55, 5)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 55, 5)
                     .unwrap();
             }
         }
@@ -162,7 +163,10 @@ pub fn trading_scenarios(c: &mut Criterion) {
             let mut quotes = Vec::new();
             for strike in (40000..60000).step_by(1000) {
                 let s = exp_book.get_strike(strike).unwrap();
-                quotes.push((s.call_quote(), s.put_quote()));
+                quotes.push((
+                    s.call_quote().expect("call quote"),
+                    s.put_quote().expect("put quote"),
+                ));
             }
             quotes
         });
@@ -187,7 +191,7 @@ pub fn trading_scenarios(c: &mut Criterion) {
             let strike = exp_book.get_strike(atm).unwrap();
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
         });
     });
@@ -215,7 +219,7 @@ pub fn hierarchy_scaling(c: &mut Criterion) {
                     for strike in (40000..60000).step_by(5000) {
                         let s = exp_book.get_or_create_strike(strike);
                         s.call()
-                            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                             .unwrap();
                     }
                 }
@@ -239,10 +243,10 @@ pub fn hierarchy_scaling(c: &mut Criterion) {
                 for i in 0..num_strikes {
                     let s = exp_book.get_or_create_strike(40000 + i * 100);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                         .unwrap();
                 }
                 b.iter(|| manager.total_order_count());
@@ -269,7 +273,12 @@ pub fn hierarchy_scaling(c: &mut Criterion) {
                             let strike = exp_book.get_or_create_strike(40000 + s * 1000);
                             strike
                                 .call()
-                                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                                .add_limit_order(
+                                    OrderId::from_uuid(Uuid::new_v4()),
+                                    Side::Buy,
+                                    100,
+                                    10,
+                                )
                                 .unwrap();
                         }
                     }

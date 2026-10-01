@@ -5,6 +5,7 @@ use option_chain_orderbook::orderbook::{StrikeOrderBook, StrikeOrderBookManager}
 use optionstratlib::ExpirationDate;
 use optionstratlib::prelude::Positive;
 use orderbook_rs::{OrderId, Side};
+use uuid::Uuid;
 
 /// Creates a test expiration date.
 fn test_expiration() -> ExpirationDate {
@@ -26,7 +27,7 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         b.iter(|| {
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
         });
     });
@@ -37,7 +38,7 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         b.iter(|| {
             strike
                 .put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                 .unwrap();
         });
     });
@@ -47,13 +48,13 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .unwrap();
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
             .unwrap();
-        b.iter(|| strike.call_quote());
+        b.iter(|| strike.call_quote().expect("call quote"));
     });
 
     // Benchmark getting put quote
@@ -61,13 +62,13 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 55, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 55, 5)
             .unwrap();
-        b.iter(|| strike.put_quote());
+        b.iter(|| strike.put_quote().expect("put quote"));
     });
 
     // Benchmark is_fully_quoted check
@@ -75,19 +76,19 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .unwrap();
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
             .unwrap();
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 55, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 55, 5)
             .unwrap();
         b.iter(|| strike.is_fully_quoted());
     });
@@ -98,11 +99,11 @@ pub fn strike_orderbook_operations(c: &mut Criterion) {
         for _ in 0..50 {
             strike
                 .call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             strike
                 .put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                 .unwrap();
         }
         b.iter(|| strike.order_count());
@@ -168,7 +169,7 @@ pub fn strike_manager_operations(c: &mut Criterion) {
         for strike in (40000..60000).step_by(1000) {
             let s = manager.get_or_create(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
         }
         b.iter(|| manager.total_order_count());

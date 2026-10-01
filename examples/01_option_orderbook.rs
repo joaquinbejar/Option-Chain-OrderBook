@@ -9,6 +9,7 @@ use option_chain_orderbook::orderbook::OptionOrderBook;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,9 +29,9 @@ fn main() {
     info!("--- Adding Orders ---");
 
     // Add buy orders (bids)
-    let bid1 = OrderId::new();
-    let bid2 = OrderId::new();
-    let bid3 = OrderId::new();
+    let bid1 = OrderId::from_uuid(Uuid::new_v4());
+    let bid2 = OrderId::from_uuid(Uuid::new_v4());
+    let bid3 = OrderId::from_uuid(Uuid::new_v4());
 
     book.add_limit_order(bid1, Side::Buy, 500, 10).unwrap();
     info!("Added BID: price=500, size=10");
@@ -42,9 +43,9 @@ fn main() {
     info!("Added BID: price=490, size=15");
 
     // Add sell orders (asks)
-    let ask1 = OrderId::new();
-    let ask2 = OrderId::new();
-    let ask3 = OrderId::new();
+    let ask1 = OrderId::from_uuid(Uuid::new_v4());
+    let ask2 = OrderId::from_uuid(Uuid::new_v4());
+    let ask3 = OrderId::from_uuid(Uuid::new_v4());
 
     book.add_limit_order(ask1, Side::Sell, 510, 8).unwrap();
     info!("Added ASK: price=510, size=8");
@@ -59,7 +60,7 @@ fn main() {
 
     // === Quote Information ===
     info!("\n--- Best Quote (Top of Book) ---");
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     info!("Best Bid: {} @ {:?}", quote.bid_size(), quote.bid_price());
     info!("Best Ask: {} @ {:?}", quote.ask_size(), quote.ask_price());
     info!("Spread: {:?}", quote.spread());
@@ -76,20 +77,20 @@ fn main() {
     if let Some(spread_bps) = book.spread_bps() {
         info!("Spread (bps): {:.2}", spread_bps);
     }
-    if let Some(micro) = book.micro_price() {
+    if let Some(micro) = book.micro_price().expect("micro price") {
         info!("Micro price: {:.2}", micro);
     }
 
     // === Order Book Depth ===
     info!("\n--- Order Book Depth ---");
-    let bid_depth = book.total_bid_depth();
-    let ask_depth = book.total_ask_depth();
+    let bid_depth = book.total_bid_depth().expect("bid depth");
+    let ask_depth = book.total_ask_depth().expect("ask depth");
     info!("Total bid depth: {}", bid_depth);
     info!("Total ask depth: {}", ask_depth);
 
     // === Imbalance ===
     info!("\n--- Order Imbalance ---");
-    let imbalance = book.imbalance(5);
+    let imbalance = book.imbalance(5).expect("imbalance");
     info!(
         "Imbalance (5 levels): {:.2}% (positive = more bids)",
         imbalance * 100.0
@@ -97,7 +98,7 @@ fn main() {
 
     // === Snapshot ===
     info!("\n--- Order Book Snapshot (3 levels) ---");
-    let snapshot = book.snapshot(3);
+    let snapshot = book.snapshot(3).expect("snapshot");
     info!("Bids:");
     for (i, level) in snapshot.bids.iter().enumerate() {
         info!(
@@ -119,10 +120,10 @@ fn main() {
 
     // === VWAP ===
     info!("\n--- VWAP Calculation ---");
-    if let Some(vwap_buy) = book.vwap(20, Side::Buy) {
+    if let Some(vwap_buy) = book.vwap(20, Side::Buy).expect("vwap") {
         info!("VWAP to buy 20 contracts: {:.2}", vwap_buy);
     }
-    if let Some(vwap_sell) = book.vwap(20, Side::Sell) {
+    if let Some(vwap_sell) = book.vwap(20, Side::Sell).expect("vwap") {
         info!("VWAP to sell 20 contracts: {:.2}", vwap_sell);
     }
 
@@ -134,7 +135,7 @@ fn main() {
     info!("Orders after cancel: {}", book.order_count());
 
     // Verify quote changed
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     info!(
         "Best Bid after cancel: {} @ {:?}",
         quote.bid_size(),

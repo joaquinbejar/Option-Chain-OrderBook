@@ -18,6 +18,7 @@ use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
 use std::time::Duration;
+use uuid::Uuid;
 
 fn main() {
     println!("=== Order Lifecycle Tracking Example ===\n");
@@ -28,9 +29,9 @@ fn main() {
     let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
     // Add some orders
-    let order1 = OrderId::new();
-    let order2 = OrderId::new();
-    let order3 = OrderId::new();
+    let order1 = OrderId::from_uuid(Uuid::new_v4());
+    let order2 = OrderId::from_uuid(Uuid::new_v4());
+    let order3 = OrderId::from_uuid(Uuid::new_v4());
 
     book.add_limit_order(order1, Side::Buy, 100, 10)
         .expect("add order1");
@@ -58,7 +59,7 @@ fn main() {
 
     // Match some orders
     println!("\n--- Matching orders ---");
-    let taker = OrderId::new();
+    let taker = OrderId::from_uuid(Uuid::new_v4());
     book.add_limit_order(taker, Side::Sell, 99, 15)
         .expect("add taker");
 
@@ -87,21 +88,51 @@ fn main() {
 
     // Alice places 3 orders
     book2
-        .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_alice)
+        .add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_alice,
+        )
         .expect("alice1");
     book2
-        .add_limit_order_with_user(OrderId::new(), Side::Buy, 99, 5, user_alice)
+        .add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            99,
+            5,
+            user_alice,
+        )
         .expect("alice2");
     book2
-        .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 8, user_alice)
+        .add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            110,
+            8,
+            user_alice,
+        )
         .expect("alice3");
 
     // Bob places 2 orders
     book2
-        .add_limit_order_with_user(OrderId::new(), Side::Buy, 98, 20, user_bob)
+        .add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            98,
+            20,
+            user_bob,
+        )
         .expect("bob1");
     book2
-        .add_limit_order_with_user(OrderId::new(), Side::Sell, 112, 15, user_bob)
+        .add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            112,
+            15,
+            user_bob,
+        )
         .expect("bob2");
 
     let alice_orders = book2.orders_by_user(user_alice);
@@ -119,7 +150,7 @@ fn main() {
     let strike = exp.get_or_create_strike(50000);
 
     // Place an order deep in the hierarchy
-    let deep_order = OrderId::new();
+    let deep_order = OrderId::from_uuid(Uuid::new_v4());
     strike
         .call()
         .add_limit_order(deep_order, Side::Buy, 500, 10)
@@ -145,7 +176,7 @@ fn main() {
     }
 
     // Unknown order returns None
-    let unknown = OrderId::new();
+    let unknown = OrderId::from_uuid(Uuid::new_v4());
     if manager.find_order_across_underlyings(unknown).is_none() {
         println!("Unknown order correctly returns None");
     }
@@ -157,11 +188,11 @@ fn main() {
     let strike2 = exp.get_or_create_strike(55000);
     strike2
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 400, 5)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 400, 5)
         .expect("s2c1");
     strike2
         .put()
-        .add_limit_order(OrderId::new(), Side::Sell, 300, 8)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 300, 8)
         .expect("s2p1");
 
     println!(
@@ -188,11 +219,11 @@ fn main() {
     let fill_strike = exp.get_or_create_strike(60000);
     fill_strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Sell, 200, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 200, 10)
         .expect("maker");
     fill_strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 10)
         .expect("taker");
 
     println!(

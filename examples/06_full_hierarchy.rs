@@ -10,6 +10,7 @@ use optionstratlib::prelude::{Positive, pos_or_panic};
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -63,18 +64,18 @@ fn main() {
                 if let Ok(s) = exp_book.get_strike(strike) {
                     // Update call quotes
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 450, 50)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 450, 50)
                         .unwrap();
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Sell, 480, 50)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 480, 50)
                         .unwrap();
 
                     // Update put quotes
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Buy, 200, 50)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 50)
                         .unwrap();
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Sell, 230, 50)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 230, 50)
                         .unwrap();
                 }
             }
@@ -100,8 +101,8 @@ fn main() {
 
         for strike in exp_book.strike_prices() {
             if let Ok(s) = exp_book.get_strike(strike) {
-                let call_quote = s.call_quote();
-                let put_quote = s.put_quote();
+                let call_quote = s.call_quote().expect("call quote");
+                let put_quote = s.put_quote().expect("put quote");
 
                 info!(
                     "{:<10} {:>12} {:>12} {:>12} {:>12}",
@@ -127,7 +128,7 @@ fn main() {
         info!("Simulating order flow on BTC-50000 Call:\n");
 
         // Get initial state
-        let initial_quote = strike.call_quote();
+        let initial_quote = strike.call_quote().expect("call quote");
         info!(
             "Initial: {} @ {:?} / {} @ {:?}",
             initial_quote.bid_size(),
@@ -140,18 +141,18 @@ fn main() {
         info!("\n[Buyer] Lifting offer - buying 30 contracts");
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 480, 30)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 480, 30)
             .unwrap();
 
         // Simulate aggressive seller
         info!("[Seller] Hitting bid - selling 20 contracts");
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 450, 20)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 450, 20)
             .unwrap();
 
         // Check new state
-        let new_quote = strike.call_quote();
+        let new_quote = strike.call_quote().expect("call quote");
         info!(
             "\nAfter flow: {} @ {:?} / {} @ {:?}",
             new_quote.bid_size(),
@@ -229,20 +230,20 @@ fn main() {
 
         info!("\nCall Option:");
         info!("  Orders: {}", call.order_count());
-        let bid_depth = call.total_bid_depth();
-        let ask_depth = call.total_ask_depth();
+        let bid_depth = call.total_bid_depth().expect("bid depth");
+        let ask_depth = call.total_ask_depth().expect("ask depth");
         info!("  Bid depth: {}", bid_depth);
         info!("  Ask depth: {}", ask_depth);
-        let imbalance = call.imbalance(5);
+        let imbalance = call.imbalance(5).expect("imbalance");
         info!("  Imbalance: {:.1}%", imbalance * 100.0);
 
         info!("\nPut Option:");
         info!("  Orders: {}", put.order_count());
-        let bid_depth = put.total_bid_depth();
-        let ask_depth = put.total_ask_depth();
+        let bid_depth = put.total_bid_depth().expect("bid depth");
+        let ask_depth = put.total_ask_depth().expect("ask depth");
         info!("  Bid depth: {}", bid_depth);
         info!("  Ask depth: {}", ask_depth);
-        let imbalance = put.imbalance(5);
+        let imbalance = put.imbalance(5).expect("imbalance");
         info!("  Imbalance: {:.1}%", imbalance * 100.0);
 
         info!(
@@ -279,16 +280,16 @@ fn setup_btc_options(manager: &UnderlyingOrderBookManager) {
 
             // Add initial liquidity
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 400, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 400, 10)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 450, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 450, 8)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 250, 8)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 250, 8)
                 .unwrap();
         }
     }
@@ -303,16 +304,16 @@ fn setup_btc_options(manager: &UnderlyingOrderBookManager) {
             let s = exp_book.get_or_create_strike(strike);
 
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 500, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 500, 15)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 550, 12)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 550, 12)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 300, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 300, 15)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 350, 12)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 350, 12)
                 .unwrap();
         }
     }
@@ -340,16 +341,16 @@ fn setup_eth_options(manager: &UnderlyingOrderBookManager) {
             let s = exp_book.get_or_create_strike(strike);
 
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 20)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 20)
                 .unwrap();
             s.call()
-                .add_limit_order(OrderId::new(), Side::Sell, 60, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 60, 15)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 30, 20)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 30, 20)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Sell, 40, 15)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 40, 15)
                 .unwrap();
         }
     }

@@ -37,7 +37,7 @@ proptest! {
             apply_op(&book, op);
         }
 
-        let quote = book.best_quote();
+        let quote = book.best_quote().expect("best quote");
         let bid = book.best_bid();
         let ask = book.best_ask();
 
@@ -56,7 +56,7 @@ proptest! {
         // every level instead of only the top) is caught, not just a zero fill.
         // The test stream submits only plain limit orders, so hidden quantity is
         // always zero and `visible_quantity()` equals the level's total depth.
-        let snap = book.snapshot(1);
+        let snap = book.snapshot(1).expect("snapshot");
         match bid {
             Some(_) => {
                 let top_bid_depth = snap.bids.first().expect("bid level present").visible_quantity();
@@ -91,7 +91,7 @@ fn two_sided_book_yields_two_sided_quote() {
     book.add_limit_order(OrderId::from_u64(2), Side::Sell, 101, 5)
         .expect("add sell");
 
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     assert!(quote.is_two_sided());
     assert_eq!(quote.bid_price().map(|p| p.as_u128()), Some(99));
     assert_eq!(quote.ask_price().map(|p| p.as_u128()), Some(101));
@@ -106,7 +106,7 @@ fn one_sided_book_yields_one_sided_quote() {
     book.add_limit_order(OrderId::from_u64(1), Side::Buy, 100, 7)
         .expect("add buy");
 
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     assert!(!quote.is_two_sided());
     assert!(!book.has_both_sides());
     assert_eq!(quote.bid_price().map(|p| p.as_u128()), Some(100));
@@ -124,7 +124,7 @@ fn crossing_orders_clear_a_side() {
     book.add_limit_order(OrderId::from_u64(2), Side::Sell, 99, 4)
         .expect("add crossing sell");
 
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     // The aggressing sell matched against the bid and did not rest.
     assert!(book.best_ask().is_none());
     assert!(!quote.is_two_sided());

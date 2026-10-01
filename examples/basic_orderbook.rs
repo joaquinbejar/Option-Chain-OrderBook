@@ -13,6 +13,7 @@ use option_chain_orderbook::orderbook::OptionOrderBook;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{OrderId, Side};
 use tracing::info;
+use uuid::Uuid;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -29,9 +30,9 @@ fn main() {
     // Add some buy orders (bids)
     // Prices are in smallest units (e.g., cents, satoshis)
     info!("--- Adding Buy Orders ---");
-    let bid1 = OrderId::new();
-    let bid2 = OrderId::new();
-    let bid3 = OrderId::new();
+    let bid1 = OrderId::from_uuid(Uuid::new_v4());
+    let bid2 = OrderId::from_uuid(Uuid::new_v4());
+    let bid3 = OrderId::from_uuid(Uuid::new_v4());
 
     book.add_limit_order(bid1, Side::Buy, 500, 10).unwrap();
     info!("Added bid: price=500, size=10, id={:?}", bid1);
@@ -44,9 +45,9 @@ fn main() {
 
     // Add some sell orders (asks)
     info!("--- Adding Sell Orders ---");
-    let ask1 = OrderId::new();
-    let ask2 = OrderId::new();
-    let ask3 = OrderId::new();
+    let ask1 = OrderId::from_uuid(Uuid::new_v4());
+    let ask2 = OrderId::from_uuid(Uuid::new_v4());
+    let ask3 = OrderId::from_uuid(Uuid::new_v4());
 
     book.add_limit_order(ask1, Side::Sell, 510, 8).unwrap();
     info!("Added ask: price=510, size=8, id={:?}", ask1);
@@ -59,7 +60,7 @@ fn main() {
 
     // Get the best quote (top of book)
     info!("--- Best Quote ---");
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     info!("Best bid: {} @ {:?}", quote.bid_size(), quote.bid_price());
     info!("Best ask: {} @ {:?}", quote.ask_size(), quote.ask_price());
     info!("Spread: {:?}", quote.spread());
@@ -67,7 +68,7 @@ fn main() {
 
     // Get a snapshot of the order book (top 5 levels)
     info!("--- Order Book Snapshot (5 levels) ---");
-    let snapshot = book.snapshot(5);
+    let snapshot = book.snapshot(5).expect("snapshot");
     info!("Bids:");
     for (i, level) in snapshot.bids.iter().enumerate() {
         info!(
@@ -95,13 +96,13 @@ fn main() {
 
     // Check the quote after cancellation
     info!("--- Quote After Cancellation ---");
-    let quote = book.best_quote();
+    let quote = book.best_quote().expect("best quote");
     info!("Best bid: {} @ {:?}", quote.bid_size(), quote.bid_price());
     info!("Best ask: {} @ {:?}", quote.ask_size(), quote.ask_price());
 
     // Demonstrate order book statistics
     info!("--- Order Book Statistics ---");
-    let snapshot = book.snapshot(100);
+    let snapshot = book.snapshot(100).expect("snapshot");
     info!("Total bid levels: {}", snapshot.bids.len());
     info!("Total ask levels: {}", snapshot.asks.len());
 

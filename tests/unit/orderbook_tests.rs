@@ -7,22 +7,23 @@ use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
+use uuid::Uuid;
 
 #[test]
 fn test_option_order_book_integration() {
     let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
     // Add orders
-    if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+    if let Err(err) = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10) {
         panic!("add order failed: {}", err);
     }
-    if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+    if let Err(err) = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5) {
         panic!("add order failed: {}", err);
     }
 
     // Verify state
     assert_eq!(book.order_count(), 2);
-    assert!(book.best_quote().is_two_sided());
+    assert!(book.best_quote().expect("best quote").is_two_sided());
 }
 
 #[test]
@@ -39,11 +40,11 @@ fn test_underlying_manager_integration() {
         // Add orders to call and put
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .unwrap_or_else(|err| panic!("add order failed: {}", err));
         strike
             .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 50, 5)
             .unwrap_or_else(|err| panic!("add order failed: {}", err));
     }
 
@@ -65,15 +66,17 @@ fn test_cancel_all_across_underlyings() {
         let exp = btc.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(50000);
 
-        if let Err(err) = strike
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
         {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = strike
-            .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 80, 5)
         {
             panic!("add order failed: {}", err);
         }
@@ -84,9 +87,10 @@ fn test_cancel_all_across_underlyings() {
         let exp = eth.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(3000);
 
-        if let Err(err) = strike
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 7)
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 7)
         {
             panic!("add order failed: {}", err);
         }
@@ -117,11 +121,13 @@ fn test_cancel_by_user_across_underlyings() {
         let exp = btc.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(50000);
 
-        if let Err(err) =
-            strike
-                .call()
-                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
-        {
+        if let Err(err) = strike.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
     }
@@ -131,19 +137,23 @@ fn test_cancel_by_user_across_underlyings() {
         let exp = eth.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(3000);
 
-        if let Err(err) =
-            strike
-                .put()
-                .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
-        {
+        if let Err(err) = strike.put().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            80,
+            5,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
 
-        if let Err(err) =
-            strike
-                .call()
-                .add_limit_order_with_user(OrderId::new(), Side::Buy, 90, 6, user_b)
-        {
+        if let Err(err) = strike.call().add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            90,
+            6,
+            user_b,
+        ) {
             panic!("add order failed: {}", err);
         }
     }
@@ -168,15 +178,17 @@ fn test_cancel_by_side_across_underlyings() {
         let exp = btc.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(50000);
 
-        if let Err(err) = strike
-            .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
         {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = strike
-            .call()
-            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 5)
         {
             panic!("add order failed: {}", err);
         }
@@ -187,15 +199,17 @@ fn test_cancel_by_side_across_underlyings() {
         let exp = eth.get_or_create_expiration(exp_date);
         let strike = exp.get_or_create_strike(3000);
 
-        if let Err(err) = strike
-            .put()
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 7)
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 7)
         {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = strike
-            .put()
-            .add_limit_order(OrderId::new(), Side::Sell, 60, 3)
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 60, 3)
         {
             panic!("add order failed: {}", err);
         }
@@ -227,9 +241,10 @@ fn test_hierarchy_set_validation_max_price_propagates_to_new_strikes() {
     let strike = exp.get_or_create_strike(50000);
 
     // An above-bound add on the freshly vivified leaf is rejected crate-side.
-    let rejected = strike
-        .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 1_001, 10);
+    let rejected =
+        strike
+            .call()
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1_001, 10);
     let err = match rejected {
         Ok(()) => panic!("above-bound add should be rejected on a propagated leaf"),
         Err(e) => e,
@@ -239,7 +254,7 @@ fn test_hierarchy_set_validation_max_price_propagates_to_new_strikes() {
     // A within-bound add on the same leaf still succeeds.
     strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 1_000, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1_000, 10)
         .unwrap_or_else(|err| panic!("within-bound add failed: {err}"));
     assert_eq!(strike.call().order_count(), 1);
 }
@@ -253,7 +268,7 @@ fn test_replace_order_through_hierarchy_handles() {
     let exp = btc.get_or_create_expiration(exp_date);
     let strike = exp.get_or_create_strike(50000);
 
-    let id = OrderId::new();
+    let id = OrderId::from_uuid(Uuid::new_v4());
     strike
         .call()
         .add_limit_order(id, Side::Buy, 100, 10)
@@ -290,19 +305,19 @@ fn test_hierarchy_set_specs_price_band_propagates_to_new_strikes() {
     // Within-band add succeeds; out-of-band adds are rejected crate-side.
     strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 500, 10)
         .unwrap_or_else(|err| panic!("within-band add failed: {err}"));
     assert!(
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 1_001, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1_001, 10)
             .is_err(),
         "above-band add must be rejected"
     );
     assert!(
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 99, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 99, 10)
             .is_err(),
         "below-band add must be rejected"
     );
@@ -329,12 +344,12 @@ fn test_hierarchy_chain_set_specs_band_activates_at_leaf() {
     let strike = chain.get_or_create_strike(50000);
     strike
         .call()
-        .add_limit_order(OrderId::new(), Side::Buy, 1_500, 10)
+        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1_500, 10)
         .unwrap_or_else(|err| panic!("within-band add failed: {err}"));
     assert!(
         strike
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 2_001, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 2_001, 10)
             .is_err(),
         "above-band add must be rejected once the chain-level band is set"
     );

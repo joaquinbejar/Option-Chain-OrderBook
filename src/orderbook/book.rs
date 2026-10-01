@@ -526,7 +526,7 @@ impl OptionOrderBook {
             symbol_hash,
             book: Arc::new(book),
             option_style,
-            id: OrderId::new(),
+            id: OrderId::from_uuid(Uuid::new_v4()),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
@@ -1286,12 +1286,17 @@ impl OptionOrderBook {
     /// the trade component when an order rests without producing fills; the
     /// `_full` methods map that `None` onto this empty result so callers always
     /// receive a `TradeResult` carrying their own taker order id.
-    #[must_use]
-    fn empty_trade_result(&self, order_id: OrderId, quantity: u64) -> TradeResult {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookError`] if the engine refuses to build the
+    /// result (fee or notional arithmetic overflow, never hit with no trades).
+    fn empty_trade_result(&self, order_id: OrderId, quantity: u64) -> Result<TradeResult> {
         TradeResult::new(
             self.symbol.clone(),
             MatchResult::new(order_id, Quantity::new(quantity)),
         )
+        .map_err(|err| Error::orderbook(err.to_string()))
     }
 
     /// Adds a limit order and returns the full [`TradeResult`] including fees.
@@ -1340,7 +1345,7 @@ impl OptionOrderBook {
             TimeInForce::Gtc,
             None,
         )?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, quantity), Ok)
     }
 
     /// Adds a limit order with time-in-force and returns the full [`TradeResult`].
@@ -1370,7 +1375,7 @@ impl OptionOrderBook {
         let (_order, trade) = self
             .book
             .add_limit_order_with_result(order_id, price, quantity, side, tif, None)?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, quantity), Ok)
     }
 
     /// Adds a limit order with user identity and returns the full [`TradeResult`].
@@ -1406,7 +1411,7 @@ impl OptionOrderBook {
             user_id,
             None,
         )?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, quantity), Ok)
     }
 
     /// Adds a limit order with time-in-force, user identity, and returns
@@ -1438,7 +1443,7 @@ impl OptionOrderBook {
         let (_order, trade) = self.book.add_limit_order_with_user_and_result(
             order_id, price, quantity, side, tif, user_id, None,
         )?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, quantity), Ok)
     }
 
     // ── Order-kind methods (post-only / iceberg) ────────────────────────
@@ -1498,7 +1503,7 @@ impl OptionOrderBook {
             extra_fields: (),
         };
         let (_order, trade) = self.book.add_order_with_result(order)?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, quantity)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, quantity), Ok)
     }
 
     /// Adds an iceberg order and returns the full [`TradeResult`].
@@ -1568,7 +1573,7 @@ impl OptionOrderBook {
             extra_fields: (),
         };
         let (_order, trade) = self.book.add_order_with_result(order)?;
-        Ok(trade.unwrap_or_else(|| self.empty_trade_result(order_id, total)))
+        trade.map_or_else(|| self.empty_trade_result(order_id, total), Ok)
     }
 
     /// Adds a post-only order, discarding the [`TradeResult`].
@@ -1864,11 +1869,11 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-    /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
+    /// if let Err(err) = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 1) {
     ///     panic!("add order failed: {}", err);
     /// }
     /// let result = match book.cancel_all() {
@@ -1904,11 +1909,11 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-    /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
+    /// if let Err(err) = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 1) {
     ///     panic!("add order failed: {}", err);
     /// }
     /// let result = match book.cancel_by_side(Side::Buy) {
@@ -1944,13 +1949,13 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     /// use pricelevel::Hash32;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// let user = Hash32::from([1u8; 32]);
-    /// if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 1, user) {
+    /// if let Err(err) = book.add_limit_order_with_user(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 1, user) {
     ///     panic!("add order failed: {}", err);
     /// }
     /// let result = match book.cancel_by_user(user) {
@@ -2013,20 +2018,25 @@ impl OptionOrderBook {
     ///
     /// The identifiers of the evicted orders, in the deterministic order
     /// described above. Empty when nothing was expired. A second sweep at the
-    /// same `now_ms` returns an empty vector (idempotent).
+    /// same `now_ms` returns an empty vector (idempotent). A per-order failure
+    /// does not stop the sweep: it is logged at `WARN`, an order that could
+    /// not be cancelled keeps resting and is retried by a later sweep, and an
+    /// order whose level faulted after removing it is reported as evicted.
     ///
     /// # Errors
     ///
-    /// None.
+    /// Returns [`Error::OrderBookEngine`] when the engine cannot read a price
+    /// level's resting orders. The read runs before any eviction, so on this
+    /// error nothing was evicted and the book is unchanged.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, TimeInForce, TimestampMs};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, TimeInForce, TimestampMs, Uuid};
     /// use optionstratlib::OptionStyle;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-    /// let gtd = OrderId::new();
+    /// let gtd = OrderId::from_uuid(Uuid::new_v4());
     /// // A resting GTD order that expires at t = 10_000_000_000_000 ms.
     /// if let Err(err) =
     ///     book.add_limit_order_with_tif(gtd, Side::Buy, 100, 1, TimeInForce::Gtd(10_000_000_000_000))
@@ -2036,19 +2046,25 @@ impl OptionOrderBook {
     /// // Nothing expired one millisecond before the deadline.
     /// assert!(
     ///     book.evict_expired_orders(TimestampMs::new(9_999_999_999_999))
+    ///         .expect("sweep")
     ///         .is_empty()
     /// );
     /// // At the deadline the order is evicted.
-    /// let evicted = book.evict_expired_orders(TimestampMs::new(10_000_000_000_000));
+    /// let evicted = book
+    ///     .evict_expired_orders(TimestampMs::new(10_000_000_000_000))
+    ///     .expect("sweep");
     /// assert_eq!(evicted, vec![gtd]);
     /// ```
-    #[must_use]
-    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> Vec<OrderId> {
-        self.book
-            .evict_expired_orders(now_ms)
-            .into_iter()
-            .map(|order| order.id())
-            .collect()
+    pub fn evict_expired_orders(&self, now_ms: TimestampMs) -> Result<Vec<OrderId>> {
+        let result = self.book.evict_expired_orders(now_ms)?;
+        for failure in result.failures() {
+            tracing::warn!(
+                symbol = %self.symbol,
+                ?failure,
+                "expired order eviction failed for one order"
+            );
+        }
+        Ok(result.evicted_order_ids().to_vec())
     }
 
     // ── Order Lifecycle Queries ────────────────────────────────────────────
@@ -2076,11 +2092,11 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-    /// let id = OrderId::new();
+    /// let id = OrderId::from_uuid(Uuid::new_v4());
     /// book.add_limit_order(id, Side::Buy, 100, 10).expect("add order");
     /// let status = book.get_order_status(id);
     /// assert!(status.is_some());
@@ -2113,11 +2129,11 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-    /// let id = OrderId::new();
+    /// let id = OrderId::from_uuid(Uuid::new_v4());
     /// book.add_limit_order(id, Side::Buy, 100, 10).expect("add order");
     /// let history = book.get_order_history(id);
     /// assert!(history.is_some());
@@ -2252,13 +2268,13 @@ impl OptionOrderBook {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+    /// use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
     /// use optionstratlib::OptionStyle;
     /// use pricelevel::Hash32;
     ///
     /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
     /// let user = Hash32::from([1u8; 32]);
-    /// book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user)
+    /// book.add_limit_order_with_user(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10, user)
     ///     .expect("add order");
     /// let orders = book.orders_by_user(user);
     /// assert_eq!(orders.len(), 1);
@@ -2293,9 +2309,13 @@ impl OptionOrderBook {
     /// (`u128`): a value above `2^53` is not exactly representable as an
     /// IEEE-754 double, so any consumer deserializing the resulting [`Quote`]
     /// JSON must parse prices with a 128-bit-aware parser, not as `f64`.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine cannot sum the size at
+    /// a best level (a level whose quantity overflows `u64`).
     #[inline]
-    pub fn best_quote(&self) -> Quote {
+    pub fn best_quote(&self) -> Result<Quote> {
         // Wall-clock stamp (non-monotonic). Safe here: `Quote` is a transient
         // market-data read, is excluded from `Quote`'s `PartialEq`, and is never
         // serialized into a journal record or NATS payload. Do NOT let a `Quote`
@@ -2310,7 +2330,7 @@ impl OptionOrderBook {
         let (bid_price, bid_size) = match self.book.best_bid() {
             Some(p) => (
                 Some(Price::new(p)),
-                Quantity::new(self.book.total_depth_at_levels(1, Side::Buy)),
+                Quantity::new(self.book.total_depth_at_levels(1, Side::Buy)?),
             ),
             None => (None, Quantity::ZERO),
         };
@@ -2318,12 +2338,18 @@ impl OptionOrderBook {
         let (ask_price, ask_size) = match self.book.best_ask() {
             Some(p) => (
                 Some(Price::new(p)),
-                Quantity::new(self.book.total_depth_at_levels(1, Side::Sell)),
+                Quantity::new(self.book.total_depth_at_levels(1, Side::Sell)?),
             ),
             None => (None, Quantity::ZERO),
         };
 
-        Quote::new(bid_price, bid_size, ask_price, ask_size, timestamp_ms)
+        Ok(Quote::new(
+            bid_price,
+            bid_size,
+            ask_price,
+            ask_size,
+            timestamp_ms,
+        ))
     }
 
     /// Returns `true` if the book currently has resting orders on **both**
@@ -2378,21 +2404,33 @@ impl OptionOrderBook {
     /// # Arguments
     ///
     /// * `depth` - Maximum number of price levels to include on each side
-    #[must_use]
-    pub fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
-        self.book.create_snapshot(depth)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn snapshot(&self, depth: usize) -> Result<OrderBookSnapshot> {
+        Ok(self.book.create_snapshot(depth)?)
     }
 
     /// Returns the total bid depth (sum of all bid quantities).
-    #[must_use]
-    pub fn total_bid_depth(&self) -> u64 {
-        self.book.total_depth_at_levels(usize::MAX, Side::Buy)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn total_bid_depth(&self) -> Result<u64> {
+        Ok(self.book.total_depth_at_levels(usize::MAX, Side::Buy)?)
     }
 
     /// Returns the total ask depth (sum of all ask quantities).
-    #[must_use]
-    pub fn total_ask_depth(&self) -> u64 {
-        self.book.total_depth_at_levels(usize::MAX, Side::Sell)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn total_ask_depth(&self) -> Result<u64> {
+        Ok(self.book.total_depth_at_levels(usize::MAX, Side::Sell)?)
     }
 
     /// Returns the number of bid price levels.
@@ -2443,23 +2481,35 @@ impl OptionOrderBook {
     /// # Arguments
     ///
     /// * `levels` - Number of price levels to consider
-    #[must_use]
-    pub fn imbalance(&self, levels: usize) -> f64 {
-        self.book.order_book_imbalance(levels)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn imbalance(&self, levels: usize) -> Result<f64> {
+        Ok(self.book.order_book_imbalance(levels)?)
     }
 
     /// Returns depth at a specific price level on the bid side.
-    #[must_use]
-    pub fn bid_depth_at_price(&self, price: u128) -> u64 {
-        let (bid_volumes, _) = self.book.get_volume_by_price();
-        bid_volumes.get(&price).copied().unwrap_or(0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn bid_depth_at_price(&self, price: u128) -> Result<u64> {
+        let (bid_volumes, _) = self.book.get_volume_by_price()?;
+        Ok(bid_volumes.get(&price).copied().unwrap_or(0))
     }
 
     /// Returns depth at a specific price level on the ask side.
-    #[must_use]
-    pub fn ask_depth_at_price(&self, price: u128) -> u64 {
-        let (_, ask_volumes) = self.book.get_volume_by_price();
-        ask_volumes.get(&price).copied().unwrap_or(0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn ask_depth_at_price(&self, price: u128) -> Result<u64> {
+        let (_, ask_volumes) = self.book.get_volume_by_price()?;
+        Ok(ask_volumes.get(&price).copied().unwrap_or(0))
     }
 
     /// Calculates VWAP for a given quantity.
@@ -2468,21 +2518,33 @@ impl OptionOrderBook {
     ///
     /// * `quantity` - Target quantity to fill
     /// * `side` - Side to calculate VWAP for
-    #[must_use]
-    pub fn vwap(&self, quantity: u64, side: Side) -> Option<f64> {
-        self.book.vwap(quantity, side)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn vwap(&self, quantity: u64, side: Side) -> Result<Option<f64>> {
+        Ok(self.book.vwap(quantity, side)?)
     }
 
     /// Returns the micro price (weighted by volume at best bid/ask).
-    #[must_use]
-    pub fn micro_price(&self) -> Option<f64> {
-        self.book.micro_price()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn micro_price(&self) -> Result<Option<f64>> {
+        Ok(self.book.micro_price()?)
     }
 
     /// Calculates market impact for a hypothetical order.
-    #[must_use]
-    pub fn market_impact(&self, quantity: u64, side: Side) -> orderbook_rs::MarketImpact {
-        self.book.market_impact(quantity, side)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookEngine`] if the engine read fails (a level
+    /// whose quantity or aggregate overflows).
+    pub fn market_impact(&self, quantity: u64, side: Side) -> Result<orderbook_rs::MarketImpact> {
+        Ok(self.book.market_impact(quantity, side)?)
     }
 }
 
@@ -2504,10 +2566,14 @@ mod tests {
     fn test_add_limit_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -2528,7 +2594,7 @@ mod tests {
         // OrderBookError::DuplicateOrderId; the wrapper must propagate it as
         // Error::OrderBookEngine with the upstream source chain intact (rather
         // than flattening it to a string and dropping the typed cause).
-        let order_id = OrderId::new();
+        let order_id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(order_id, Side::Buy, 100, 10)
             .expect("first add should succeed");
 
@@ -2558,14 +2624,18 @@ mod tests {
     fn test_best_quote() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
-        let quote = book.best_quote();
+        let quote = book.best_quote().expect("best quote");
 
         assert_eq!(quote.bid_price(), Some(Price::new(100)));
         assert_eq!(quote.bid_size(), Quantity::new(10));
@@ -2582,21 +2652,21 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
         // Two orders at the best bid (100), one deeper bid (99).
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add bid");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 7)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 7)
             .expect("add bid");
-        book.add_limit_order(OrderId::new(), Side::Buy, 99, 100)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 99, 100)
             .expect("add deep bid");
         // Two orders at the best ask (101), one deeper ask (102).
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
             .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 3)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 3)
             .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Sell, 102, 100)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 102, 100)
             .expect("add deep ask");
 
-        let quote = book.best_quote();
+        let quote = book.best_quote().expect("best quote");
         assert_eq!(quote.bid_price(), Some(Price::new(100)));
         assert_eq!(quote.bid_size(), Quantity::new(17)); // 10 + 7, deeper 99 excluded
         assert_eq!(quote.ask_price(), Some(Price::new(101)));
@@ -2610,9 +2680,9 @@ mod tests {
         // Bid-only book: ask side must be None/zero, not two-sided.
         let bid_only = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         bid_only
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add bid");
-        let q = bid_only.best_quote();
+        let q = bid_only.best_quote().expect("best quote");
         assert_eq!(q.bid_price(), Some(Price::new(100)));
         assert_eq!(q.bid_size(), Quantity::new(10));
         assert_eq!(q.ask_price(), None);
@@ -2623,9 +2693,9 @@ mod tests {
         // Ask-only book: bid side must be None/zero, not two-sided.
         let ask_only = OptionOrderBook::new("BTC-20240329-50000-P", OptionStyle::Put);
         ask_only
-            .add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
             .expect("add ask");
-        let q = ask_only.best_quote();
+        let q = ask_only.best_quote().expect("best quote");
         assert_eq!(q.bid_price(), None);
         assert_eq!(q.bid_size(), Quantity::ZERO);
         assert_eq!(q.ask_price(), Some(Price::new(105)));
@@ -2635,7 +2705,7 @@ mod tests {
 
         // Empty book: neither side, not two-sided.
         let empty = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let q = empty.best_quote();
+        let q = empty.best_quote().expect("best quote");
         assert!(q.is_empty());
         assert!(!q.is_two_sided());
         assert!(!empty.has_both_sides());
@@ -2648,10 +2718,10 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(!book.is_trade_capture_armed());
 
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add ask");
         // Crossing buy matches the resting ask.
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add crossing buy");
         assert!(
             book.last_trade_result().is_none(),
@@ -2661,9 +2731,9 @@ mod tests {
         // Arming makes the plain path populate the capture.
         book.arm_trade_capture(true);
         assert!(book.is_trade_capture_armed());
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 4)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 4)
             .expect("add ask");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 4)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 4)
             .expect("add crossing buy");
         assert!(
             book.last_trade_result().is_some(),
@@ -2680,9 +2750,9 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(!book.is_trade_capture_armed());
 
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add ask");
-        let taker = OrderId::new();
+        let taker = OrderId::from_uuid(Uuid::new_v4());
         let result = book
             .add_limit_order_full(taker, Side::Buy, 100, 10)
             .expect("full buy");
@@ -2726,7 +2796,7 @@ mod tests {
 
         // One resting sell per aggressive buy.
         for _ in 0..THREADS {
-            book.add_limit_order(OrderId::new(), Side::Sell, PRICE, QTY)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, PRICE, QTY)
                 .expect("seed resting sell");
         }
 
@@ -2736,7 +2806,7 @@ mod tests {
             let book = Arc::clone(&book);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                let my_id = OrderId::new();
+                let my_id = OrderId::from_uuid(Uuid::new_v4());
                 // Release all submissions as close to simultaneously as possible
                 // to maximize contention on the shared book.
                 barrier.wait();
@@ -2776,10 +2846,14 @@ mod tests {
     fn test_mid_price_and_spread() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -2791,7 +2865,7 @@ mod tests {
     fn test_cancel_order() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        let order_id = OrderId::new();
+        let order_id = OrderId::from_uuid(Uuid::new_v4());
         if let Err(err) = book.add_limit_order(order_id, Side::Buy, 100, 10) {
             panic!("add order failed: {}", err);
         }
@@ -2812,7 +2886,7 @@ mod tests {
         // Cancelling an order that was never added must report `false`, not a
         // false `true`. (Regression: the wrapper used to map every Ok(_) to
         // Ok(true), so a no-op cancel falsely reported success.)
-        match book.cancel_order(OrderId::new()) {
+        match book.cancel_order(OrderId::from_uuid(Uuid::new_v4())) {
             Ok(found) => assert!(!found, "cancel of a non-existent order must be false"),
             Err(err) => panic!("cancel of a non-existent order must not error: {}", err),
         }
@@ -2823,7 +2897,7 @@ mod tests {
     fn test_cancel_order_already_cancelled_returns_false() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        let order_id = OrderId::new();
+        let order_id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(order_id, Side::Buy, 100, 10)
             .expect("add order should succeed");
         assert!(book.cancel_order(order_id).expect("first cancel"));
@@ -2840,10 +2914,14 @@ mod tests {
     fn test_cancel_all_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -2860,10 +2938,14 @@ mod tests {
     fn test_cancel_by_side() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -2884,12 +2966,22 @@ mod tests {
         let user_a = Hash32::from([1u8; 32]);
         let user_b = Hash32::from([2u8; 32]);
 
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 101, 5, user_b)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            101,
+            5,
+            user_b,
+        ) {
             panic!("add order failed: {}", err);
         }
 
@@ -2912,9 +3004,9 @@ mod tests {
     #[test]
     fn test_evict_expired_orders_evicts_gtd_and_leaves_unexpired_and_gtc() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let expired = OrderId::new();
-        let later = OrderId::new();
-        let gtc = OrderId::new();
+        let expired = OrderId::from_uuid(Uuid::new_v4());
+        let later = OrderId::from_uuid(Uuid::new_v4());
+        let gtc = OrderId::from_uuid(Uuid::new_v4());
 
         if let Err(err) = book.add_limit_order_with_tif(
             expired,
@@ -2937,13 +3029,16 @@ mod tests {
         // One millisecond before the earliest deadline nothing is expired.
         assert!(
             book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED - 1))
+                .expect("sweep")
                 .is_empty()
         );
         assert_eq!(book.order_count(), 3);
 
         // At the deadline only the matching GTD order is swept (inclusive
         // boundary); the later GTD and the GTC order are untouched.
-        let evicted = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("sweep");
         assert_eq!(evicted, vec![expired]);
         assert_eq!(book.order_count(), 2);
         assert_eq!(book.get_order_status(later), Some(OrderStatus::Open));
@@ -2953,7 +3048,7 @@ mod tests {
     #[test]
     fn test_evict_expired_orders_is_idempotent() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let expired = OrderId::new();
+        let expired = OrderId::from_uuid(Uuid::new_v4());
         if let Err(err) = book.add_limit_order_with_tif(
             expired,
             Side::Buy,
@@ -2964,11 +3059,15 @@ mod tests {
             panic!("add order failed: {}", err);
         }
 
-        let first = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        let first = book
+            .evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("sweep");
         assert_eq!(first, vec![expired]);
 
         // A second sweep at the same instant evicts nothing: the order is gone.
-        let second = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        let second = book
+            .evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("sweep");
         assert!(second.is_empty());
     }
 
@@ -2977,6 +3076,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(
             book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+                .expect("sweep")
                 .is_empty()
         );
     }
@@ -2984,9 +3084,9 @@ mod tests {
     #[test]
     fn test_evict_expired_orders_deterministic_order() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let bid_low = OrderId::new();
-        let bid_high = OrderId::new();
-        let ask = OrderId::new();
+        let bid_low = OrderId::from_uuid(Uuid::new_v4());
+        let bid_high = OrderId::from_uuid(Uuid::new_v4());
+        let ask = OrderId::from_uuid(Uuid::new_v4());
 
         // Add out of the documented order to prove the sweep, not insertion,
         // dictates the result order: bids ascending price, then asks.
@@ -3010,7 +3110,9 @@ mod tests {
             panic!("add order failed: {}", err);
         }
 
-        let evicted = book.evict_expired_orders(TimestampMs::new(GTD_EXPIRED));
+        let evicted = book
+            .evict_expired_orders(TimestampMs::new(GTD_EXPIRED))
+            .expect("sweep");
         // Bids ascending price (99 then 100), then asks.
         assert_eq!(evicted, vec![bid_low, bid_high, ask]);
     }
@@ -3019,18 +3121,24 @@ mod tests {
     fn test_total_depth() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 99, 20) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 99, 20)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
-        assert_eq!(book.total_bid_depth(), 30);
-        assert_eq!(book.total_ask_depth(), 5);
+        assert_eq!(book.total_bid_depth().expect("bid depth"), 30);
+        assert_eq!(book.total_ask_depth().expect("ask depth"), 5);
     }
 
     #[test]
@@ -3047,15 +3155,19 @@ mod tests {
     fn test_imbalance() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 60) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 60)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 40) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 101, 40)
+        {
             panic!("add order failed: {}", err);
         }
 
         // Imbalance = (60 - 40) / (60 + 40) = 0.2
-        let imbalance = book.imbalance(5);
+        let imbalance = book.imbalance(5).expect("imbalance");
         assert!((imbalance - 0.2).abs() < 0.01);
     }
 
@@ -3077,9 +3189,13 @@ mod tests {
     fn test_add_limit_order_with_tif() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) =
-            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
-        {
+        if let Err(err) = book.add_limit_order_with_tif(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+        ) {
             panic!("add order failed: {}", err);
         }
 
@@ -3093,10 +3209,14 @@ mod tests {
         assert!(book.best_bid().is_none());
         assert!(book.best_ask().is_none());
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -3108,10 +3228,14 @@ mod tests {
     fn test_spread_bps() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 102, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 102, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -3123,14 +3247,18 @@ mod tests {
     fn test_snapshot() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
-        let snapshot = book.snapshot(5);
+        let snapshot = book.snapshot(5).expect("snapshot");
         assert_eq!(snapshot.bids.len(), 1);
         assert_eq!(snapshot.asks.len(), 1);
     }
@@ -3139,10 +3267,14 @@ mod tests {
     fn test_clear() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
@@ -3154,8 +3286,8 @@ mod tests {
     #[test]
     fn test_clear_transitions_orders_to_cancelled_terminal() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id1 = OrderId::new();
-        let id2 = OrderId::new();
+        let id1 = OrderId::from_uuid(Uuid::new_v4());
+        let id2 = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id1, Side::Buy, 100, 10)
             .expect("add bid");
         book.add_limit_order(id2, Side::Sell, 105, 5)
@@ -3183,37 +3315,47 @@ mod tests {
     fn test_depth_at_price() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
+        {
             panic!("add order failed: {}", err);
         }
 
-        assert_eq!(book.bid_depth_at_price(100), 10);
-        assert_eq!(book.bid_depth_at_price(99), 0);
-        assert_eq!(book.ask_depth_at_price(105), 5);
-        assert_eq!(book.ask_depth_at_price(106), 0);
+        assert_eq!(book.bid_depth_at_price(100).expect("bid depth"), 10);
+        assert_eq!(book.bid_depth_at_price(99).expect("bid depth"), 0);
+        assert_eq!(book.ask_depth_at_price(105).expect("ask depth"), 5);
+        assert_eq!(book.ask_depth_at_price(106).expect("ask depth"), 0);
     }
 
     #[test]
     fn test_vwap() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 99, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 99, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 10)
+        {
             panic!("add order failed: {}", err);
         }
 
-        let vwap_sell = book.vwap(5, Side::Sell);
+        let vwap_sell = book.vwap(5, Side::Sell).expect("vwap");
         assert!(vwap_sell.is_some());
 
-        let vwap_buy = book.vwap(5, Side::Buy);
+        let vwap_buy = book.vwap(5, Side::Buy).expect("vwap");
         assert!(vwap_buy.is_some());
     }
 
@@ -3221,14 +3363,18 @@ mod tests {
     fn test_micro_price() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 102, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 102, 10)
+        {
             panic!("add order failed: {}", err);
         }
 
-        let micro = book.micro_price();
+        let micro = book.micro_price().expect("micro price");
         assert!(micro.is_some());
     }
 
@@ -3236,14 +3382,18 @@ mod tests {
     fn test_market_impact() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 10)
+        {
             panic!("add order failed: {}", err);
         }
 
-        let impact = book.market_impact(5, Side::Buy);
+        let impact = book.market_impact(5, Side::Buy).expect("market impact");
         // avg_price is f64, just verify it's a valid number
         assert!(impact.avg_price >= 0.0 || impact.avg_price < 0.0);
     }
@@ -3259,13 +3409,13 @@ mod tests {
 
         // Valid price (multiple of 100)
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 200, 10)
                 .is_ok()
         );
 
         // Invalid price (not a multiple of 100)
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 10)
                 .is_err()
         );
     }
@@ -3281,13 +3431,13 @@ mod tests {
 
         // Valid quantity (multiple of 10)
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 20)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 20)
                 .is_ok()
         );
 
         // Invalid quantity (not a multiple of 10)
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 15)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 15)
                 .is_err()
         );
     }
@@ -3305,19 +3455,19 @@ mod tests {
 
         // Valid quantity (within range)
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 50)
                 .is_ok()
         );
 
         // Too small
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 2)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 2)
                 .is_err()
         );
 
         // Too large
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 200)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 200)
                 .is_err()
         );
     }
@@ -3346,11 +3496,11 @@ mod tests {
 
         // Any price/quantity should work
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1, 1)
                 .is_ok()
         );
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 150, 7)
                 .is_ok()
         );
     }
@@ -3366,7 +3516,7 @@ mod tests {
 
         // Empty config = no validation = anything goes
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1, 1)
                 .is_ok()
         );
     }
@@ -3671,8 +3821,8 @@ mod tests {
     fn test_expire_sets_expired_and_clears() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        let id1 = OrderId::new();
-        let id2 = OrderId::new();
+        let id1 = OrderId::from_uuid(Uuid::new_v4());
+        let id2 = OrderId::from_uuid(Uuid::new_v4());
         if let Err(err) = book.add_limit_order(id1, Side::Buy, 100, 10) {
             panic!("add order failed: {}", err);
         }
@@ -3700,8 +3850,8 @@ mod tests {
     #[test]
     fn test_expire_transitions_orders_to_cancelled_and_rejects_new_adds() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id1 = OrderId::new();
-        let id2 = OrderId::new();
+        let id1 = OrderId::from_uuid(Uuid::new_v4());
+        let id2 = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id1, Side::Buy, 100, 10)
             .expect("add bid");
         book.add_limit_order(id2, Side::Sell, 105, 5)
@@ -3725,7 +3875,7 @@ mod tests {
 
         // Instrument is now Expired and must reject new flow.
         assert_eq!(book.status(), InstrumentStatus::Expired);
-        let rejected = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1);
+        let rejected = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 1);
         let err = match rejected {
             Ok(()) => panic!("expected InstrumentNotActive error"),
             Err(e) => e,
@@ -3739,7 +3889,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("Active -> Halted is legal");
 
-        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        let result = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10);
         assert!(result.is_err());
         let err = match result {
             Ok(_) => panic!("expected error but got Ok"),
@@ -3757,7 +3907,7 @@ mod tests {
         // setter to exercise the order-rejection path.
         book.store_status(InstrumentStatus::Pending);
 
-        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        let result = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10);
         assert!(result.is_err());
         let err = match result {
             Ok(_) => panic!("expected error but got Ok"),
@@ -3772,7 +3922,7 @@ mod tests {
         book.set_status(InstrumentStatus::Settling)
             .expect("Active -> Settling is legal");
 
-        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        let result = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10);
         assert!(result.is_err());
         let err = match result {
             Ok(_) => panic!("expected error but got Ok"),
@@ -3787,7 +3937,7 @@ mod tests {
         book.set_status(InstrumentStatus::Expired)
             .expect("Active -> Expired is legal");
 
-        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        let result = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10);
         assert!(result.is_err());
         let err = match result {
             Ok(_) => panic!("expected error but got Ok"),
@@ -3801,8 +3951,13 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("Active -> Halted is legal");
 
-        let result =
-            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc);
+        let result = book.add_limit_order_with_tif(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+        );
         assert!(result.is_err());
         let err = match result {
             Ok(_) => panic!("expected error but got Ok"),
@@ -3817,13 +3972,13 @@ mod tests {
 
         book.halt().expect("Active -> Halted is legal");
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .is_err()
         );
 
         book.resume().expect("Halted -> Active is legal (resume)");
         assert!(
-            book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .is_ok()
         );
     }
@@ -3832,7 +3987,9 @@ mod tests {
     fn test_halt_preserves_existing_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
         assert_eq!(book.order_count(), 1);
@@ -3847,7 +4004,7 @@ mod tests {
     fn test_cancel_works_when_halted() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        let oid = OrderId::new();
+        let oid = OrderId::from_uuid(Uuid::new_v4());
         if let Err(err) = book.add_limit_order(oid, Side::Buy, 100, 10) {
             panic!("add order failed: {}", err);
         }
@@ -4007,7 +4164,7 @@ mod tests {
                 },
             );
             let admitted = with_clock.add_limit_order_with_tif_and_user(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 100,
                 10,
@@ -4029,7 +4186,7 @@ mod tests {
                 },
             );
             let rejected = without_clock.add_limit_order_with_tif_and_user(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 100,
                 10,
@@ -4048,7 +4205,13 @@ mod tests {
     fn test_add_limit_order_with_user() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let user = Hash32::from([1u8; 32]);
-        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        let result = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        );
         assert!(result.is_ok());
         assert_eq!(book.order_count(), 1);
     }
@@ -4058,7 +4221,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let user = Hash32::from([2u8; 32]);
         let result = book.add_limit_order_with_tif_and_user(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Sell,
             200,
             5,
@@ -4079,14 +4242,25 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            100,
+            10,
+            user,
+        ) {
             panic!("add order failed: {}", err);
         }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — STP triggers, returns error
-        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        let result = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        );
         assert!(result.is_err());
         // Maker (sell) should still be there
         assert_eq!(book.order_count(), 1);
@@ -4103,14 +4277,25 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            100,
+            10,
+            user,
+        ) {
             panic!("add order failed: {}", err);
         }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — maker cancelled, taker rests
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user) {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        ) {
             panic!("add order failed: {}", err);
         }
         // Taker (buy) should now be resting, maker (sell) was cancelled
@@ -4128,14 +4313,25 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            100,
+            10,
+            user,
+        ) {
             panic!("add order failed: {}", err);
         }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — STP triggers, returns error
-        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        let result = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        );
         assert!(result.is_err());
     }
 
@@ -4150,15 +4346,24 @@ mod tests {
         let user_b = Hash32::from([2u8; 32]);
 
         // User A sells
-        if let Err(err) =
-            book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user_a)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            100,
+            10,
+            user_a,
+        ) {
             panic!("add order failed: {}", err);
         }
 
         // User B buys — should trade normally
-        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_b)
-        {
+        if let Err(err) = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_b,
+        ) {
             panic!("add order failed: {}", err);
         }
         // Both matched and removed
@@ -4170,7 +4375,13 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("Active -> Halted is legal");
         let user = Hash32::from([1u8; 32]);
-        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        let result = book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        );
         assert!(result.is_err());
     }
 
@@ -4244,10 +4455,12 @@ mod tests {
             },
         );
         // Single order, no match — returns empty TradeResult
-        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
-            Ok(r) => r,
-            Err(err) => panic!("add order failed: {}", err),
-        };
+        let result =
+            match book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+            {
+                Ok(r) => r,
+                Err(err) => panic!("add order failed: {}", err),
+            };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
@@ -4265,15 +4478,19 @@ mod tests {
             },
         );
         // Place a resting sell order
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
 
         // Aggressive buy matches the sell — trade occurs, fees calculated
-        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
-            Ok(r) => r,
-            Err(err) => panic!("add order failed: {}", err),
-        };
+        let result =
+            match book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+            {
+                Ok(r) => r,
+                Err(err) => panic!("add order failed: {}", err),
+            };
 
         // Taker fee: notional * taker_bps / 10_000 = (100 * 10) * 5 / 10_000 = 0
         // For small notionals, fees may round to zero. Just verify the fields exist
@@ -4287,14 +4504,18 @@ mod tests {
     fn test_add_limit_order_full_zero_fees_by_default() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Place a resting sell
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
         // Aggressive buy with _full — no fee schedule, so zero fees
-        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
-            Ok(r) => r,
-            Err(err) => panic!("add order failed: {}", err),
-        };
+        let result =
+            match book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+            {
+                Ok(r) => r,
+                Err(err) => panic!("add order failed: {}", err),
+            };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
     }
@@ -4311,7 +4532,7 @@ mod tests {
             },
         );
         let result = match book.add_limit_order_with_tif_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             10,
@@ -4336,11 +4557,16 @@ mod tests {
             },
         );
         let user = Hash32::from([1u8; 32]);
-        let result =
-            match book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, 100, 10, user) {
-                Ok(r) => r,
-                Err(err) => panic!("add order failed: {}", err),
-            };
+        let result = match book.add_limit_order_with_user_full(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user,
+        ) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
     }
@@ -4357,7 +4583,7 @@ mod tests {
         );
         let user = Hash32::from([1u8; 32]);
         let result = match book.add_limit_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Sell,
             200,
             5,
@@ -4383,11 +4609,15 @@ mod tests {
         // Capture is disarmed by default; arm it so the plain order path records
         // the trade into last_trade_result.
         book.arm_trade_capture(true);
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
         // Trigger a match
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
         // last_trade_result should now be populated
@@ -4399,7 +4629,8 @@ mod tests {
     fn test_full_method_rejected_when_halted() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("Active -> Halted is legal");
-        let result = book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10);
+        let result =
+            book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10);
         assert!(result.is_err());
     }
 
@@ -4408,13 +4639,17 @@ mod tests {
         // Verifies that existing code path without fee schedule still works
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(book.fee_schedule().is_none());
-        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+        if let Err(err) =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
+        {
             panic!("add order failed: {}", err);
         }
-        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
-            Ok(r) => r,
-            Err(err) => panic!("add order failed: {}", err),
-        };
+        let result =
+            match book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
+            {
+                Ok(r) => r,
+                Err(err) => panic!("add order failed: {}", err),
+            };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
     }
@@ -4424,7 +4659,7 @@ mod tests {
     #[test]
     fn test_get_order_status_returns_open_for_resting_order() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add order");
         let status = book.get_order_status(id);
@@ -4435,8 +4670,8 @@ mod tests {
     #[test]
     fn test_get_order_status_returns_filled_after_full_match() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let maker_id = OrderId::new();
-        let taker_id = OrderId::new();
+        let maker_id = OrderId::from_uuid(Uuid::new_v4());
+        let taker_id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(maker_id, Side::Sell, 100, 10)
             .expect("add maker");
         book.add_limit_order(taker_id, Side::Buy, 100, 10)
@@ -4449,7 +4684,7 @@ mod tests {
     #[test]
     fn test_get_order_history_returns_transitions() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add order");
         let history = book.get_order_history(id);
@@ -4464,10 +4699,10 @@ mod tests {
     fn test_active_order_count_tracks_resting_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert_eq!(book.active_order_count(), 0);
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add order");
         assert_eq!(book.active_order_count(), 1);
-        book.add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 110, 5)
             .expect("add order");
         assert_eq!(book.active_order_count(), 2);
     }
@@ -4477,9 +4712,9 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert_eq!(book.terminal_order_count(), 0);
         // Add and match orders
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add maker");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add taker");
         // Both should be filled (terminal)
         assert_eq!(book.terminal_order_count(), 2);
@@ -4488,9 +4723,9 @@ mod tests {
     #[test]
     fn test_terminal_order_summary_counts_filled() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add maker");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add taker");
         let summary = book.terminal_order_summary();
         assert_eq!(summary.filled, 2);
@@ -4501,7 +4736,7 @@ mod tests {
     #[test]
     fn test_terminal_order_summary_counts_cancelled() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add order");
         book.cancel_order(id).expect("cancel");
@@ -4516,12 +4751,30 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let user_a = Hash32::from([1u8; 32]);
         let user_b = Hash32::from([2u8; 32]);
-        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
-            .expect("add a1");
-        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 99, 5, user_a)
-            .expect("add a2");
-        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 10, user_b)
-            .expect("add b1");
+        book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            100,
+            10,
+            user_a,
+        )
+        .expect("add a1");
+        book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Buy,
+            99,
+            5,
+            user_a,
+        )
+        .expect("add a2");
+        book.add_limit_order_with_user(
+            OrderId::from_uuid(Uuid::new_v4()),
+            Side::Sell,
+            110,
+            10,
+            user_b,
+        )
+        .expect("add b1");
         let a_orders = book.orders_by_user(user_a);
         assert_eq!(a_orders.len(), 2);
         let b_orders = book.orders_by_user(user_b);
@@ -4535,9 +4788,9 @@ mod tests {
 
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Add and match to create terminal states
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("add maker");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("add taker");
         assert_eq!(book.terminal_order_count(), 2);
 
@@ -4558,7 +4811,7 @@ mod tests {
                 ..BookConfig::default()
             },
         );
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add order");
         // Status should be None when tracking disabled
@@ -4628,9 +4881,9 @@ mod tests {
         book.arm_trade_capture(true);
 
         // Rest a sell, then cross it with a marketable buy to force a trade.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 5)
             .expect("rest sell");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .expect("cross buy");
 
         // The NATS trade listener fired on the match, carrying the subject.
@@ -4681,31 +4934,49 @@ mod tests {
         // Every add entry point must apply the crate-side bound. Normalize each
         // return type to `Result<()>` so the eight paths can be checked uniformly.
         let results: Vec<Result<()>> = vec![
-            book.add_limit_order(OrderId::new(), Side::Buy, ABOVE, 10),
-            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, ABOVE, 10, TimeInForce::Gtc),
-            book.add_limit_order_with_user(OrderId::new(), Side::Buy, ABOVE, 10, user),
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, ABOVE, 10),
+            book.add_limit_order_with_tif(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                ABOVE,
+                10,
+                TimeInForce::Gtc,
+            ),
+            book.add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                ABOVE,
+                10,
+                user,
+            ),
             book.add_limit_order_with_tif_and_user(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 ABOVE,
                 10,
                 TimeInForce::Gtc,
                 user,
             ),
-            book.add_limit_order_full(OrderId::new(), Side::Buy, ABOVE, 10)
+            book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, ABOVE, 10)
                 .map(|_| ()),
             book.add_limit_order_with_tif_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 ABOVE,
                 10,
                 TimeInForce::Gtc,
             )
             .map(|_| ()),
-            book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, ABOVE, 10, user)
-                .map(|_| ()),
+            book.add_limit_order_with_user_full(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                ABOVE,
+                10,
+                user,
+            )
+            .map(|_| ()),
             book.add_limit_order_with_tif_and_user_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 ABOVE,
                 10,
@@ -4731,7 +5002,7 @@ mod tests {
         const BOUND: u128 = 1_000;
         let book = max_price_book(BOUND);
         // The bound is inclusive: a price exactly at the bound is accepted.
-        let res = book.add_limit_order(OrderId::new(), Side::Buy, BOUND, 10);
+        let res = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, BOUND, 10);
         assert!(res.is_ok(), "price at the bound must be accepted: {res:?}");
         assert_eq!(book.order_count(), 1);
     }
@@ -4741,7 +5012,8 @@ mod tests {
         // No max_price configured: even an extreme price is admitted (subject to
         // the engine's own checks, of which there are none here).
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let res = book.add_limit_order(OrderId::new(), Side::Buy, u128::MAX, 10);
+        let res =
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, u128::MAX, 10);
         assert!(
             res.is_ok(),
             "no bound means no crate-side price rejection: {res:?}"
@@ -4810,31 +5082,49 @@ mod tests {
         // Every add entry point must apply the lower band bound. Normalize each
         // return type to `Result<()>` so the eight paths check uniformly.
         let results: Vec<Result<()>> = vec![
-            book.add_limit_order(OrderId::new(), Side::Buy, BELOW, 10),
-            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, BELOW, 10, TimeInForce::Gtc),
-            book.add_limit_order_with_user(OrderId::new(), Side::Buy, BELOW, 10, user),
+            book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, BELOW, 10),
+            book.add_limit_order_with_tif(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                BELOW,
+                10,
+                TimeInForce::Gtc,
+            ),
+            book.add_limit_order_with_user(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                BELOW,
+                10,
+                user,
+            ),
             book.add_limit_order_with_tif_and_user(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 BELOW,
                 10,
                 TimeInForce::Gtc,
                 user,
             ),
-            book.add_limit_order_full(OrderId::new(), Side::Buy, BELOW, 10)
+            book.add_limit_order_full(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, BELOW, 10)
                 .map(|_| ()),
             book.add_limit_order_with_tif_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 BELOW,
                 10,
                 TimeInForce::Gtc,
             )
             .map(|_| ()),
-            book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, BELOW, 10, user)
-                .map(|_| ()),
+            book.add_limit_order_with_user_full(
+                OrderId::from_uuid(Uuid::new_v4()),
+                Side::Buy,
+                BELOW,
+                10,
+                user,
+            )
+            .map(|_| ()),
             book.add_limit_order_with_tif_and_user_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 BELOW,
                 10,
@@ -4860,9 +5150,9 @@ mod tests {
         const MAX: u128 = 5_000;
         let book = band_book(MIN, MAX);
         // Both bounds are inclusive.
-        book.add_limit_order(OrderId::new(), Side::Buy, MIN, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, MIN, 10)
             .expect("price at the lower bound must be accepted");
-        book.add_limit_order(OrderId::new(), Side::Sell, MAX, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, MAX, 10)
             .expect("price at the upper bound must be accepted");
         assert_eq!(book.order_count(), 2);
     }
@@ -4871,7 +5161,7 @@ mod tests {
     fn test_min_price_unset_never_rejects_low_price() {
         // No min_price configured (only a max): a very low price is admitted.
         let book = max_price_book(5_000);
-        let res = book.add_limit_order(OrderId::new(), Side::Buy, 1, 10);
+        let res = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1, 10);
         assert!(
             res.is_ok(),
             "no lower bound means no low-price rejection: {res:?}"
@@ -4882,7 +5172,7 @@ mod tests {
     #[test]
     fn test_price_band_within_band_accepted() {
         let book = band_book(500, 5_000);
-        let res = book.add_limit_order(OrderId::new(), Side::Buy, 1_000, 10);
+        let res = book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 1_000, 10);
         assert!(
             res.is_ok(),
             "a price inside the band must be accepted: {res:?}"
@@ -4893,7 +5183,7 @@ mod tests {
     #[test]
     fn test_min_price_enforced_on_replace_order() {
         let book = band_book(500, 5_000);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 1_000, 10)
             .expect("add within band");
         // Reprice below the lower bound: rejected crate-side, original untouched.
@@ -4934,9 +5224,9 @@ mod tests {
     fn test_take_trade_result_returns_captured_and_empties_slot() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.arm_trade_capture(true);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .expect("cross buy");
 
         let first = book.take_trade_result();
@@ -4952,9 +5242,9 @@ mod tests {
     fn test_take_trade_result_none_when_never_armed() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // A match occurs, but capture was never armed, so nothing is recorded.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .expect("cross buy");
         assert!(book.take_trade_result().is_none());
     }
@@ -4963,9 +5253,9 @@ mod tests {
     fn test_clear_trade_capture_empties_slot_without_disarming() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.arm_trade_capture(true);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .expect("cross buy");
         assert!(book.last_trade_result().is_some());
 
@@ -4987,7 +5277,10 @@ mod tests {
                 .last_trade_result
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = Some(book.empty_trade_result(OrderId::new(), 5));
+            *guard = Some(
+                book.empty_trade_result(OrderId::from_uuid(Uuid::new_v4()), 5)
+                    .expect("empty trade result"),
+            );
         }
 
         // Poison the capture lock by panicking while holding the guard.
@@ -5011,7 +5304,7 @@ mod tests {
     #[test]
     fn test_replace_order_moves_price_and_quantity_returns_true() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10).expect("add");
 
         let res = book.replace_order(id, 105, 20, Side::Buy);
@@ -5026,7 +5319,7 @@ mod tests {
     #[test]
     fn test_replace_order_unknown_id_returns_false() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let res = book.replace_order(OrderId::new(), 100, 10, Side::Buy);
+        let res = book.replace_order(OrderId::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy);
         assert!(
             matches!(res, Ok(false)),
             "unknown id must be a miss: {res:?}"
@@ -5036,7 +5329,7 @@ mod tests {
     #[test]
     fn test_replace_order_rejected_when_halted_original_untouched() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10).expect("add");
         book.halt().expect("halt");
 
@@ -5063,7 +5356,7 @@ mod tests {
                 ..BookConfig::default()
             },
         );
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add at valid tick");
 
@@ -5081,9 +5374,9 @@ mod tests {
     fn test_replace_order_to_crossing_price_rematches_and_fills_reach_listener() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Resting sell to cross into, and a resting buy well below it.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 90, 5)
             .expect("rest buy");
 
@@ -5106,7 +5399,7 @@ mod tests {
     #[test]
     fn test_replace_order_side_flip_moves_order_across_book() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add buy");
         assert_eq!(book.best_bid(), Some(100));
@@ -5123,7 +5416,7 @@ mod tests {
     #[test]
     fn test_max_price_enforced_on_replace_order() {
         let book = max_price_book(1_000);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 500, 10)
             .expect("add within bound");
 
@@ -5149,7 +5442,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Empty book: a post-only buy has nothing to cross and rests.
         let res = book.add_post_only_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             10,
@@ -5169,11 +5462,11 @@ mod tests {
     fn test_add_post_only_order_would_cross_rejected_original_book_untouched() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Seed a resting sell; a post-only buy at the same price would cross.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
 
         let res = book.add_post_only_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             5,
@@ -5197,7 +5490,7 @@ mod tests {
     #[test]
     fn test_add_post_only_order_full_returns_empty_trade_when_rested() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         let trade = book
             .add_post_only_order_with_tif_and_user_full(
                 id,
@@ -5219,7 +5512,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let trade = book
             .add_iceberg_order_with_tif_and_user_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 100,
                 3,
@@ -5236,7 +5529,7 @@ mod tests {
         assert_eq!(book.best_bid(), Some(100));
 
         // The level exposes the visible tranche and hides the reserve.
-        let snapshot = book.snapshot(8);
+        let snapshot = book.snapshot(8).expect("snapshot");
         let level = snapshot.bids.first().expect("one resting bid level");
         assert_eq!(level.visible_quantity().as_u64(), 3, "visible tranche");
         assert_eq!(level.hidden_quantity().as_u64(), 7, "hidden reserve");
@@ -5246,13 +5539,13 @@ mod tests {
     fn test_add_iceberg_order_full_crossing_returns_fills() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Resting sell to cross into.
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
 
         // Iceberg buy at the ask crosses and trades on entry (visible 3 + hidden 5).
         let trade = book
             .add_iceberg_order_with_tif_and_user_full(
-                OrderId::new(),
+                OrderId::from_uuid(Uuid::new_v4()),
                 Side::Buy,
                 100,
                 3,
@@ -5271,7 +5564,7 @@ mod tests {
     fn test_add_iceberg_order_visible_plus_hidden_overflow_rejected() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let res = book.add_iceberg_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             u64::MAX,
@@ -5292,7 +5585,7 @@ mod tests {
         // An above-band post-only is rejected by the crate-side band check before
         // the order is ever built or handed to the engine.
         let res = book.add_post_only_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             1_001,
             10,
@@ -5310,7 +5603,7 @@ mod tests {
     fn test_add_iceberg_order_out_of_band_rejected_before_engine() {
         let book = max_price_book(1_000);
         let res = book.add_iceberg_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             1_001,
             3,
@@ -5330,7 +5623,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("halt");
         let res = book.add_post_only_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             10,
@@ -5349,7 +5642,7 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         book.halt().expect("halt");
         let res = book.add_iceberg_order_with_tif_and_user_full(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             3,
@@ -5370,7 +5663,7 @@ mod tests {
         // The non-`_full` convenience delegates to the `_full` method and drops
         // the result; a resting post-only still succeeds and rests.
         let res = book.add_post_only_order_with_tif_and_user(
-            OrderId::new(),
+            OrderId::from_uuid(Uuid::new_v4()),
             Side::Buy,
             100,
             10,
@@ -5387,9 +5680,9 @@ mod tests {
     #[test]
     fn test_replace_order_full_rematch_returns_own_fills() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 90, 5)
             .expect("rest buy");
 
@@ -5405,7 +5698,7 @@ mod tests {
     #[test]
     fn test_replace_order_full_no_cross_returns_none_trade() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("rest buy");
 
@@ -5422,7 +5715,7 @@ mod tests {
     fn test_replace_order_full_unknown_id_returns_false_none() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         let (replaced, trade) = book
-            .replace_order_full(OrderId::new(), 100, 10, Side::Buy)
+            .replace_order_full(OrderId::from_uuid(Uuid::new_v4()), 100, 10, Side::Buy)
             .expect("replace");
         assert!(!replaced);
         assert!(trade.is_none());
@@ -5438,7 +5731,7 @@ mod tests {
                 ..BookConfig::default()
             },
         );
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 100, 10)
             .expect("add at valid tick");
 
@@ -5461,9 +5754,9 @@ mod tests {
     #[test]
     fn test_replace_order_full_does_not_disturb_continuous_capture() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 10)
             .expect("rest sell");
-        let id = OrderId::new();
+        let id = OrderId::from_uuid(Uuid::new_v4());
         book.add_limit_order(id, Side::Buy, 90, 5)
             .expect("rest buy");
 
@@ -5483,9 +5776,9 @@ mod tests {
 
         // Continuous capture still works normally afterward.
         book.arm_trade_capture(true);
-        book.add_limit_order(OrderId::new(), Side::Sell, 95, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 95, 5)
             .expect("rest sell");
-        book.add_limit_order(OrderId::new(), Side::Buy, 95, 5)
+        book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 95, 5)
             .expect("cross");
         assert!(
             book.take_trade_result().is_some(),

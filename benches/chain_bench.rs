@@ -4,6 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use option_chain_orderbook::orderbook::{OptionChainOrderBook, OptionChainOrderBookManager};
 use optionstratlib::prelude::{ExpirationDate, Positive, pos_or_panic};
 use orderbook_rs::{OrderId, Side};
+use uuid::Uuid;
 
 /// Creates a test expiration date.
 fn test_expiration() -> ExpirationDate {
@@ -60,10 +61,10 @@ pub fn chain_orderbook_operations(c: &mut Criterion) {
         for strike in (40000..60000).step_by(1000) {
             let s = chain.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
             s.put()
-                .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 50, 10)
                 .unwrap();
         }
         b.iter(|| chain.total_order_count());
@@ -84,7 +85,7 @@ pub fn chain_orderbook_operations(c: &mut Criterion) {
         for strike in (40000..60000).step_by(1000) {
             let s = chain.get_or_create_strike(strike);
             s.call()
-                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                 .unwrap();
         }
         b.iter(|| chain.stats());
@@ -102,10 +103,10 @@ pub fn chain_orderbook_operations(c: &mut Criterion) {
                 for strike in (10000..60000).step_by(100) {
                     let s = chain.get_or_create_strike(strike);
                     s.call()
-                        .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                         .unwrap();
                     s.put()
-                        .add_limit_order(OrderId::new(), Side::Sell, 50, 10)
+                        .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 50, 10)
                         .unwrap();
                 }
                 chain
@@ -163,7 +164,7 @@ pub fn chain_manager_operations(c: &mut Criterion) {
             for strike in (40000..60000).step_by(5000) {
                 let s = chain.get_or_create_strike(strike);
                 s.call()
-                    .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                    .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                     .unwrap();
             }
         }
@@ -208,7 +209,7 @@ pub fn chain_manager_scaling(c: &mut Criterion) {
                     for strike in (40000..60000).step_by(5000) {
                         let s = chain.get_or_create_strike(strike);
                         s.call()
-                            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
                             .unwrap();
                     }
                 }

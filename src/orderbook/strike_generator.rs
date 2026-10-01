@@ -509,6 +509,7 @@ mod tests {
     use super::*;
     use optionstratlib::prelude::{ExpirationDate, Positive};
     use orderbook_rs::{OrderId, Side};
+    use uuid::Uuid;
 
     fn test_expiration() -> ExpirationDate {
         ExpirationDate::Days(Positive::THIRTY)
@@ -861,7 +862,7 @@ mod tests {
         let strike_45k = chain.get_strike(45000).expect("strike exists");
         strike_45k
             .call()
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
             .expect("order added");
 
         // Move spot to 70000 — all old strikes outside range

@@ -454,10 +454,21 @@ impl NatsPublisherHandles {
 
     /// Gracefully shuts down both publishers, draining and awaiting their
     /// background batch tasks. Provides the cancellation/await path required of
-    /// every spawned task in this crate.
-    pub async fn shutdown(&self) {
-        self.trade_handle.shutdown().await;
-        self.book_handle.shutdown().await;
+    /// every spawned task in this crate. Both publishers are always shut down,
+    /// even when the first one fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OrderBookError`](crate::Error::OrderBookError) if
+    /// either publisher's background task did not finish cleanly (panicked,
+    /// was cancelled or timed out); the trade publisher's error wins when
+    /// both fail.
+    pub async fn shutdown(&self) -> crate::error::Result<()> {
+        let trade = self.trade_handle.shutdown().await;
+        let book = self.book_handle.shutdown().await;
+        trade
+            .and(book)
+            .map_err(|err| crate::Error::orderbook(err.to_string()))
     }
 }
 
@@ -676,6 +687,7 @@ pub fn build_underlying_manager_with_nats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn test_subject_builder_from_symbol() {
@@ -993,9 +1005,9 @@ mod tests {
             .trade_subject(prefix);
 
         // Rest a sell, then cross it with a marketable buy to force a trade.
-        call.add_limit_order(OrderId::new(), Side::Sell, 100, 5)
+        call.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 100, 5)
             .expect("rest sell");
-        call.add_limit_order(OrderId::new(), Side::Buy, 100, 5)
+        call.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 5)
             .expect("cross buy");
 
         let guard = captured.lock().unwrap_or_else(|p| p.into_inner());

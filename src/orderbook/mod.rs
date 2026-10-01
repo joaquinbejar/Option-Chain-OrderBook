@@ -31,6 +31,7 @@
 //! ## Example
 //!
 //! ```rust
+//! use option_chain_orderbook::Uuid;
 //! use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 //! use option_chain_orderbook::{OrderId, Side};
 //! use optionstratlib::ExpirationDate;
@@ -44,13 +45,13 @@
 //! let strike = exp.get_or_create_strike(50_000);
 //!
 //! // Add a two-sided market to the call book.
-//! strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+//! strike.call().add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
 //!     .expect("add bid should succeed");
-//! strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+//! strike.call().add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
 //!     .expect("add ask should succeed");
 //!
 //! // Read the best quote.
-//! let quote = strike.call().best_quote();
+//! let quote = strike.call().best_quote().expect("best quote");
 //! assert!(quote.is_two_sided());
 //! ```
 

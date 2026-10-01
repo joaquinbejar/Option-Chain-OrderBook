@@ -191,7 +191,7 @@
 //! ### Creating a Hierarchical Order Book
 //!
 //! ```rust
-//! use option_chain_orderbook::{OrderId, Side, UnderlyingOrderBookManager};
+//! use option_chain_orderbook::{OrderId, Side, UnderlyingOrderBookManager, Uuid};
 //! use optionstratlib::prelude::pos_or_panic;
 //! use optionstratlib::ExpirationDate;
 //!
@@ -205,13 +205,13 @@
 //!     let strike = exp.get_or_create_strike(50000);
 //!
 //!     // Add orders to call
-//!     strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+//!     strike.call().add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 100, 10)
 //!         .expect("add order should succeed");
-//!     strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+//!     strike.call().add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 105, 5)
 //!         .expect("add order should succeed");
 //!
 //!     // Get quote
-//!     let quote = strike.call().best_quote();
+//!     let quote = strike.call().best_quote().expect("best quote");
 //!     assert!(quote.is_two_sided());
 //! }
 //!
@@ -222,20 +222,20 @@
 //! ### Creating a Single Option Order Book
 //!
 //! ```rust
-//! use option_chain_orderbook::{OptionOrderBook, OrderId, Side};
+//! use option_chain_orderbook::{OptionOrderBook, OrderId, Side, Uuid};
 //! use optionstratlib::OptionStyle;
 //!
 //! // Create an order book for a specific option
 //! let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 //!
 //! // Add limit orders
-//! book.add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+//! book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Buy, 500, 10)
 //!     .expect("add order should succeed");
-//! book.add_limit_order(OrderId::new(), Side::Sell, 520, 5)
+//! book.add_limit_order(OrderId::from_uuid(Uuid::new_v4()), Side::Sell, 520, 5)
 //!     .expect("add order should succeed");
 //!
 //! // Get the best quote
-//! let quote = book.best_quote();
+//! let quote = book.best_quote().expect("best quote");
 //! assert!(quote.is_two_sided());
 //! ```
 //!

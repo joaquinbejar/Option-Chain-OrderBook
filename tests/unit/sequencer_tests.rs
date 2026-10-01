@@ -374,8 +374,8 @@ fn level_ladder(levels: &[pricelevel::PriceLevelSnapshot]) -> Vec<LevelSnapshot>
 /// Snapshots a single contract's full depth ladder, top-of-book, and order
 /// state.
 fn contract_snapshot(leaf: &OptionOrderBook) -> ContractSnapshot {
-    let quote = leaf.best_quote();
-    let book = leaf.snapshot(SNAPSHOT_DEPTH);
+    let quote = leaf.best_quote().expect("best quote");
+    let book = leaf.snapshot(SNAPSHOT_DEPTH).expect("snapshot");
     ContractSnapshot {
         symbol: leaf.symbol().to_string(),
         bid_price: quote.bid_price().map(|p| p.as_u128()),
@@ -387,8 +387,8 @@ fn contract_snapshot(leaf: &OptionOrderBook) -> ContractSnapshot {
         status: leaf.status(),
         bids: level_ladder(&book.bids),
         asks: level_ladder(&book.asks),
-        total_bid_depth: leaf.total_bid_depth(),
-        total_ask_depth: leaf.total_ask_depth(),
+        total_bid_depth: leaf.total_bid_depth().expect("bid depth"),
+        total_ask_depth: leaf.total_ask_depth().expect("ask depth"),
         bid_level_count: leaf.bid_level_count(),
         ask_level_count: leaf.ask_level_count(),
     }
@@ -514,7 +514,7 @@ fn test_replay_equals_live_full_state_oracle() {
         )
         .expect("exp A present");
     let a50c = exp_a.get_strike(50000).expect("strike 50000 present");
-    let q = a50c.call().best_quote();
+    let q = a50c.call().best_quote().expect("best quote");
     assert_eq!(q.bid_price().map(|p| p.as_u128()), Some(100));
     assert_eq!(q.bid_size().as_u64(), 10);
     assert_eq!(q.ask_price().map(|p| p.as_u128()), Some(110));
@@ -548,11 +548,11 @@ fn test_replay_equals_live_full_state_oracle() {
     let d70c = exp_d.get_strike(70000).expect("strike 70000 present");
     assert_eq!(d70c.call().best_ask(), Some(310), "iceberg rests at 310");
     assert_eq!(
-        d70c.call().total_ask_depth(),
+        d70c.call().total_ask_depth().expect("ask depth"),
         17,
         "iceberg total (visible + hidden) after draining 8 of 25"
     );
-    let d70c_asks = d70c.call().snapshot(SNAPSHOT_DEPTH).asks;
+    let d70c_asks = d70c.call().snapshot(SNAPSHOT_DEPTH).expect("snapshot").asks;
     let ask_310 = d70c_asks
         .iter()
         .find(|l| l.price().as_u128() == 310)
@@ -1038,7 +1038,7 @@ fn test_replay_rejected_after_fills_ioc_remainder_equals_live() {
         "the resting ask must be fully consumed by the partial fill"
     );
     assert_eq!(
-        live_leaf.call().total_ask_depth(),
+        live_leaf.call().total_ask_depth().expect("ask depth"),
         0,
         "no ask depth remains after the fill"
     );
