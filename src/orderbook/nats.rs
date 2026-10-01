@@ -459,7 +459,7 @@ impl NatsPublisherHandles {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::OrderBookError`](crate::Error::OrderBookError) if
+    /// Returns [`Error::OrderBookError`] if
     /// either publisher's background task did not finish cleanly (panicked,
     /// was cancelled or timed out); the trade publisher's error wins when
     /// both fail.

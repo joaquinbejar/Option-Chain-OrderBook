@@ -181,7 +181,7 @@ impl InstrumentRegistry {
     #[inline]
     pub fn allocate(&self) -> Result<u32> {
         self.next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| Error::instrument_id_exhausted())
