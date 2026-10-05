@@ -79,15 +79,15 @@ publish: readme
 
 .PHONY: coverage
 coverage:
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	LOGLEVEL=WARN cargo tarpaulin --verbose --all-features --workspace --timeout 0 --out Xml --output-dir coverage
+	LOGLEVEL=WARN cargo tarpaulin --verbose --all-features --workspace --timeout 600 --out Xml --output-dir coverage
 
 .PHONY: coverage-html
 coverage-html:
-	cargo install cargo-tarpaulin
+	cargo install cargo-tarpaulin --locked --version '>=0.37.5'
 	mkdir -p coverage
-	LOGLEVEL=WARN cargo tarpaulin --color Always --tests --all-targets --all-features --workspace --timeout 0 --out Html --output-dir coverage
+	LOGLEVEL=WARN cargo tarpaulin --color Always --tests --all-targets --all-features --workspace --timeout 600 --out Html --output-dir coverage
 
 .PHONY: open-coverage
 open-coverage:
