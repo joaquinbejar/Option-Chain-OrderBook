@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   >= 0.37.5, the first release that reads Rust 1.99 coverage data; the
   Makefile targets use `--timeout 600` because 0.37.5 treats `--timeout 0` as
   zero seconds.
+- `uuid` dependency requirement `1.26` → `1.27`.
 
 ## [0.13.0] - 2026-09-30
 
