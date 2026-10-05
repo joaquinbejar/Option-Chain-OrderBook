@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`0.15.0`), `pricelevel 0.10` (`0.10.2`), `uuid 1.26` now with `v4`. Every
   other requirement was already on its latest stable release (`dashmap 7` is
   still a release candidate, so `6.2` is kept).
+- Builds warning free on Rust 1.99: `InstrumentRegistry::allocate` uses
+  `AtomicU32::try_update` instead of the now deprecated `fetch_update` (same
+  semantics), and a redundant explicit rustdoc link target in `nats.rs` was
+  dropped. `try_update` needs Rust 1.95 or newer.
 
 ## [0.12.0] - 2026-09-18
 
