@@ -154,7 +154,7 @@ pub enum Error {
 
     /// Error from optionstratlib decimal operations.
     #[error("optionstratlib decimal error: {0}")]
-    OptionStratLibDecimal(#[from] optionstratlib::error::decimal::DecimalError),
+    OptionStratLibDecimal(#[from] optionstratlib::error::DecimalError),
 
     /// Error from expiration date operations.
     #[error("expiration date error: {0}")]

@@ -409,8 +409,8 @@ impl GreeksEngine {
         let strike_pos =
             Positive::new(strike).map_err(|_| Error::greeks("Invalid strike price"))?;
         let iv_pos = Positive::new(iv).map_err(|_| Error::greeks("Invalid implied volatility"))?;
-        // No clamp: a 0.0 dividend yield is valid (Positive::new(0.0) succeeds —
-        // the `positive` crate's non-zero feature is not enabled). Clamping to
+        // No clamp: a 0.0 dividend yield is valid (Positive::new(0.0) succeeds;
+        // `Positive` is always `>= 0` since positive 0.8). Clamping to
         // 0.0001 would inject a systematic bias into every Greek for the common
         // crypto-options case of a true zero dividend.
         let div_yield =
@@ -431,6 +431,7 @@ impl GreeksEngine {
             ),
             implied_volatility: iv_pos,
             quantity: Positive::ONE,
+            contract_size: Positive::ONE,
             underlying_price: spot_pos,
             // The rate is already guaranteed finite above; surface any
             // remaining conversion failure as a typed error rather than

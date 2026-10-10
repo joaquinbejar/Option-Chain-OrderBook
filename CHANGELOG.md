@@ -13,18 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- CI and `make coverage` / `make coverage-html` now require `cargo-tarpaulin`
-  >= 0.37.5, the first release that reads Rust 1.99 coverage data; the
-  Makefile targets use `--timeout 600` because 0.37.5 treats `--timeout 0` as
-  zero seconds.
-- `uuid` dependency requirement `1.26` → `1.27`.
-
-## [0.13.0] - 2026-09-30
+## [0.13.0] - 2026-10-10
 
 ### ⚠️ Breaking Changes
 
+- **`optionstratlib` public dependency `0.21` → `0.22`** (built with
+  `default-features = false, features = ["pricing"]`). `OptionStyle`,
+  `ExpirationDate`, `Positive` and `Greek` appear throughout this crate's API,
+  and `Error::OptionStratLibDecimal` / `Error::ExpirationDateError` wrap its
+  error types, so a downstream crate must move to `optionstratlib 0.22` in the
+  same update. 0.22 brings `positive 0.8` and `expiration_date 0.5`: a crate
+  that pins either must move too. See the OptionStratLib 0.22 migration guide.
+- **`Error::OptionStratLibDecimal` wraps `optionstratlib::error::DecimalError`**
+  (the `error::decimal` module path is gone in 0.22; the type is the same).
+- **Greeks are unchanged numerically**: `GreeksEngine` builds `Options` with
+  `contract_size: Positive::ONE`, which keeps 0.21 results.
 - **`orderbook-rs` public dependency `0.13` → `0.15` and `pricelevel` `0.9` →
   `0.10` (breaking for co-pinners).** Both are *public* dependencies: `OrderId`,
   `Side`, `TimeInForce`, `TradeResult`, `OrderStatus` and the other re-exported
@@ -65,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI and `make coverage` / `make coverage-html` now require `cargo-tarpaulin`
+  >= 0.37.5, the first release that reads Rust 1.99 coverage data; the
+  Makefile targets use `--timeout 600` because 0.37.5 treats `--timeout 0` as
+  zero seconds.
+- `uuid` dependency requirement `1.26` → `1.27`.
 - Dependencies updated to latest stable versions: `orderbook-rs 0.15`
   (`0.15.0`), `pricelevel 0.10` (`0.10.2`), `uuid 1.26` now with `v4`. Every
   other requirement was already on its latest stable release (`dashmap 7` is
