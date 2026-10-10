@@ -270,6 +270,7 @@ let option = Options {
     expiration_date: ExpirationDate::Days(pos_or_panic!(30.0)),
     implied_volatility: pos_or_panic!(0.6),
     quantity: pos_or_panic!(1.0),
+    contract_size: pos_or_panic!(1.0),
     underlying_price: pos_or_panic!(48000.0),
     risk_free_rate: dec!(0.05),
     option_style: OptionStyle::Call,

@@ -69,7 +69,7 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [workspace.dependencies]
-optionstratlib = { version = "0.21", default-features = false }
+optionstratlib = { version = "0.22", default-features = false, features = ["pricing"] }
 orderbook-rs = { version = "0.15", features = ["special_orders"] }
 uuid = { version = "1.27", features = ["v4", "v5"] }
 # Must track the `async-nats` line orderbook-rs uses, so both crates share one
