@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-19
+
+### ⚠️ Breaking Changes
+
+- **`optionstratlib` public dependency `0.22` → `0.23`** (still built with
+  `default-features = false, features = ["pricing"]`). `Greek` (in the
+  `GreeksEngine` results, the `StrikeOrderBook` call/put Greeks accessors and
+  `GreeksAggregator`) and the `optionstratlib::error::DecimalError` wrapped by
+  `Error::OptionStratLibDecimal` are new types in 0.23, so a downstream crate
+  that names them must move to `optionstratlib 0.23` in the same update.
+  `OptionStyle`, `ExpirationDate`, `ExpirationDateError` and
+  `Positive` are unchanged (`financial_types 0.3`, `expiration_date 0.5` and
+  `positive 0.8`, as in 0.22).
+- **No source changes and no behaviour changes.** The only breaking change in
+  `optionstratlib 0.23` is in PNG/SVG export (`static_export`), which this
+  crate does not enable; pricing and Greeks give the same results as with
+  0.22. See the OptionStratLib 0.23 migration guide.
+
 ## [0.13.0] - 2026-10-10
 
 ### ⚠️ Breaking Changes
