@@ -506,7 +506,14 @@ impl OptionOrderBook {
             let counters = Arc::new(TerminalCounters::new());
             let counters_clone = Arc::clone(&counters);
 
-            let mut tracker = OrderStateTracker::new();
+            // The tracker stamps transition history with the leaf's engine
+            // clock when one is injected, so history follows the same clock as
+            // order stamping and time-in-force admission (deterministic under
+            // replay); otherwise it keeps the upstream default wall clock.
+            let mut tracker = match config.clock.as_ref() {
+                Some(clock) => OrderStateTracker::with_clock(Arc::clone(clock)),
+                None => OrderStateTracker::new(),
+            };
             tracker.set_listener(Arc::new(move |_id, _old, new| {
                 // Count when reaching terminal states. The upstream tracker
                 // currently emits one transition per order, so double-counting
@@ -5863,5 +5870,206 @@ mod tests {
             crossing_first_trade_id(&put),
             "call and put must derive distinct trade-ID namespaces from distinct symbols"
         );
+    }
+}
+
+/// UP-1: the leaf's order state tracker follows the leaf clock, and tracking
+/// can be disabled.
+#[cfg(test)]
+mod up1_state_tracking_tests {
+    use super::*;
+    use orderbook_rs::StubClock;
+
+    const SYMBOL: &str = "BTC-20240329-50000-C";
+
+    fn stub_book() -> OptionOrderBook {
+        OptionOrderBook::new_with_config(
+            SYMBOL,
+            OptionStyle::Call,
+            BookConfig {
+                clock: Some(Arc::new(StubClock::with_step(1_000, 10)) as Arc<dyn Clock>),
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    /// Adds two orders, cancels one and lets the other rest; returns both
+    /// histories.
+    fn run(book: &OptionOrderBook) -> Vec<Vec<(u64, OrderStatus)>> {
+        let a = OrderId::from_uuid(Uuid::from_u128(1));
+        let b = OrderId::from_uuid(Uuid::from_u128(2));
+        book.add_limit_order(a, Side::Buy, 100, 10).expect("add a");
+        book.add_limit_order(b, Side::Sell, 120, 5).expect("add b");
+        book.cancel_order(a).expect("cancel a");
+        [a, b]
+            .iter()
+            .map(|id| book.get_order_history(*id).expect("tracked history"))
+            .collect()
+    }
+
+    #[test]
+    fn test_tracker_history_follows_the_injected_clock() {
+        let book = stub_book();
+        let histories = run(&book);
+        for history in &histories {
+            assert!(!history.is_empty());
+            for (t, _) in history {
+                // Every stamp comes from the stub (1000 + 10k), never from the
+                // wall clock (~1.7e12 ms).
+                assert!(*t >= 1_000 && *t < 2_000, "stamp {t} is not from the stub");
+                assert_eq!((*t - 1_000) % 10, 0, "stamp {t} is off the stub grid");
+            }
+        }
+        // The cancelled order ends in a terminal state stamped by the stub.
+        let last = histories[0].last().expect("transition");
+        assert!(last.1.is_terminal());
+    }
+
+    #[test]
+    fn test_tracker_history_is_identical_across_runs_with_the_same_stub() {
+        // Deterministic replay: same clock start/step and same commands give
+        // the same history, stamps included.
+        let first = run(&stub_book());
+        let second = run(&stub_book());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_tracking_disabled_installs_no_tracker() {
+        let book = OptionOrderBook::new_with_config(
+            SYMBOL,
+            OptionStyle::Call,
+            BookConfig {
+                enable_state_tracking: false,
+                clock: Some(Arc::new(StubClock::new()) as Arc<dyn Clock>),
+                ..BookConfig::default()
+            },
+        );
+        assert!(book.inner().order_state_tracker().is_none());
+        let id = OrderId::from_uuid(Uuid::from_u128(3));
+        book.add_limit_order(id, Side::Buy, 100, 10).expect("add");
+        book.cancel_order(id).expect("cancel");
+        assert!(book.get_order_history(id).is_none());
+        assert_eq!(
+            book.terminal_order_summary(),
+            TerminalOrderSummary::default()
+        );
+    }
+
+    #[test]
+    fn test_default_config_keeps_tracking_on() {
+        let book = OptionOrderBook::new(SYMBOL, OptionStyle::Call);
+        assert!(book.inner().order_state_tracker().is_some());
+    }
+}
+
+/// UP-1 review additions: tracking on and off are equivalent for the book's
+/// own trades and timestamps under a clock that does not advance on read,
+/// and both constructor branches honour the configuration.
+#[cfg(test)]
+mod up1_equivalence_tests {
+    use super::*;
+    use orderbook_rs::StubClock;
+
+    /// A clock that never advances on read, like a sequencer-driven clock
+    /// (`StubClock` clamps a zero step to one, so it cannot stand in).
+    #[derive(Debug)]
+    struct FixedClock(u64);
+
+    impl Clock for FixedClock {
+        fn now_millis(&self) -> TimestampMs {
+            TimestampMs::new(self.0)
+        }
+    }
+
+    const SYMBOL: &str = "BTC-20240329-50000-C";
+
+    fn leaf(tracking: bool, stp_mode: STPMode, clock: Arc<dyn Clock>) -> OptionOrderBook {
+        OptionOrderBook::new_with_config(
+            SYMBOL,
+            OptionStyle::Call,
+            BookConfig {
+                enable_state_tracking: tracking,
+                stp_mode,
+                clock: Some(clock),
+                trade_id_root_namespace: Some(Uuid::from_u128(0x00C0_FFEE)),
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    /// A resting sell, a crossing buy, a resting buy and its cancel; returns
+    /// the serialized trade result.
+    fn session(book: &OptionOrderBook) -> String {
+        book.add_limit_order_with_user(
+            OrderId::from_u64(1),
+            Side::Sell,
+            100,
+            10,
+            Hash32::new([1; 32]),
+        )
+        .expect("rest sell");
+        let trade = book
+            .add_limit_order_with_user_full(
+                OrderId::from_u64(2),
+                Side::Buy,
+                100,
+                5,
+                Hash32::new([2; 32]),
+            )
+            .expect("crossing buy");
+        book.add_limit_order_with_user(
+            OrderId::from_u64(3),
+            Side::Buy,
+            90,
+            3,
+            Hash32::new([2; 32]),
+        )
+        .expect("rest buy");
+        book.cancel_order(OrderId::from_u64(3)).expect("cancel");
+        serde_json::to_string(&trade).expect("serialize trade result")
+    }
+
+    #[test]
+    fn test_tracking_on_and_off_give_identical_trades_under_a_fixed_clock() {
+        // MM-REVIEWER n1: with a clock that does not advance on read (as
+        // Xynthex's sequencer-driven clock), the tracker's reads change
+        // nothing the book itself produces.
+        for stp in [STPMode::None, STPMode::CancelTaker] {
+            let fixed = || Arc::new(FixedClock(1_000)) as Arc<dyn Clock>;
+            let on = session(&leaf(true, stp, fixed()));
+            let off = session(&leaf(false, stp, fixed()));
+            assert_eq!(on, off, "stp {stp:?}");
+        }
+    }
+
+    #[test]
+    fn test_both_constructor_branches_honour_tracking_and_clock() {
+        // Codex 3: STPMode::None takes the plain constructor, any other mode
+        // `with_stp_mode`; both must install (or not) the tracker, and a
+        // tracked leaf stamps history from the injected clock.
+        for stp in [STPMode::None, STPMode::CancelTaker] {
+            let on = leaf(true, stp, Arc::new(StubClock::with_step(1_000, 10)));
+            assert!(on.inner().order_state_tracker().is_some(), "stp {stp:?}");
+            session(&on);
+            let history = on.get_order_history(OrderId::from_u64(3)).expect("tracked");
+            assert!(history.last().expect("transition").1.is_terminal());
+            assert!(
+                history
+                    .iter()
+                    .all(|(t, _)| *t >= 1_000 && *t < 2_000 && (*t - 1_000) % 10 == 0),
+                "stp {stp:?}: {history:?}"
+            );
+
+            let off = leaf(false, stp, Arc::new(StubClock::with_step(1_000, 10)));
+            assert!(off.inner().order_state_tracker().is_none(), "stp {stp:?}");
+            session(&off);
+            assert!(off.get_order_history(OrderId::from_u64(3)).is_none());
+            assert_eq!(
+                off.terminal_order_summary(),
+                TerminalOrderSummary::default()
+            );
+            assert_eq!(off.active_order_count(), 0);
+        }
     }
 }

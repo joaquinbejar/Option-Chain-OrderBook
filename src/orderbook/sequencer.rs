@@ -1112,6 +1112,26 @@ impl SequencedUnderlyingOrderBook {
         self.inner.set_clock(clock);
     }
 
+    /// Enables or disables order state tracking for leaves this book vivifies
+    /// from later commands (default: enabled).
+    ///
+    /// Delegates to [`UnderlyingOrderBook::set_state_tracking`] under the same
+    /// serialization gate as [`set_clock`](Self::set_clock), so a racing
+    /// command deterministically sees either the old or the new setting.
+    /// Leaves vivified by earlier commands are not affected.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        let _serialized = self.sequencer.acquire_gate();
+        self.inner.set_state_tracking(enabled);
+    }
+
+    /// Returns whether leaves vivified from later commands track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.inner.state_tracking()
+    }
+
     /// Sets the root trade-ID namespace for leaves this book vivifies from later
     /// commands.
     ///

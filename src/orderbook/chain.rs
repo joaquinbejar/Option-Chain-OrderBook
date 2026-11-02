@@ -281,6 +281,23 @@ impl OptionChainOrderBook {
         self.strikes.clock()
     }
 
+    /// Enables or disables order state tracking for all future option books
+    /// created within this book (default: enabled).
+    ///
+    /// Delegates to [`StrikeOrderBookManager::set_state_tracking`]. Existing books are not
+    /// affected.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        self.strikes.set_state_tracking(enabled);
+    }
+
+    /// Returns whether future option books track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.strikes.state_tracking()
+    }
+
     /// Sets the root trade-ID namespace for all future option books created
     /// within this chain.
     ///
@@ -975,6 +992,8 @@ pub struct OptionChainOrderBookManager {
     /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
     /// time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Whether newly created option books track order state (default true).
+    state_tracking: Shared<bool>,
     /// Root trade-ID namespace propagated to newly created chains. `None` keeps
     /// the upstream default random namespace; a set root makes trade IDs
     /// reproducible across runs sharing the root.
@@ -999,6 +1018,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
         }
     }
@@ -1028,6 +1048,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
         }
     }
@@ -1066,6 +1087,7 @@ impl OptionChainOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
         }
     }
@@ -1172,6 +1194,36 @@ impl OptionChainOrderBookManager {
         self.clock.get()
     }
 
+    /// Enables or disables order state tracking for all future option books
+    /// created by this manager (default: enabled).
+    ///
+    /// Applies to option books created *after* this call; existing books are
+    /// unaffected (same semantics as the engine clock): a child that already
+    /// exists keeps its own setting, and leaves later created under it follow
+    /// that child, not this call. Set it before the first leaf is created to
+    /// make the whole tree uniform; otherwise a tree can mix tracked and
+    /// untracked leaves, and order history and terminal summaries cover only
+    /// the tracked ones.
+    ///
+    /// A leaf built with tracking disabled installs no `OrderStateTracker`: it
+    /// keeps no order history or terminal counters and reads no clock for
+    /// them. A leaf built with tracking enabled stamps its history with the
+    /// engine clock set by [`set_clock`](Self::set_clock) (the same
+    /// `Arc<dyn Clock>` the leaf stamps orders with, so a clock that advances
+    /// on every read sees the tracker's reads too), or with the upstream wall
+    /// clock when none is set.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        self.state_tracking.set(enabled);
+    }
+
+    /// Returns whether future option books track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.state_tracking.get()
+    }
+
     /// Sets the root trade-ID namespace for all future chains created by this
     /// manager.
     ///
@@ -1273,6 +1325,7 @@ impl OptionChainOrderBookManager {
         if let Some(clock) = self.clock.get() {
             fresh.set_clock(clock);
         }
+        fresh.set_state_tracking(self.state_tracking.get());
         if let Some(ns) = self.trade_id_root_namespace.get() {
             fresh.set_trade_id_namespace(ns);
         }
