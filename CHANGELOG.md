@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-02
+
 ### Fixed
 
 - An absolute `ExpirationDate::DateTime` no longer reads the wall clock anywhere in the hierarchy. `get_date()` and `Display` of `ExpirationDate` evaluate `Utc::now()` even for an absolute instant. Building a strike's contract symbols, the hierarchy logs, mass cancel results and `expiration_not_found` errors now format the instant directly. Every output string is byte for byte the same as before. A `Days` expiration is relative to now by definition and still resolves against the wall clock.
