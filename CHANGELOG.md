@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitation
 
-- A leaf's symbol carries only the expiration day. Two expirations of one underlying on the same day with different instants give leaves with the same symbol, so they collide twice: in the symbol index, which is keyed by symbol and keeps one of them, and in the trade-ID namespace, which derives from the symbol and gives both the same trade-ID stream. The caller must keep leaf symbols unique: at most one expiration instant per day per underlying. A versioned change (symbols or namespaces from the full instant) is left for a later minor release.
+- A leaf's symbol carries only the expiration day. Two expirations of one underlying on the same day with different instants give leaves with the same symbol, so they collide twice: in the symbol index, which is keyed by symbol and keeps one of them, and in the trade-ID namespace, which derives from the symbol and gives both the same trade-ID stream. The caller must keep leaf symbols unique: at most one expiration instant per day per underlying. A versioned change (symbols or namespaces from the full instant) is left for a later minor release ([#179](https://github.com/joaquinbejar/Option-Chain-OrderBook/issues/179)).
 
 ## [0.14.2] - 2026-11-02
 
