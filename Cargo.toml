@@ -54,6 +54,10 @@ criterion = { version = "0.8", default-features = false, features = ["html_repor
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1.11"
 
+[lints.rust]
+# `scripts/lint-selftest.sh` builds `src/lint_probe.rs` with this cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ocob_lint_probe)"] }
+
 [[test]]
 name = "tests"
 path = "tests/unit/mod.rs"

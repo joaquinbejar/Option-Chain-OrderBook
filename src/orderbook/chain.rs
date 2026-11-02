@@ -6,6 +6,7 @@
 use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
 use super::instrument_registry::InstrumentRegistry;
+use super::node_id::{NodePath, node_id};
 use super::shared::Shared;
 use super::strike::{
     StrikeEvictExpiredResult, StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager,
@@ -65,79 +66,56 @@ impl OptionChainOrderBook {
     /// * `expiration` - The expiration date
     #[must_use]
     pub fn new(underlying: impl Into<String>, expiration: ExpirationDate) -> Self {
-        let underlying = underlying.into();
-
-        Self {
-            strikes: Arc::new(StrikeOrderBookManager::new(&underlying, expiration)),
-            underlying,
-            expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: None,
-            symbol_index: None,
-        }
+        Self::build(underlying, expiration, None, None, None)
     }
 
-    /// Creates a new option chain order book with an instrument registry.
-    ///
-    /// The registry is propagated to the internal [`StrikeOrderBookManager`]
-    /// so that newly created strikes get unique instrument IDs.
-    ///
-    /// # Arguments
-    ///
-    /// * `underlying` - The underlying asset symbol
-    /// * `expiration` - The expiration date
-    /// * `registry` - The instrument registry for ID allocation
+    /// Builds a chain with the optional registry and symbol index, and with
+    /// a node id derived from `root` when one is given (random otherwise,
+    /// see [`super::node_id`]). The index is kept only with a registry, as
+    /// in the constructors above.
     #[must_use]
-    pub(crate) fn new_with_registry(
+    pub(crate) fn build(
         underlying: impl Into<String>,
         expiration: ExpirationDate,
-        registry: Arc<InstrumentRegistry>,
+        registry: Option<Arc<InstrumentRegistry>>,
+        symbol_index: Option<Arc<SymbolIndex>>,
+        root: Option<Uuid>,
     ) -> Self {
         let underlying = underlying.into();
-
+        let id = node_id(root, &NodePath::chain(&underlying, &expiration));
+        let (strikes, registry, symbol_index) = match (registry, symbol_index) {
+            (Some(registry), Some(symbol_index)) => (
+                StrikeOrderBookManager::new_with_registry_and_index(
+                    &underlying,
+                    expiration,
+                    Arc::clone(&registry),
+                    Arc::clone(&symbol_index),
+                ),
+                Some(registry),
+                Some(symbol_index),
+            ),
+            (Some(registry), None) => (
+                StrikeOrderBookManager::new_with_registry(
+                    &underlying,
+                    expiration,
+                    Arc::clone(&registry),
+                ),
+                Some(registry),
+                None,
+            ),
+            (None, _) => (
+                StrikeOrderBookManager::new(&underlying, expiration),
+                None,
+                None,
+            ),
+        };
         Self {
-            strikes: Arc::new(StrikeOrderBookManager::new_with_registry(
-                &underlying,
-                expiration,
-                Arc::clone(&registry),
-            )),
+            strikes: Arc::new(strikes),
             underlying,
             expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: Some(registry),
-            symbol_index: None,
-        }
-    }
-
-    /// Creates a new option chain order book with both instrument registry and symbol index.
-    ///
-    /// # Arguments
-    ///
-    /// * `underlying` - The underlying asset symbol
-    /// * `expiration` - The expiration date
-    /// * `registry` - The instrument registry for ID allocation
-    /// * `symbol_index` - The symbol index for O(1) lookups
-    #[must_use]
-    pub(crate) fn new_with_registry_and_index(
-        underlying: impl Into<String>,
-        expiration: ExpirationDate,
-        registry: Arc<InstrumentRegistry>,
-        symbol_index: Arc<SymbolIndex>,
-    ) -> Self {
-        let underlying = underlying.into();
-
-        Self {
-            strikes: Arc::new(StrikeOrderBookManager::new_with_registry_and_index(
-                &underlying,
-                expiration,
-                Arc::clone(&registry),
-                Arc::clone(&symbol_index),
-            )),
-            underlying,
-            expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: Some(registry),
-            symbol_index: Some(symbol_index),
+            id,
+            registry,
+            symbol_index,
         }
     }
 
@@ -153,7 +131,14 @@ impl OptionChainOrderBook {
         &self.expiration
     }
 
-    /// Returns the unique identifier for this option chain order book.
+    /// Returns the identifier of this option chain order book.
+    ///
+    /// Built by a manager with a trade-ID root namespace, the id is
+    /// `UUIDv5(root, path)` of the node's path in the hierarchy (see the
+    /// `node_id` module): the same root and path give the same id in every
+    /// hierarchy and every run, also when the node is removed and created
+    /// again, and another root gives another id. Built without a root, the
+    /// id is a random UUIDv4.
     #[must_use]
     pub const fn id(&self) -> OrderId {
         self.id
@@ -1296,20 +1281,13 @@ impl OptionChainOrderBookManager {
         // winning chain is configured-before-visible. Configuration only mutates
         // the fresh object (no global side effects), so a race loser's chain is
         // dropped harmlessly.
-        let fresh = match (&self.registry, &self.symbol_index) {
-            (Some(reg), Some(idx)) => Arc::new(OptionChainOrderBook::new_with_registry_and_index(
-                &self.underlying,
-                expiration,
-                Arc::clone(reg),
-                Arc::clone(idx),
-            )),
-            (Some(reg), None) => Arc::new(OptionChainOrderBook::new_with_registry(
-                &self.underlying,
-                expiration,
-                Arc::clone(reg),
-            )),
-            _ => Arc::new(OptionChainOrderBook::new(&self.underlying, expiration)),
-        };
+        let fresh = Arc::new(OptionChainOrderBook::build(
+            &self.underlying,
+            expiration,
+            self.registry.clone(),
+            self.symbol_index.clone(),
+            self.trade_id_root_namespace.get(),
+        ));
         if let Some(ref config) = self.validation_config.get() {
             fresh.set_validation(config.clone());
         }
@@ -1385,6 +1363,9 @@ impl OptionChainOrderBookManager {
 }
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use optionstratlib::prelude::pos_or_panic;

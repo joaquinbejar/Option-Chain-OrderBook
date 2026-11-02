@@ -12,6 +12,10 @@
 //! - Terminal order summaries (`terminal_order_summary`)
 //! - Purging old terminal states (`purge_terminal_states`)
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use option_chain_orderbook::orderbook::{OptionOrderBook, UnderlyingOrderBookManager};
 use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::{ExpirationDate, OptionStyle};

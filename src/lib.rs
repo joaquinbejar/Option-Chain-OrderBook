@@ -343,6 +343,9 @@ pub mod error;
 pub mod orderbook;
 pub mod utils;
 
+#[cfg(ocob_lint_probe)]
+mod lint_probe;
+
 pub use error::{Error, Result};
 
 // Every public item of the [`orderbook`] module is also re-exported at the crate

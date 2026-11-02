@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A leaf with an engine clock and a trade-ID root namespace is built without the default namespace.** `OptionOrderBook` used to build its inner book with `OrderBook::new` or `OrderBook::with_stp_mode`, which derive the default trade-ID namespace from the wall clock, the process id and a global counter, and only then installed the injected clock and namespace. With both configured (`set_clock` and `set_trade_id_namespace` on the manager), the inner book is now built with `OrderBook::with_clock_and_namespace`, and the STP mode is set on it afterwards. With orderbook-rs 0.15.2 or later (which the `0.15` requirement resolves to), that constructor derives no default namespace, so building the leaf reads no wall clock; with orderbook-rs 0.15.1 it still derives one and discards it. The leaf's trade-ID namespace is still `UUIDv5(root, symbol)`. Without both, construction is unchanged.
+- **Hierarchy node ids are derived, not random, under a root namespace.** Expiration, chain, strike and leaf books built by a manager with a trade-ID root namespace take `UUIDv5(root, path)` as their `id()`, where the path encodes the level, the underlying, the full expiration instant (or the normalized day count), the strike and the option style without ambiguity. Building them reads no OS entropy, and the same root and path give the same id in every hierarchy and every run. Without a root, ids stay random UUIDv4 values.
+
+### Changed
+
+- `clippy.toml` also bans the orderbook-rs constructors that derive the default namespace (`OrderBook::new`, `with_clock`, `with_stp_mode`, `with_trade_listener`, `with_trade_and_price_level_listener`) and `Uuid::new_v4` in the library. `make lint-selftest` (in `make check`, `make pre-push` and the lint workflow) checks that every ban fires on the probes of `src/lint_probe.rs`, built only with `--cfg ocob_lint_probe`.
+
+### Known limitation
+
+- A leaf's trade-ID namespace derives from its symbol, which carries only the expiration day. Two expirations of one underlying on the same day with different instants give leaves with the same symbol, and so the same trade-ID stream. Use one expiration instant per day, or distinct roots.
+
 ## [0.14.2] - 2026-11-02
 
 ### Fixed

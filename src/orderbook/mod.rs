@@ -71,6 +71,7 @@ mod index_price_feed;
 mod instrument_registry;
 mod instrument_status;
 mod mark_price;
+pub(crate) mod node_id;
 mod quote;
 pub(crate) mod shared;
 mod stp;

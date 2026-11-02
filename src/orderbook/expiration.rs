@@ -7,6 +7,7 @@ use super::chain::{ChainEvictExpiredResult, ChainMassCancelResult, OptionChainOr
 use super::contract_specs::ContractSpecs;
 use super::expiration_key::ExpirationKey;
 use super::instrument_registry::InstrumentRegistry;
+use super::node_id::{NodePath, node_id};
 use super::shared::Shared;
 use super::strike::StrikeOrderBook;
 use super::symbol_index::SymbolIndex;
@@ -63,79 +64,37 @@ impl ExpirationOrderBook {
     /// * `expiration` - The expiration date
     #[must_use]
     pub fn new(underlying: impl Into<String>, expiration: ExpirationDate) -> Self {
-        let underlying = underlying.into();
-
-        Self {
-            chain: Arc::new(OptionChainOrderBook::new(&underlying, expiration)),
-            underlying,
-            expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: None,
-            symbol_index: None,
-        }
+        Self::build(underlying, expiration, None, None, None)
     }
 
-    /// Creates a new expiration order book with an instrument registry.
-    ///
-    /// The registry is propagated to the internal [`OptionChainOrderBook`]
-    /// and its strike manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `underlying` - The underlying asset symbol
-    /// * `expiration` - The expiration date
-    /// * `registry` - The instrument registry for ID allocation
+    /// Builds an expiration book, and its chain, with the optional registry
+    /// and symbol index, and with node ids derived from `root` when one is
+    /// given (random otherwise, see [`super::node_id`]). The index is kept
+    /// only with a registry, as in the managers' constructors.
     #[must_use]
-    pub(crate) fn new_with_registry(
+    pub(crate) fn build(
         underlying: impl Into<String>,
         expiration: ExpirationDate,
-        registry: Arc<InstrumentRegistry>,
+        registry: Option<Arc<InstrumentRegistry>>,
+        symbol_index: Option<Arc<SymbolIndex>>,
+        root: Option<Uuid>,
     ) -> Self {
         let underlying = underlying.into();
-
+        let symbol_index = registry.as_ref().and(symbol_index);
+        let chain = OptionChainOrderBook::build(
+            &underlying,
+            expiration,
+            registry.clone(),
+            symbol_index.clone(),
+            root,
+        );
         Self {
-            chain: Arc::new(OptionChainOrderBook::new_with_registry(
-                &underlying,
-                expiration,
-                Arc::clone(&registry),
-            )),
+            id: node_id(root, &NodePath::expiration(&underlying, &expiration)),
+            chain: Arc::new(chain),
             underlying,
             expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: Some(registry),
-            symbol_index: None,
-        }
-    }
-
-    /// Creates a new expiration order book with both instrument registry and symbol index.
-    ///
-    /// # Arguments
-    ///
-    /// * `underlying` - The underlying asset symbol
-    /// * `expiration` - The expiration date
-    /// * `registry` - The instrument registry for ID allocation
-    /// * `symbol_index` - The symbol index for O(1) lookups
-    #[must_use]
-    pub(crate) fn new_with_registry_and_index(
-        underlying: impl Into<String>,
-        expiration: ExpirationDate,
-        registry: Arc<InstrumentRegistry>,
-        symbol_index: Arc<SymbolIndex>,
-    ) -> Self {
-        let underlying = underlying.into();
-
-        Self {
-            chain: Arc::new(OptionChainOrderBook::new_with_registry_and_index(
-                &underlying,
-                expiration,
-                Arc::clone(&registry),
-                Arc::clone(&symbol_index),
-            )),
-            underlying,
-            expiration,
-            id: OrderId::from_uuid(Uuid::new_v4()),
-            registry: Some(registry),
-            symbol_index: Some(symbol_index),
+            registry,
+            symbol_index,
         }
     }
 
@@ -151,7 +110,14 @@ impl ExpirationOrderBook {
         &self.expiration
     }
 
-    /// Returns the unique identifier for this expiration order book.
+    /// Returns the identifier of this expiration order book.
+    ///
+    /// Built by a manager with a trade-ID root namespace, the id is
+    /// `UUIDv5(root, path)` of the node's path in the hierarchy (see the
+    /// `node_id` module): the same root and path give the same id in every
+    /// hierarchy and every run, also when the node is removed and created
+    /// again, and another root gives another id. Built without a root, the
+    /// id is a random UUIDv4.
     #[must_use]
     pub const fn id(&self) -> OrderId {
         self.id
@@ -1050,20 +1016,13 @@ impl ExpirationOrderBookManager {
         // winning book is configured-before-visible. Configuration only mutates
         // the fresh object (no global side effects), so a race loser's book is
         // dropped harmlessly.
-        let fresh = match (&self.registry, &self.symbol_index) {
-            (Some(reg), Some(idx)) => Arc::new(ExpirationOrderBook::new_with_registry_and_index(
-                &self.underlying,
-                expiration,
-                Arc::clone(reg),
-                Arc::clone(idx),
-            )),
-            (Some(reg), None) => Arc::new(ExpirationOrderBook::new_with_registry(
-                &self.underlying,
-                expiration,
-                Arc::clone(reg),
-            )),
-            _ => Arc::new(ExpirationOrderBook::new(&self.underlying, expiration)),
-        };
+        let fresh = Arc::new(ExpirationOrderBook::build(
+            &self.underlying,
+            expiration,
+            self.registry.clone(),
+            self.symbol_index.clone(),
+            self.trade_id_root_namespace.get(),
+        ));
         if let Some(ref config) = self.validation_config.get() {
             fresh.set_validation(config.clone());
         }
@@ -1476,6 +1435,9 @@ impl ExpirationEvictExpiredResult {
 }
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use optionstratlib::prelude::pos_or_panic;

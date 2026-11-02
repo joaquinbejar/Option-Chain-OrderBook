@@ -3,6 +3,10 @@
 //! These benchmarks measure the performance of operations that span
 //! the entire order book hierarchy.
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{BenchmarkId, Criterion, Throughput};
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::prelude::{ExpirationDate, Positive, pos_or_panic};

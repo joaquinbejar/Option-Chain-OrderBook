@@ -8,6 +8,7 @@ use super::book::{BookConfig, OptionOrderBook};
 use super::book::{ContractNatsListenerFactory, PreparedNatsListeners, SharedNatsFactory};
 use super::contract_specs::ContractSpecs;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
+use super::node_id::{NodePath, derived_node_id, node_id, random_node_id};
 use super::quote::Quote;
 use super::shared::Shared;
 use super::symbol_index::{SymbolIndex, SymbolRef};
@@ -126,7 +127,7 @@ impl StrikeOrderBook {
             put: Arc::new(OptionOrderBook::new(put_symbol, OptionStyle::Put)),
             call_greeks: RwLock::new(None),
             put_greeks: RwLock::new(None),
-            id: OrderId::from_uuid(Uuid::new_v4()),
+            id: random_node_id(),
         }
     }
 
@@ -168,7 +169,7 @@ impl StrikeOrderBook {
             )),
             call_greeks: RwLock::new(None),
             put_greeks: RwLock::new(None),
-            id: OrderId::from_uuid(Uuid::new_v4()),
+            id: random_node_id(),
         }
     }
 
@@ -184,6 +185,7 @@ impl StrikeOrderBook {
         strike: u64,
         call: Arc<OptionOrderBook>,
         put: Arc<OptionOrderBook>,
+        id: OrderId,
     ) -> Self {
         Self {
             underlying: underlying.into(),
@@ -193,7 +195,7 @@ impl StrikeOrderBook {
             put,
             call_greeks: RwLock::new(None),
             put_greeks: RwLock::new(None),
-            id: OrderId::from_uuid(Uuid::new_v4()),
+            id,
         }
     }
 
@@ -215,7 +217,14 @@ impl StrikeOrderBook {
         self.strike
     }
 
-    /// Returns the unique identifier for this strike order book.
+    /// Returns the identifier of this strike order book.
+    ///
+    /// Built by a manager with a trade-ID root namespace, the id is
+    /// `UUIDv5(root, path)` of the node's path in the hierarchy (see the
+    /// `node_id` module): the same root and path give the same id in every
+    /// hierarchy and every run, also when the node is removed and created
+    /// again, and another root gives another id. Built without a root, the
+    /// id is a random UUIDv4.
     #[must_use]
     pub const fn id(&self) -> OrderId {
         self.id
@@ -1420,6 +1429,17 @@ impl StrikeOrderBookManager {
         winner
     }
 
+    /// The node id of the `style` leaf of `strike`: derived from `root` when
+    /// one is configured, `None` (a random id) otherwise.
+    fn leaf_node_id(&self, root: Option<Uuid>, strike: u64, style: OptionStyle) -> Option<OrderId> {
+        root.map(|root| {
+            derived_node_id(
+                root,
+                &NodePath::leaf(&self.underlying, &self.expiration, strike, style),
+            )
+        })
+    }
+
     /// Internal helper that builds a [`StrikeOrderBook`] with optional
     /// validation config, STP mode, and fee schedule but **without** allocating
     /// instrument IDs.
@@ -1430,25 +1450,32 @@ impl StrikeOrderBookManager {
         let (call_symbol, put_symbol) =
             contract_symbols(&self.underlying, &self.expiration, strike);
 
+        let root = self.trade_id_root_namespace.get();
         let base_config = BookConfig {
             validation: self.effective_validation(),
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
             enable_state_tracking: self.state_tracking.get(),
-            trade_id_root_namespace: self.trade_id_root_namespace.get(),
+            trade_id_root_namespace: root,
             ..BookConfig::default()
         };
 
         let call = Arc::new(OptionOrderBook::new_with_config(
             &call_symbol,
             OptionStyle::Call,
-            base_config.clone(),
+            BookConfig {
+                node_id: self.leaf_node_id(root, strike, OptionStyle::Call),
+                ..base_config.clone()
+            },
         ));
         let put = Arc::new(OptionOrderBook::new_with_config(
             &put_symbol,
             OptionStyle::Put,
-            base_config,
+            BookConfig {
+                node_id: self.leaf_node_id(root, strike, OptionStyle::Put),
+                ..base_config
+            },
         ));
 
         Arc::new(StrikeOrderBook::from_books(
@@ -1457,6 +1484,10 @@ impl StrikeOrderBookManager {
             strike,
             call,
             put,
+            node_id(
+                root,
+                &NodePath::strike(&self.underlying, &self.expiration, strike),
+            ),
         ))
     }
 
@@ -1536,15 +1567,22 @@ impl StrikeOrderBookManager {
         let (call_symbol, put_symbol) =
             contract_symbols(&self.underlying, &self.expiration, strike);
 
+        let root = self.trade_id_root_namespace.get();
         let call = Arc::new(OptionOrderBook::new_with_config(
             &call_symbol,
             OptionStyle::Call,
-            self.book_config_with_listeners(factory(&call_symbol)),
+            BookConfig {
+                node_id: self.leaf_node_id(root, strike, OptionStyle::Call),
+                ..self.book_config_with_listeners(factory(&call_symbol))
+            },
         ));
         let put = Arc::new(OptionOrderBook::new_with_config(
             &put_symbol,
             OptionStyle::Put,
-            self.book_config_with_listeners(factory(&put_symbol)),
+            BookConfig {
+                node_id: self.leaf_node_id(root, strike, OptionStyle::Put),
+                ..self.book_config_with_listeners(factory(&put_symbol))
+            },
         ));
 
         Arc::new(StrikeOrderBook::from_books(
@@ -1553,6 +1591,10 @@ impl StrikeOrderBookManager {
             strike,
             call,
             put,
+            node_id(
+                root,
+                &NodePath::strike(&self.underlying, &self.expiration, strike),
+            ),
         ))
     }
 
@@ -1799,6 +1841,9 @@ impl StrikeOrderBookManager {
 }
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use optionstratlib::prelude::pos_or_panic;

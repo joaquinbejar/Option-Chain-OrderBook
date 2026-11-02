@@ -9,6 +9,10 @@
 //!
 //! Run with: `cargo run --example basic_orderbook`
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use option_chain_orderbook::orderbook::OptionOrderBook;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{OrderId, Side};
