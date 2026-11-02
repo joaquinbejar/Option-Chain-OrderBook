@@ -686,6 +686,10 @@ fn current_timestamp_ns() -> u64 {
 /// Time to expiry in years, or 0.0 if already expired.
 #[must_use]
 pub fn calculate_tte_years(expiration: &optionstratlib::ExpirationDate) -> f64 {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "time to expiry for the Greeks engine is measured from now by definition; it is not on the order or matching path"
+    )]
     let now = Utc::now();
 
     match expiration {

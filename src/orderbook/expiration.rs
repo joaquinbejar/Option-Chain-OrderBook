@@ -12,7 +12,7 @@ use super::strike::StrikeOrderBook;
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
-use crate::utils::checked_accumulate;
+use crate::utils::{checked_accumulate, expiration_label};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
@@ -360,7 +360,7 @@ impl ExpirationOrderBook {
         let result = self.chain.cancel_all()?;
 
         Ok(ExpirationMassCancelResult {
-            per_child: vec![(self.expiration.to_string(), result)],
+            per_child: vec![(expiration_label(&self.expiration), result)],
         })
     }
 
@@ -402,7 +402,7 @@ impl ExpirationOrderBook {
         let result = self.chain.cancel_by_side(side)?;
 
         Ok(ExpirationMassCancelResult {
-            per_child: vec![(self.expiration.to_string(), result)],
+            per_child: vec![(expiration_label(&self.expiration), result)],
         })
     }
 
@@ -447,7 +447,7 @@ impl ExpirationOrderBook {
         let result = self.chain.cancel_by_user(user_id)?;
 
         Ok(ExpirationMassCancelResult {
-            per_child: vec![(self.expiration.to_string(), result)],
+            per_child: vec![(expiration_label(&self.expiration), result)],
         })
     }
 
@@ -495,7 +495,7 @@ impl ExpirationOrderBook {
         let result = self.chain.evict_expired_orders(now_ms);
 
         ExpirationEvictExpiredResult {
-            per_child: vec![(self.expiration.to_string(), result)],
+            per_child: vec![(expiration_label(&self.expiration), result)],
         }
     }
 
@@ -1108,7 +1108,7 @@ impl ExpirationOrderBookManager {
             // the order-submission path.
             tracing::info!(
                 underlying = %self.underlying,
-                expiration = %expiration,
+                expiration = %expiration_label(&expiration),
                 "expiration created",
             );
         }
@@ -1124,7 +1124,7 @@ impl ExpirationOrderBookManager {
         self.expirations
             .get(&ExpirationKey::from(expiration))
             .map(|e| Arc::clone(e.value()))
-            .ok_or_else(|| Error::expiration_not_found(expiration.to_string()))
+            .ok_or_else(|| Error::expiration_not_found(expiration_label(expiration)))
     }
 
     /// Returns true if an expiration exists.
