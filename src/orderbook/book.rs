@@ -411,7 +411,8 @@ impl OptionOrderBook {
         // built by the one orderbook-rs constructor that, from orderbook-rs
         // 0.15.2 on, never derives the default trade-ID namespace, so
         // building it reads no wall clock, no process id and no construction
-        // counter (with 0.15.1 it still derives one and discards it). The leaf's namespace is
+        // counter. With 0.15.1 it still derives one and discards it: the
+        // consumer must resolve orderbook-rs to 0.15.2 or later. The leaf's namespace is
         // `UUIDv5(root, symbol_bytes)`: call and put carry distinct symbols,
         // so they get distinct namespaces from the same root, and the same
         // (root, symbol) pair yields the same namespace in every run.
