@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-02
+
+### Fixed
+
+- The per-leaf `OrderStateTracker` now uses the leaf's injected clock (`BookConfig.clock`) instead of the wall clock, so order history timestamps follow the same clock as order stamping and TIF (#171, #172).
+
+### Added
+
+- `set_state_tracking(enabled)` / `state_tracking()` at every level that has `set_clock` (strike, expiration, underlying, chain managers and `SequencedUnderlyingOrderBook`). Default `true`; applies to leaves created after the call (#171, #172).
+
 ## [0.14.0] - 2026-10-19
 
 ### ⚠️ Breaking Changes
