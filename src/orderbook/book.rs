@@ -6045,7 +6045,7 @@ mod up1_equivalence_tests {
 
     #[test]
     fn test_both_constructor_branches_honour_tracking_and_clock() {
-        // Codex 3: STPMode::None takes the plain constructor, any other mode
+        // STPMode::None takes the plain constructor, any other mode
         // `with_stp_mode`; both must install (or not) the tracker, and a
         // tracked leaf stamps history from the injected clock.
         for stp in [STPMode::None, STPMode::CancelTaker] {
