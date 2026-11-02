@@ -489,6 +489,23 @@ impl UnderlyingOrderBook {
         self.expirations.clock()
     }
 
+    /// Enables or disables order state tracking for all future option books
+    /// created within this book (default: enabled).
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_state_tracking`]. Existing books are not
+    /// affected.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        self.expirations.set_state_tracking(enabled);
+    }
+
+    /// Returns whether future option books track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.expirations.state_tracking()
+    }
+
     /// Sets the root trade-ID namespace for future expirations created within
     /// this underlying.
     ///
@@ -1171,6 +1188,8 @@ pub struct UnderlyingOrderBookManager {
     /// the upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` makes
     /// time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Whether newly created option books track order state (default true).
+    state_tracking: Shared<bool>,
     /// Root trade-ID namespace propagated to newly created underlying books.
     /// `None` keeps the upstream default random namespace; a set root makes
     /// trade IDs reproducible across runs sharing the root.
@@ -1204,6 +1223,7 @@ impl UnderlyingOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
@@ -1228,6 +1248,7 @@ impl UnderlyingOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
@@ -1307,6 +1328,7 @@ impl UnderlyingOrderBookManager {
         if let Some(clock) = self.clock.get() {
             fresh.set_clock(clock);
         }
+        fresh.set_state_tracking(self.state_tracking.get());
         if let Some(ns) = self.trade_id_root_namespace.get() {
             fresh.set_trade_id_namespace(ns);
         }
@@ -1392,6 +1414,36 @@ impl UnderlyingOrderBookManager {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// Enables or disables order state tracking for all future option books
+    /// created by this manager (default: enabled).
+    ///
+    /// Applies to option books created *after* this call; existing books are
+    /// unaffected (same semantics as the engine clock): a child that already
+    /// exists keeps its own setting, and leaves later created under it follow
+    /// that child, not this call. Set it before the first leaf is created to
+    /// make the whole tree uniform; otherwise a tree can mix tracked and
+    /// untracked leaves, and order history and terminal summaries cover only
+    /// the tracked ones.
+    ///
+    /// A leaf built with tracking disabled installs no `OrderStateTracker`: it
+    /// keeps no order history or terminal counters and reads no clock for
+    /// them. A leaf built with tracking enabled stamps its history with the
+    /// engine clock set by [`set_clock`](Self::set_clock) (the same
+    /// `Arc<dyn Clock>` the leaf stamps orders with, so a clock that advances
+    /// on every read sees the tracker's reads too), or with the upstream wall
+    /// clock when none is set.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        self.state_tracking.set(enabled);
+    }
+
+    /// Returns whether future option books track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.state_tracking.get()
     }
 
     /// Sets the root trade-ID namespace for all future underlying books created
@@ -2278,6 +2330,104 @@ mod tests {
             .cancel_all_across_underlyings()
             .expect("global cancel");
         assert_eq!(global_result.books_affected(), expected);
+    }
+
+    #[test]
+    fn test_state_tracking_defaults_to_on_at_every_level() {
+        let manager = UnderlyingOrderBookManager::new();
+        assert!(manager.state_tracking());
+        let book = manager.get_or_create("BTC");
+        assert!(book.state_tracking());
+        let expiration = book.get_or_create_expiration(test_expiration());
+        assert!(expiration.state_tracking());
+        assert!(expiration.chain().state_tracking());
+        let strike = expiration.get_or_create_strike(50000);
+        assert!(strike.call().inner().order_state_tracker().is_some());
+        assert!(strike.put().inner().order_state_tracker().is_some());
+    }
+
+    #[test]
+    fn test_underlying_manager_state_tracking_and_clock_reach_vivified_leaves() {
+        use orderbook_rs::StubClock;
+
+        let manager = UnderlyingOrderBookManager::new();
+        // A leaf built before the change keeps its tracker.
+        let before = manager
+            .get_or_create("BTC")
+            .get_or_create_expiration(test_expiration())
+            .get_or_create_strike(50000);
+        assert!(before.call().inner().order_state_tracker().is_some());
+
+        manager.set_clock(Arc::new(StubClock::with_step(1_000, 10)) as Arc<dyn Clock>);
+        manager.set_state_tracking(false);
+        assert!(!manager.state_tracking());
+        // An underlying vivified after the change inherits it, down to the leaf.
+        let eth = manager.get_or_create("ETH");
+        assert!(!eth.state_tracking());
+        let leaf = eth
+            .get_or_create_expiration(test_expiration())
+            .get_or_create_strike(3000);
+        assert!(leaf.call().inner().order_state_tracker().is_none());
+        assert!(leaf.put().inner().order_state_tracker().is_none());
+        assert!(before.call().inner().order_state_tracker().is_some());
+
+        // Re-enabled: the next underlying's leaves track, stamped by the stub.
+        manager.set_state_tracking(true);
+        let sol = manager
+            .get_or_create("SOL")
+            .get_or_create_expiration(test_expiration())
+            .get_or_create_strike(150);
+        let id = OrderId::from_uuid(Uuid::new_v4());
+        sol.call()
+            .add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add on tracked leaf");
+        let history = sol.call().get_order_history(id).expect("tracked");
+        assert!(history.iter().all(|(t, _)| *t >= 1_000 && *t < 2_000));
+    }
+
+    #[test]
+    fn test_state_tracking_follows_set_clock_semantics_per_level() {
+        // Like `set_clock`, each level's setting applies to children created
+        // after the call; existing children keep theirs.
+        let book = UnderlyingOrderBook::new("BTC");
+        let existing = book.get_or_create_expiration(test_expiration());
+        let old_leaf = existing.get_or_create_strike(50000);
+
+        book.set_state_tracking(false);
+        assert!(!book.state_tracking());
+        // The existing expiration is unchanged...
+        assert!(existing.state_tracking());
+        assert!(
+            existing
+                .get_or_create_strike(51000)
+                .call()
+                .inner()
+                .order_state_tracker()
+                .is_some()
+        );
+        // ...while an expiration created after the call has tracking off.
+        let later = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(60.0)));
+        assert!(!later.state_tracking());
+        assert!(
+            later
+                .get_or_create_strike(50000)
+                .call()
+                .inner()
+                .order_state_tracker()
+                .is_none()
+        );
+
+        // Setting it on the existing expiration reaches its future strikes.
+        existing.set_state_tracking(false);
+        assert!(
+            existing
+                .get_or_create_strike(52000)
+                .call()
+                .inner()
+                .order_state_tracker()
+                .is_none()
+        );
+        assert!(old_leaf.call().inner().order_state_tracker().is_some());
     }
 
     #[test]

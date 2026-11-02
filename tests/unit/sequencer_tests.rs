@@ -1193,3 +1193,30 @@ fn test_replay_with_injected_clock_and_namespace_equals_live() {
         "replayed state under injected clock + namespace must equal live state"
     );
 }
+
+#[test]
+fn test_sequenced_set_state_tracking_applies_to_leaves_vivified_by_submit() {
+    // UP-1: the toggle rides the same gate as set_clock and reaches leaves a
+    // later submit vivifies; with a stub clock, tracked history is stamped by
+    // the stub.
+    let symbol = "BTC-20240329-50000-C";
+
+    let off = SequencedUnderlyingOrderBook::new("BTC");
+    assert!(off.state_tracking());
+    off.set_state_tracking(false);
+    assert!(!off.state_tracking());
+    off.submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf");
+    let leaf = call_leaf(&off, symbol).expect("leaf vivified by submit");
+    assert!(leaf.call().inner().order_state_tracker().is_none());
+    assert!(leaf.call().get_order_history(oid(1)).is_none());
+
+    let on = SequencedUnderlyingOrderBook::new("BTC");
+    on.set_clock(Arc::new(StubClock::with_step(1_000, 10)) as Arc<dyn Clock>);
+    on.submit_add_order(symbol, oid(1), Side::Buy, 100, 10)
+        .expect("submit vivifies the leaf");
+    let leaf = call_leaf(&on, symbol).expect("leaf vivified by submit");
+    let history = leaf.call().get_order_history(oid(1)).expect("tracked");
+    assert!(!history.is_empty());
+    assert!(history.iter().all(|(t, _)| *t >= 1_000 && *t < 2_000));
+}

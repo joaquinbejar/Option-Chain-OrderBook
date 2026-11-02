@@ -939,6 +939,8 @@ pub struct StrikeOrderBookManager {
     /// upstream default `MonotonicClock`; a shared `Arc<dyn Clock>` (e.g.
     /// `StubClock`) makes time-in-force admission deterministic for replay.
     clock: Shared<Option<Arc<dyn Clock>>>,
+    /// Whether newly created option books track order state (default true).
+    state_tracking: Shared<bool>,
     /// Root trade-ID namespace applied to newly created option books. `None`
     /// keeps the upstream default (a random per-book namespace); a set root has
     /// each future leaf derive `UUIDv5(root, symbol)` at construction, making
@@ -972,6 +974,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
@@ -1005,6 +1008,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
@@ -1037,6 +1041,7 @@ impl StrikeOrderBookManager {
             stp_mode: Shared::new(STPMode::None),
             fee_schedule: Shared::new(None),
             clock: Shared::new(None),
+            state_tracking: Shared::new(true),
             trade_id_root_namespace: Shared::new(None),
             #[cfg(feature = "nats")]
             nats_factory: SharedNatsFactory::new(),
@@ -1211,6 +1216,36 @@ impl StrikeOrderBookManager {
     #[inline]
     pub fn clock(&self) -> Option<Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// Enables or disables order state tracking for all future option books
+    /// created by this manager (default: enabled).
+    ///
+    /// Applies to option books created *after* this call; existing books are
+    /// unaffected (same semantics as the engine clock): a child that already
+    /// exists keeps its own setting, and leaves later created under it follow
+    /// that child, not this call. Set it before the first leaf is created to
+    /// make the whole tree uniform; otherwise a tree can mix tracked and
+    /// untracked leaves, and order history and terminal summaries cover only
+    /// the tracked ones.
+    ///
+    /// A leaf built with tracking disabled installs no `OrderStateTracker`: it
+    /// keeps no order history or terminal counters and reads no clock for
+    /// them. A leaf built with tracking enabled stamps its history with the
+    /// engine clock set by [`set_clock`](Self::set_clock) (the same
+    /// `Arc<dyn Clock>` the leaf stamps orders with, so a clock that advances
+    /// on every read sees the tracker's reads too), or with the upstream wall
+    /// clock when none is set.
+    #[inline]
+    pub fn set_state_tracking(&self, enabled: bool) {
+        self.state_tracking.set(enabled);
+    }
+
+    /// Returns whether future option books track order state.
+    #[must_use]
+    #[inline]
+    pub fn state_tracking(&self) -> bool {
+        self.state_tracking.get()
     }
 
     /// Sets the root trade-ID namespace for all future option books created by
@@ -1394,6 +1429,7 @@ impl StrikeOrderBookManager {
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
+            enable_state_tracking: self.state_tracking.get(),
             trade_id_root_namespace: self.trade_id_root_namespace.get(),
             ..BookConfig::default()
         };
@@ -1523,6 +1559,7 @@ impl StrikeOrderBookManager {
             stp_mode: self.stp_mode.get(),
             fee_schedule: self.fee_schedule.get(),
             clock: self.clock.get(),
+            enable_state_tracking: self.state_tracking.get(),
             trade_id_root_namespace: self.trade_id_root_namespace.get(),
             nats_listeners: listeners,
             ..BookConfig::default()
@@ -3094,5 +3131,31 @@ mod tests {
             first_trade_id(&reference_leaf(&before_symbol, root)),
             "a book created before set_trade_id_namespace keeps the default namespace"
         );
+    }
+}
+
+/// UP-1: the NATS construction path builds its leaf config from the same
+/// manager settings as the plain path.
+#[cfg(all(test, feature = "nats"))]
+mod up1_nats_tests {
+    use super::*;
+    use optionstratlib::prelude::pos_or_panic;
+    use orderbook_rs::StubClock;
+
+    #[test]
+    fn test_nats_book_config_carries_state_tracking_and_clock() {
+        let manager = StrikeOrderBookManager::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+        let default_config = manager.book_config_with_listeners(None);
+        assert!(default_config.enable_state_tracking);
+        assert!(default_config.clock.is_none());
+
+        manager.set_state_tracking(false);
+        manager.set_clock(Arc::new(StubClock::new()) as Arc<dyn Clock>);
+        let config = manager.book_config_with_listeners(None);
+        assert!(!config.enable_state_tracking);
+        assert!(config.clock.is_some());
+        let leaf =
+            OptionOrderBook::new_with_config("BTC-20240329-50000-C", OptionStyle::Call, config);
+        assert!(leaf.inner().order_state_tracker().is_none());
     }
 }
