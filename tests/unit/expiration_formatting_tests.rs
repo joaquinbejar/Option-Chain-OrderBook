@@ -112,10 +112,7 @@ fn test_days_expiration_formatting_is_unchanged() {
     assert_eq!(formatted.len(), 8);
     // A midnight between the two calls could shift the day; both are days
     // from now, so they are equal or one day apart.
-    assert!(
-        formatted >= previous,
-        "{formatted} {previous}"
-    );
+    assert!(formatted >= previous, "{formatted} {previous}");
     assert!(expiration_label(&expiration).ends_with(" UTC"));
 }
 
