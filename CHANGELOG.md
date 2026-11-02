@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-11-02
+
 ### Fixed
 
 - **A leaf with an engine clock and a trade-ID root namespace is built without the default namespace.** `OptionOrderBook` used to build its inner book with `OrderBook::new` or `OrderBook::with_stp_mode`, which derive the default trade-ID namespace from the wall clock, the process id and a global counter, and only then installed the injected clock and namespace. With both configured (`set_clock` and `set_trade_id_namespace` on the manager), the inner book is now built with `OrderBook::with_clock_and_namespace`, and the STP mode is set on it afterwards. That constructor derives no default namespace only from orderbook-rs 0.15.2 on, so the guarantee needs the consumer to resolve orderbook-rs to 0.15.2 or later (for an existing lock file, `cargo update -p orderbook-rs`); with 0.15.1 it still derives one, reading the wall clock, and discards it. The test that counts clock reads while building sees only the injected clock, so it cannot detect that 0.15.1 read. The leaf's trade-ID namespace is still `UUIDv5(root, symbol)`. Without both, construction is unchanged.
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Cargo.toml` declares `rust-version = "1.95"`, the oldest toolchain the dependency graph already needs (orderbook-rs 0.15.2 declares 1.95).
 - `clippy.toml` also bans the orderbook-rs constructors that derive the default namespace (`OrderBook::new`, `with_clock`, `with_stp_mode`, `with_trade_listener`, `with_trade_and_price_level_listener`) and `Uuid::new_v4` in the library. `make lint-selftest` (in `make check`, `make pre-push` and the lint workflow) checks that every ban fires on the probes of `src/lint_probe.rs`, built only with `--cfg ocob_lint_probe`.
 
 ### Known limitation
