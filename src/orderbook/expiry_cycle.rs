@@ -17,6 +17,7 @@
 //!
 //! All expiration times default to 08:00 UTC; settlement to 08:30 UTC.
 
+use super::expiration_key::ExpirationKey;
 use super::strike_range::ExpiryType;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -239,8 +240,9 @@ impl ExpiryCycleConfig {
 
         // Sort by date, then deduplicate by date (a date from one cycle
         // type may coincide with another, e.g. last-Friday-of-month = weekly Friday).
-        dates.sort_unstable_by_key(|d| d.get_date().ok());
-        dates.dedup_by_key(|d| d.get_date().ok());
+        // `ExpirationKey` orders by the instant without reading the clock.
+        dates.sort_unstable_by_key(|d| ExpirationKey::from(d));
+        dates.dedup_by(|a, b| ExpirationKey::from(&*a) == ExpirationKey::from(&*b));
 
         Ok(dates)
     }
@@ -459,6 +461,8 @@ fn to_expiration(date: NaiveDate, time: NaiveTime) -> ExpirationDate {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Tests read the wall clock to build relative expiries and check them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::super::strike_range::ExpiryType;
     use super::*;

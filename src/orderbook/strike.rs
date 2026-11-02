@@ -13,7 +13,9 @@ use super::shared::Shared;
 use super::symbol_index::{SymbolIndex, SymbolRef};
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
-use crate::utils::{checked_accumulate, format_expiration_yyyymmdd};
+use crate::utils::{
+    checked_accumulate, contract_symbols_at, expiration_label, format_expiration_yyyymmdd,
+};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -53,7 +55,11 @@ fn contract_symbols(
     expiration: &ExpirationDate,
     strike: u64,
 ) -> (String, String) {
-    let exp_str = format_expiration_yyyymmdd(expiration).unwrap_or_else(|_| expiration.to_string());
+    if let ExpirationDate::DateTime(expiry) = expiration {
+        return contract_symbols_at(underlying, *expiry, strike);
+    }
+    let exp_str =
+        format_expiration_yyyymmdd(expiration).unwrap_or_else(|_| expiration_label(expiration));
     (
         format!("{underlying}-{exp_str}-{strike}-C"),
         format!("{underlying}-{exp_str}-{strike}-P"),
@@ -1135,7 +1141,7 @@ impl StrikeOrderBookManager {
         {
             tracing::warn!(
                 underlying = %self.underlying,
-                expiration = %self.expiration,
+                expiration = %expiration_label(&self.expiration),
                 min_price = min,
                 max_price = max,
                 "incoherent cross-source price band (min_price > max_price); \
@@ -1407,7 +1413,7 @@ impl StrikeOrderBookManager {
             tracing::info!(
                 underlying = %self.underlying,
                 strike,
-                expiration = %self.expiration,
+                expiration = %expiration_label(&self.expiration),
                 "strike created",
             );
         }
@@ -1506,7 +1512,7 @@ impl StrikeOrderBookManager {
             tracing::info!(
                 underlying = %self.underlying,
                 strike,
-                expiration = %self.expiration,
+                expiration = %expiration_label(&self.expiration),
                 "strike created",
             );
         }

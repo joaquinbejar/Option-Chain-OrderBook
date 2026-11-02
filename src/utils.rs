@@ -1,11 +1,16 @@
 //! Utility functions for the Option-Chain-OrderBook library.
 
 use crate::error::{Error, Result};
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use optionstratlib::{ExpirationDate, OptionStyle};
 use std::sync::Once;
 
 /// Formats an `ExpirationDate` as a string in `YYYYMMDD` format.
+///
+/// An absolute [`ExpirationDate::DateTime`] is formatted directly: the result
+/// depends only on the instant, and the wall clock is never read. A relative
+/// [`ExpirationDate::Days`] is an offset from now by definition, so it is
+/// resolved against the wall clock first.
 ///
 /// # Arguments
 ///
@@ -17,23 +22,97 @@ use std::sync::Once;
 ///
 /// # Errors
 ///
-/// Returns an error if the date cannot be retrieved from the `ExpirationDate`.
+/// Returns an error if a `Days` expiration cannot be resolved to a date.
 ///
 /// # Examples
 ///
 /// ```rust
+/// use chrono::{TimeZone, Utc};
 /// use option_chain_orderbook::utils::format_expiration_yyyymmdd;
-/// use optionstratlib::prelude::pos_or_panic;
 /// use optionstratlib::ExpirationDate;
 ///
-/// let expiration = ExpirationDate::Days(pos_or_panic!(30.0));
-/// let formatted = format_expiration_yyyymmdd(&expiration)
+/// let expiry = Utc.with_ymd_and_hms(2025, 12, 22, 8, 0, 0).single().expect("valid date");
+/// let formatted = format_expiration_yyyymmdd(&ExpirationDate::DateTime(expiry))
 ///     .expect("format should succeed");
-/// assert_eq!(formatted.len(), 8); // YYYYMMDD format
+/// assert_eq!(formatted, "20251222");
 /// ```
 pub fn format_expiration_yyyymmdd(expiration: &ExpirationDate) -> Result<String> {
-    let date = expiration.get_date()?;
-    Ok(date.format("%Y%m%d").to_string())
+    match expiration {
+        ExpirationDate::DateTime(dt) => Ok(format_yyyymmdd(*dt)),
+        ExpirationDate::Days(_) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a Days expiration is relative to now by definition"
+            )]
+            let date = expiration.get_date()?;
+            Ok(format_yyyymmdd(date))
+        }
+    }
+}
+
+/// `YYYYMMDD` of an instant.
+#[must_use]
+#[inline]
+fn format_yyyymmdd(instant: DateTime<Utc>) -> String {
+    instant.format("%Y%m%d").to_string()
+}
+
+/// A human readable label for an `ExpirationDate`, byte for byte the same
+/// as its `Display` (`YYYY-MM-DD HH:MM:SS UTC`).
+///
+/// For an absolute [`ExpirationDate::DateTime`] the label is built from the
+/// instant alone, without reading the wall clock (`Display` resolves the
+/// date against the wall clock even then). A relative
+/// [`ExpirationDate::Days`] uses `Display`, which reads the wall clock, as
+/// it must.
+///
+/// # Examples
+///
+/// ```rust
+/// use chrono::{TimeZone, Utc};
+/// use option_chain_orderbook::utils::expiration_label;
+/// use optionstratlib::ExpirationDate;
+///
+/// let expiry = Utc.with_ymd_and_hms(2025, 12, 22, 8, 0, 0).single().expect("valid date");
+/// assert_eq!(expiration_label(&ExpirationDate::DateTime(expiry)), "2025-12-22 08:00:00 UTC");
+/// ```
+#[must_use]
+pub fn expiration_label(expiration: &ExpirationDate) -> String {
+    match expiration {
+        ExpirationDate::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        ExpirationDate::Days(_) => expiration.to_string(),
+    }
+}
+
+/// The call and put contract symbols of `strike` at the absolute expiry
+/// `expiry`: `{underlying}-{YYYYMMDD}-{strike}-C` and `-P`.
+///
+/// A pure function of its inputs: the date is injected, and the wall clock
+/// is never read. The hierarchy builds the symbols of every strike of a
+/// [`ExpirationDate::DateTime`] expiration with it.
+///
+/// # Examples
+///
+/// ```rust
+/// use chrono::{TimeZone, Utc};
+/// use option_chain_orderbook::utils::contract_symbols_at;
+///
+/// let expiry = Utc.with_ymd_and_hms(2020, 3, 27, 8, 0, 0).single().expect("valid date");
+/// let (call, put) = contract_symbols_at("BTC", expiry, 50000);
+/// assert_eq!(call, "BTC-20200327-50000-C");
+/// assert_eq!(put, "BTC-20200327-50000-P");
+/// ```
+#[must_use]
+pub fn contract_symbols_at(
+    underlying: &str,
+    expiry: DateTime<Utc>,
+    strike: u64,
+) -> (String, String) {
+    let exp_str = format_yyyymmdd(expiry);
+    (
+        format!("{underlying}-{exp_str}-{strike}-C"),
+        format!("{underlying}-{exp_str}-{strike}-P"),
+    )
 }
 
 /// Parses a `YYYYMMDD` string into a canonical [`ExpirationDate`].
@@ -407,6 +486,8 @@ impl SymbolParser {
 }
 
 #[cfg(test)]
+// Tests read the wall clock to build relative expiries and check them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use chrono::{Datelike, TimeZone, Utc};

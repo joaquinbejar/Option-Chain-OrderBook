@@ -13,6 +13,7 @@ use super::strike::{
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
+use crate::utils::expiration_label;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
@@ -1343,7 +1344,7 @@ impl OptionChainOrderBookManager {
         self.chains
             .get(&ExpirationKey::from(expiration))
             .map(|e| Arc::clone(e.value()))
-            .ok_or_else(|| Error::expiration_not_found(expiration.to_string()))
+            .ok_or_else(|| Error::expiration_not_found(expiration_label(expiration)))
     }
 
     /// Returns true if an option chain exists for the expiration.

@@ -1,5 +1,6 @@
 //! Unit tests for option-chain-orderbook library.
 
+mod expiration_formatting_tests;
 mod layering_tests;
 mod orderbook_tests;
 

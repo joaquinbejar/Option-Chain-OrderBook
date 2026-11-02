@@ -49,6 +49,7 @@ use super::expiry_cycle::{ExpiryCycleConfig, to_datetime};
 use super::instrument_status::InstrumentStatus;
 use super::underlying::UnderlyingOrderBook;
 use crate::error::{Error, Result};
+use crate::utils::expiration_label;
 use chrono::{DateTime, Utc};
 use optionstratlib::ExpirationDate;
 use std::sync::Arc;
@@ -291,7 +292,7 @@ impl ExpiryLifecycleManager {
                 .ok_or_else(|| {
                     tracing::error!(
                         underlying = %underlying_name,
-                        expiration = %expiration,
+                        expiration = %expiration_label(expiration),
                         "overflow computing removal datetime",
                     );
                     Error::configuration("overflow computing removal datetime")
@@ -321,7 +322,7 @@ impl ExpiryLifecycleManager {
                         let cancel_result = exp_book.cancel_all().map_err(|e| {
                             tracing::warn!(
                                 underlying = %underlying_name,
-                                expiration = %expiration,
+                                expiration = %expiration_label(expiration),
                                 error = %e,
                                 "cancel-all failed during lifecycle transition",
                             );
@@ -367,7 +368,7 @@ impl ExpiryLifecycleManager {
                         let cancel_result = exp_book.cancel_all().map_err(|e| {
                             tracing::warn!(
                                 underlying = %underlying_name,
-                                expiration = %expiration,
+                                expiration = %expiration_label(expiration),
                                 error = %e,
                                 "cancel-all failed during lifecycle transition",
                             );
@@ -400,7 +401,7 @@ impl ExpiryLifecycleManager {
                     let cancel_result = exp_book.cancel_all().map_err(|e| {
                         tracing::warn!(
                             underlying = %underlying_name,
-                            expiration = %expiration,
+                            expiration = %expiration_label(expiration),
                             error = %e,
                             "cancel-all failed during lifecycle transition",
                         );
@@ -469,7 +470,7 @@ fn log_lifecycle_event(event: &LifecycleEvent) {
             cancelled_orders,
         } => tracing::info!(
             underlying = %underlying,
-            expiration = %expiration,
+            expiration = %expiration_label(expiration),
             cancelled_orders = *cancelled_orders,
             status = "settling",
             "expiration settling",
@@ -479,7 +480,7 @@ fn log_lifecycle_event(event: &LifecycleEvent) {
             expiration,
         } => tracing::info!(
             underlying = %underlying,
-            expiration = %expiration,
+            expiration = %expiration_label(expiration),
             status = "expired",
             "expiration expired",
         ),
@@ -488,7 +489,7 @@ fn log_lifecycle_event(event: &LifecycleEvent) {
             expiration,
         } => tracing::info!(
             underlying = %underlying,
-            expiration = %expiration,
+            expiration = %expiration_label(expiration),
             status = "removed",
             "expiration removed",
         ),

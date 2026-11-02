@@ -16,7 +16,7 @@ use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfi
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
-use crate::utils::checked_accumulate;
+use crate::utils::{checked_accumulate, expiration_label};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{Clock, FeeSchedule, OrderId, OrderStatus, STPMode, Side};
@@ -813,7 +813,7 @@ impl UnderlyingOrderBook {
         let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
-            let expiration_key = expiration.to_string();
+            let expiration_key = expiration_label(&expiration);
             let result = book.cancel_all()?;
             per_child.push((expiration_key, result));
         }
@@ -857,7 +857,7 @@ impl UnderlyingOrderBook {
         let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
-            let expiration_key = expiration.to_string();
+            let expiration_key = expiration_label(&expiration);
             let result = book.cancel_by_side(side)?;
             per_child.push((expiration_key, result));
         }
@@ -904,7 +904,7 @@ impl UnderlyingOrderBook {
         let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
-            let expiration_key = expiration.to_string();
+            let expiration_key = expiration_label(&expiration);
             let result = book.cancel_by_user(user_id)?;
             per_child.push((expiration_key, result));
         }
@@ -956,7 +956,7 @@ impl UnderlyingOrderBook {
         let mut per_child = Vec::with_capacity(self.expirations.len());
 
         for (expiration, book) in self.expirations.iter() {
-            let expiration_key = expiration.to_string();
+            let expiration_key = expiration_label(&expiration);
             let result = book.evict_expired_orders(now_ms);
             per_child.push((expiration_key, result));
         }

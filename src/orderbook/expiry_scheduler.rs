@@ -332,6 +332,8 @@ impl ExpiryScheduler {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Tests read the wall clock to build relative expiries and check them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::orderbook::{CycleRule, ExpiryType};

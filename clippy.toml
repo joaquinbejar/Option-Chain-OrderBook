@@ -1,0 +1,10 @@
+# Reading the wall clock makes a result depend on when it runs. These are
+# banned; the few places that must read it (wall-clock-relative expiries,
+# the Greeks engine timestamps) carry an `#[expect]` with the reason.
+disallowed-methods = [
+    { path = "chrono::Utc::now", reason = "reads the wall clock; take the instant as an input" },
+    { path = "chrono::Local::now", reason = "reads the wall clock; take the instant as an input" },
+    { path = "optionstratlib::ExpirationDate::get_date", reason = "reads the wall clock even for an absolute DateTime; use utils::format_expiration_yyyymmdd or expiration_label" },
+    { path = "optionstratlib::ExpirationDate::get_date_with_options", reason = "reads the wall clock; use utils::format_expiration_yyyymmdd or expiration_label" },
+    { path = "optionstratlib::ExpirationDate::get_days", reason = "reads the wall clock and mutates thread-local state; use ExpirationKey" },
+]

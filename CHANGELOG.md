@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An absolute `ExpirationDate::DateTime` no longer reads the wall clock anywhere in the hierarchy. `get_date()` and `Display` of `ExpirationDate` evaluate `Utc::now()` even for an absolute instant. Building a strike's contract symbols, the hierarchy logs, mass cancel results and `expiration_not_found` errors now format the instant directly. Every output string is byte for byte the same as before. A `Days` expiration is relative to now by definition and still resolves against the wall clock.
+- `ExpiryCycleConfig::generate_dates` sorts and deduplicates by the expiration instant without reading the clock.
+
+### Added
+
+- `utils::contract_symbols_at(underlying, expiry, strike)`: the call and put symbols of a strike at an injected absolute expiry, as a pure function.
+- `utils::expiration_label(&ExpirationDate)`: the `Display` text, built without the wall clock for a `DateTime`.
+- `clippy.toml` bans `chrono::Utc::now`, `chrono::Local::now` and the clock-reading `ExpirationDate` methods (`get_date`, `get_date_with_options`, `get_days`). The few places that must read the clock carry an `#[expect]` with the reason: the `Days` arm of `format_expiration_yyyymmdd`, and the Greeks engine's time to expiry. Test modules that build relative expiries allow it.
+
 ## [0.14.1] - 2026-11-02
 
 ### Fixed
