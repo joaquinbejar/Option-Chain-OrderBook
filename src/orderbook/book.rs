@@ -4,6 +4,7 @@
 //! OrderBook-rs `OrderBook<T>` implementation with option-specific functionality.
 
 use super::instrument_status::InstrumentStatus;
+use super::node_id::random_node_id;
 use super::quote::Quote;
 use super::validation::ValidationConfig;
 use crate::Result;
@@ -163,6 +164,10 @@ pub(crate) struct BookConfig {
     /// distinct namespaces. Combined with an injected deterministic clock this
     /// makes trade IDs byte-identical across runs sharing the same root.
     pub trade_id_root_namespace: Option<Uuid>,
+    /// The leaf's node id, derived from its path by the strike manager when a
+    /// root namespace is configured (see [`super::node_id`]). `None` gives
+    /// the leaf a random id.
+    pub node_id: Option<OrderId>,
     /// Pre-built NATS publisher listeners installed before the inner book is
     /// wrapped in `Arc` (feature `nats`). `None` for every non-NATS path.
     #[cfg(feature = "nats")]
@@ -178,7 +183,8 @@ impl std::fmt::Debug for BookConfig {
             .field("fee_schedule", &self.fee_schedule)
             .field("enable_state_tracking", &self.enable_state_tracking)
             .field("clock", &self.clock)
-            .field("trade_id_root_namespace", &self.trade_id_root_namespace);
+            .field("trade_id_root_namespace", &self.trade_id_root_namespace)
+            .field("node_id", &self.node_id);
         // The NATS listeners are boxed closures and carry no `Debug`; surface
         // only whether they are present so the impl stays informative.
         #[cfg(feature = "nats")]
@@ -197,6 +203,7 @@ impl Default for BookConfig {
             enable_state_tracking: true,
             clock: None,
             trade_id_root_namespace: None,
+            node_id: None,
             #[cfg(feature = "nats")]
             nats_listeners: None,
         }
@@ -400,10 +407,29 @@ impl OptionOrderBook {
         let symbol = symbol.into();
         let symbol_hash = Self::hash_symbol(&symbol);
 
-        let mut book = if config.stp_mode != STPMode::None {
-            DefaultOrderBook::with_stp_mode(&symbol, config.stp_mode)
+        // With both an engine clock and a root namespace the inner book is
+        // built by the one orderbook-rs constructor that, from orderbook-rs
+        // 0.15.2 on, never derives the default trade-ID namespace, so
+        // building it reads no wall clock, no process id and no construction
+        // counter. With 0.15.1 it still derives one and discards it: the
+        // consumer must resolve orderbook-rs to 0.15.2 or later. The leaf's namespace is
+        // `UUIDv5(root, symbol_bytes)`: call and put carry distinct symbols,
+        // so they get distinct namespaces from the same root, and the same
+        // (root, symbol) pair yields the same namespace in every run.
+        let mut book = if let (Some(clock), Some(root)) =
+            (config.clock.clone(), config.trade_id_root_namespace)
+        {
+            let mut book = DefaultOrderBook::with_clock_and_namespace(
+                &symbol,
+                clock,
+                Uuid::new_v5(&root, symbol.as_bytes()),
+            );
+            if config.stp_mode != STPMode::None {
+                book.set_stp_mode(config.stp_mode);
+            }
+            book
         } else {
-            DefaultOrderBook::new(&symbol)
+            Self::configured_default_book(&symbol, &config)
         };
 
         if let Some(ref validation) = config.validation {
@@ -422,26 +448,6 @@ impl OptionOrderBook {
             .and_then(ValidationConfig::min_price);
         if let Some(schedule) = config.fee_schedule {
             book.set_fee_schedule(Some(schedule));
-        }
-        // Install the injected engine clock (if any) while the book is still
-        // owned mutably, before it is frozen in `Arc`. This works for both
-        // constructor branches above (STP and non-STP). `None` keeps the
-        // upstream default `MonotonicClock`.
-        if let Some(clock) = config.clock.clone() {
-            book.set_clock(clock);
-        }
-        // Derive this leaf's trade-ID namespace from the configured root, while
-        // the book is still owned mutably (pre-`Arc`). The derivation contract is
-        // `UUIDv5(root, leaf_symbol_bytes)`: because call and put carry distinct
-        // symbols, they receive distinct namespaces from the same root, and the
-        // same (root, symbol) pair always yields the same namespace across runs.
-        // Combined with a deterministic clock this makes the leaf's trade IDs
-        // byte-identical run-to-run. The upstream counter-restart caveat on
-        // `set_trade_id_namespace` is moot here: it is applied exactly once, at
-        // construction, before any order is submitted. `None` keeps the upstream
-        // default random namespace.
-        if let Some(root) = config.trade_id_root_namespace {
-            book.set_trade_id_namespace(Uuid::new_v5(&root, symbol.as_bytes()));
         }
 
         // Install the continuous-capture listener backing the opt-in
@@ -533,7 +539,7 @@ impl OptionOrderBook {
             symbol_hash,
             book: Arc::new(book),
             option_style,
-            id: OrderId::from_uuid(Uuid::new_v4()),
+            id: config.node_id.unwrap_or_else(random_node_id),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
@@ -544,6 +550,35 @@ impl OptionOrderBook {
             replace_capture,
             replace_capture_armed: replace_armed,
         }
+    }
+
+    /// The inner book of a leaf configured without both an engine clock and a
+    /// root namespace: the upstream constructor, then the clock and the
+    /// namespace that are configured. The upstream constructor derives the
+    /// default trade-ID namespace (wall clock, process id and a construction
+    /// counter) even when a namespace replaces it here; only the path in
+    /// [`Self::new_with_config`] with both set avoids that.
+    fn configured_default_book(symbol: &str, config: &BookConfig) -> DefaultOrderBook {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "without both a clock and a root namespace the leaf keeps the upstream default construction"
+        )]
+        let mut book = if config.stp_mode != STPMode::None {
+            DefaultOrderBook::with_stp_mode(symbol, config.stp_mode)
+        } else {
+            DefaultOrderBook::new(symbol)
+        };
+        // `None` keeps the upstream default `MonotonicClock`.
+        if let Some(clock) = config.clock.clone() {
+            book.set_clock(clock);
+        }
+        // Applied once, before any order is submitted, so the upstream
+        // counter-restart caveat of `set_trade_id_namespace` is moot. `None`
+        // keeps the upstream default namespace.
+        if let Some(root) = config.trade_id_root_namespace {
+            book.set_trade_id_namespace(Uuid::new_v5(&root, symbol.as_bytes()));
+        }
+        book
     }
 
     // ── Public constructors ─────────────────────────────────────────────
@@ -714,7 +749,14 @@ impl OptionOrderBook {
         self.symbol_hash
     }
 
-    /// Returns the unique identifier for this order book.
+    /// Returns the identifier of this order book.
+    ///
+    /// Built by a manager with a trade-ID root namespace, the id is
+    /// `UUIDv5(root, path)` of the node's path in the hierarchy (see the
+    /// `node_id` module): the same root and path give the same id in every
+    /// hierarchy and every run, also when the node is removed and created
+    /// again, and another root gives another id. Built without a root, the
+    /// id is a random UUIDv4.
     #[must_use]
     pub const fn id(&self) -> OrderId {
         self.id
@@ -2556,6 +2598,9 @@ impl OptionOrderBook {
 }
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -4436,6 +4481,7 @@ mod tests {
                 enable_state_tracking: true,
                 clock: None,
                 trade_id_root_namespace: None,
+                node_id: None,
                 #[cfg(feature = "nats")]
                 nats_listeners: None,
             },
@@ -5876,6 +5922,9 @@ mod tests {
 /// UP-1: the leaf's order state tracker follows the leaf clock, and tracking
 /// can be disabled.
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod up1_state_tracking_tests {
     use super::*;
     use orderbook_rs::StubClock;
@@ -5967,6 +6016,9 @@ mod up1_state_tracking_tests {
 /// own trades and timestamps under a clock that does not advance on read,
 /// and both constructor branches honour the configuration.
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod up1_equivalence_tests {
     use super::*;
     use orderbook_rs::StubClock;

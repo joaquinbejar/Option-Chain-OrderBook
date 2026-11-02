@@ -1,5 +1,9 @@
 //! Benchmarks for order book operations.
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{BenchmarkId, Criterion, Throughput};
 use option_chain_orderbook::orderbook::OptionOrderBook;
 use optionstratlib::OptionStyle;

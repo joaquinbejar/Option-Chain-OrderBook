@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A leaf with an engine clock and a trade-ID root namespace is built without the default namespace.** `OptionOrderBook` used to build its inner book with `OrderBook::new` or `OrderBook::with_stp_mode`, which derive the default trade-ID namespace from the wall clock, the process id and a global counter, and only then installed the injected clock and namespace. With both configured (`set_clock` and `set_trade_id_namespace` on the manager), the inner book is now built with `OrderBook::with_clock_and_namespace`, and the STP mode is set on it afterwards. That constructor derives no default namespace only from orderbook-rs 0.15.2 on, so the guarantee needs the consumer to resolve orderbook-rs to 0.15.2 or later (for an existing lock file, `cargo update -p orderbook-rs`); with 0.15.1 it still derives one, reading the wall clock, and discards it. The test that counts clock reads while building sees only the injected clock, so it cannot detect that 0.15.1 read. The leaf's trade-ID namespace is still `UUIDv5(root, symbol)`. Without both, construction is unchanged.
+- **Hierarchy node ids are derived, not random, under a root namespace.** Expiration, chain, strike and leaf books built by a manager with a trade-ID root namespace take `UUIDv5(root, path)` as their `id()`, where the path encodes the level, the underlying, the full expiration instant (or the normalized day count), the strike and the option style without ambiguity. Building them reads no OS entropy, and the same root and path give the same id in every hierarchy and every run. Without a root, ids stay random UUIDv4 values.
+
+### Changed
+
+- `clippy.toml` also bans the orderbook-rs constructors that derive the default namespace (`OrderBook::new`, `with_clock`, `with_stp_mode`, `with_trade_listener`, `with_trade_and_price_level_listener`) and `Uuid::new_v4` in the library. `make lint-selftest` (in `make check`, `make pre-push` and the lint workflow) checks that every ban fires on the probes of `src/lint_probe.rs`, built only with `--cfg ocob_lint_probe`.
+
+### Known limitation
+
+- A leaf's symbol carries only the expiration day. Two expirations of one underlying on the same day with different instants give leaves with the same symbol, so they collide twice: in the symbol index, which is keyed by symbol and keeps one of them, and in the trade-ID namespace, which derives from the symbol and gives both the same trade-ID stream. The caller must keep leaf symbols unique: at most one expiration instant per day per underlying. A versioned change (symbols or namespaces from the full instant) is left for a later minor release ([#179](https://github.com/joaquinbejar/Option-Chain-OrderBook/issues/179)).
+
 ## [0.14.2] - 2026-11-02
 
 ### Fixed

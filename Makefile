@@ -38,6 +38,11 @@ fmt-check:
 lint:
 	cargo clippy --all-targets --all-features --workspace -- -D warnings
 
+# The bans in clippy.toml fire on every probe of src/lint_probe.rs
+.PHONY: lint-selftest
+lint-selftest:
+	scripts/lint-selftest.sh
+
 .PHONY: lint-fix
 lint-fix: 
 	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged --workspace -- -D warnings
@@ -49,7 +54,7 @@ clean:
 
 # Pre-push checks
 .PHONY: check
-check: test fmt-check lint
+check: test fmt-check lint lint-selftest
 
 # Run the project
 .PHONY: run
@@ -61,7 +66,7 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc
+pre-push: fix fmt lint-fix lint-selftest test readme doc
 
 .PHONY: doc
 doc:

@@ -1,5 +1,10 @@
 //! Unit tests for option-chain-orderbook library.
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
+mod deterministic_construction_tests;
 mod expiration_formatting_tests;
 mod layering_tests;
 mod orderbook_tests;

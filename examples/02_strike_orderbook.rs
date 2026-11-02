@@ -5,6 +5,10 @@
 //!
 //! Run with: `cargo run --example 02_strike_orderbook`
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use option_chain_orderbook::orderbook::{StrikeOrderBook, StrikeOrderBookManager};
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};

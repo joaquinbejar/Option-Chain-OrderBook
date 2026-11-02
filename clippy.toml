@@ -7,4 +7,21 @@ disallowed-methods = [
     { path = "optionstratlib::ExpirationDate::get_date", reason = "reads the wall clock even for an absolute DateTime; use utils::format_expiration_yyyymmdd or expiration_label" },
     { path = "optionstratlib::ExpirationDate::get_date_with_options", reason = "reads the wall clock; use utils::format_expiration_yyyymmdd or expiration_label" },
     { path = "optionstratlib::ExpirationDate::get_days", reason = "reads the wall clock and mutates thread-local state; use ExpirationKey" },
+    # Every orderbook-rs constructor but `with_clock_and_namespace` derives the
+    # default trade-ID namespace from the wall clock, the process id and a
+    # global counter. A leaf with an engine clock and a root namespace is
+    # built with `with_clock_and_namespace`; the other paths carry an
+    # `#[expect]`.
+    { path = "orderbook_rs::OrderBook::new", reason = "derives the default trade-ID namespace (wall clock, pid, global counter); use OrderBook::with_clock_and_namespace" },
+    { path = "orderbook_rs::OrderBook::with_clock", reason = "derives the default trade-ID namespace (wall clock, pid, global counter); use OrderBook::with_clock_and_namespace" },
+    { path = "orderbook_rs::OrderBook::with_stp_mode", reason = "derives the default trade-ID namespace (wall clock, pid, global counter); use OrderBook::with_clock_and_namespace and set_stp_mode" },
+    { path = "orderbook_rs::OrderBook::with_trade_listener", reason = "derives the default trade-ID namespace (wall clock, pid, global counter); use OrderBook::with_clock_and_namespace and set_trade_listener" },
+    { path = "orderbook_rs::OrderBook::with_trade_and_price_level_listener", reason = "derives the default trade-ID namespace (wall clock, pid, global counter); use OrderBook::with_clock_and_namespace and the listener setters" },
+    # Node ids derive from the root namespace (orderbook::node_id).
+    { path = "uuid::Uuid::new_v4", reason = "reads OS entropy; derive the id with orderbook::node_id" },
+    # Not enabled in the graph today (uuid features v4 and v5 only); banned so
+    # enabling them later cannot add a clock or entropy read unnoticed.
+    { path = "uuid::Uuid::now_v1", reason = "reads the wall clock", allow-invalid = true },
+    { path = "uuid::Uuid::now_v6", reason = "reads the wall clock", allow-invalid = true },
+    { path = "uuid::Uuid::now_v7", reason = "reads the wall clock and OS entropy", allow-invalid = true },
 ]

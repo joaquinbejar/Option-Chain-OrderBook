@@ -2446,6 +2446,9 @@ impl std::fmt::Debug for SequencedUnderlyingOrderBook {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

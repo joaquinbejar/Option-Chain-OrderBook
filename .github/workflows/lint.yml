@@ -51,3 +51,6 @@ jobs:
 
       - name: Lint
         run: make lint
+
+      - name: Lint bans self test
+        run: make lint-selftest

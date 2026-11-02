@@ -578,6 +578,9 @@ fn set_all_book_status(chain: &super::chain::OptionChainOrderBook, status: Instr
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// Tests build orders with random ids and books with the default
+// constructors; the bans in clippy.toml cover the library.
+#[allow(clippy::disallowed_methods)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;

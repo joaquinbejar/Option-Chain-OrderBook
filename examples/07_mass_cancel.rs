@@ -5,6 +5,10 @@
 //!
 //! Run with: `cargo run --example 07_mass_cancel`
 
+// Examples, benchmarks and tests build orders with random ids and books
+// with the default constructors; the bans in clippy.toml cover the library.
+#![allow(clippy::disallowed_methods)]
+
 use option_chain_orderbook::orderbook::UnderlyingOrderBookManager;
 use optionstratlib::ExpirationDate;
 use optionstratlib::prelude::pos_or_panic;
