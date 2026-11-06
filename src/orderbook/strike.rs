@@ -8,7 +8,7 @@ use super::book::{BookConfig, OptionOrderBook};
 use super::book::{ContractNatsListenerFactory, PreparedNatsListeners, SharedNatsFactory};
 use super::contract_specs::ContractSpecs;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
-use super::node_id::{NodePath, derived_node_id, node_id, random_node_id};
+use super::node_id::{NodePath, derived_node_id, derived_trade_namespace, node_id, random_node_id};
 use super::quote::Quote;
 use super::shared::Shared;
 use super::symbol_index::{SymbolIndex, SymbolRef};
@@ -958,7 +958,7 @@ pub struct StrikeOrderBookManager {
     state_tracking: Shared<bool>,
     /// Root trade-ID namespace applied to newly created option books. `None`
     /// keeps the upstream default (a random per-book namespace); a set root has
-    /// each future leaf derive `UUIDv5(root, symbol)` at construction, making
+    /// each future leaf derive its namespace from the root and its full path at construction, making
     /// trade IDs reproducible across runs that share the root and clock.
     trade_id_root_namespace: Shared<Option<Uuid>>,
     /// Per-contract NATS listener factory propagated from the top of the
@@ -1269,7 +1269,7 @@ impl StrikeOrderBookManager {
     /// Applies to option books created *after* this call via
     /// [`get_or_create`](Self::get_or_create); existing books are unaffected
     /// (same semantics as the engine clock). Each future leaf derives its own
-    /// namespace `UUIDv5(root, symbol)` at construction, so call and put receive
+    /// namespace from the root and its full path at construction, so call and put receive
     /// distinct namespaces and — together with a deterministic clock — produce
     /// byte-identical trade IDs across runs sharing this root.
     #[inline]
@@ -1440,6 +1440,22 @@ impl StrikeOrderBookManager {
         })
     }
 
+    /// The trade-ID namespace of the `style` leaf of `strike`, from its full
+    /// path, so same-day expirations at different instants do not share one.
+    fn leaf_trade_namespace(
+        &self,
+        root: Option<Uuid>,
+        strike: u64,
+        style: OptionStyle,
+    ) -> Option<Uuid> {
+        root.map(|root| {
+            derived_trade_namespace(
+                root,
+                &NodePath::leaf_trade_namespace(&self.underlying, &self.expiration, strike, style),
+            )
+        })
+    }
+
     /// Internal helper that builds a [`StrikeOrderBook`] with optional
     /// validation config, STP mode, and fee schedule but **without** allocating
     /// instrument IDs.
@@ -1465,6 +1481,7 @@ impl StrikeOrderBookManager {
             &call_symbol,
             OptionStyle::Call,
             BookConfig {
+                trade_id_namespace: self.leaf_trade_namespace(root, strike, OptionStyle::Call),
                 node_id: self.leaf_node_id(root, strike, OptionStyle::Call),
                 ..base_config.clone()
             },
@@ -1473,6 +1490,7 @@ impl StrikeOrderBookManager {
             &put_symbol,
             OptionStyle::Put,
             BookConfig {
+                trade_id_namespace: self.leaf_trade_namespace(root, strike, OptionStyle::Put),
                 node_id: self.leaf_node_id(root, strike, OptionStyle::Put),
                 ..base_config
             },
@@ -1572,6 +1590,7 @@ impl StrikeOrderBookManager {
             &call_symbol,
             OptionStyle::Call,
             BookConfig {
+                trade_id_namespace: self.leaf_trade_namespace(root, strike, OptionStyle::Call),
                 node_id: self.leaf_node_id(root, strike, OptionStyle::Call),
                 ..self.book_config_with_listeners(factory(&call_symbol))
             },
@@ -1580,6 +1599,7 @@ impl StrikeOrderBookManager {
             &put_symbol,
             OptionStyle::Put,
             BookConfig {
+                trade_id_namespace: self.leaf_trade_namespace(root, strike, OptionStyle::Put),
                 node_id: self.leaf_node_id(root, strike, OptionStyle::Put),
                 ..self.book_config_with_listeners(factory(&put_symbol))
             },
@@ -1720,8 +1740,8 @@ impl StrikeOrderBookManager {
         if removed && let Some(idx) = &self.symbol_index {
             let (call_symbol, put_symbol) =
                 contract_symbols(&self.underlying, &self.expiration, strike);
-            idx.deregister(&call_symbol);
-            idx.deregister(&put_symbol);
+            idx.deregister_at(&call_symbol, &self.expiration);
+            idx.deregister_at(&put_symbol, &self.expiration);
         }
         removed
     }
@@ -1764,8 +1784,8 @@ impl StrikeOrderBookManager {
         if removed && let Some(idx) = &self.symbol_index {
             let (call_symbol, put_symbol) =
                 contract_symbols(&self.underlying, &self.expiration, strike);
-            idx.deregister(&call_symbol);
-            idx.deregister(&put_symbol);
+            idx.deregister_at(&call_symbol, &self.expiration);
+            idx.deregister_at(&put_symbol, &self.expiration);
         }
         removed
     }
@@ -3149,12 +3169,20 @@ mod tests {
                 .expect("one fill")
                 .trade_id()
         }
-        fn reference_leaf(symbol: &str, root: Uuid) -> OptionOrderBook {
+        fn reference_leaf(symbol: &str, strike: u64, root: Uuid) -> OptionOrderBook {
             OptionOrderBook::new_with_config(
                 symbol,
                 OptionStyle::Call,
                 BookConfig {
-                    trade_id_root_namespace: Some(root),
+                    trade_id_namespace: Some(derived_trade_namespace(
+                        root,
+                        &NodePath::leaf_trade_namespace(
+                            "BTC",
+                            &test_expiration(),
+                            strike,
+                            OptionStyle::Call,
+                        ),
+                    )),
                     ..BookConfig::default()
                 },
             )
@@ -3167,11 +3195,11 @@ mod tests {
         let after = manager.get_or_create(51000);
 
         // A book created AFTER the set derives its namespace from the root, so it
-        // matches an independently-derived reference leaf with the same symbol.
+        // matches an independently-derived reference leaf with the same path.
         let after_symbol = after.call().symbol().to_string();
         assert_eq!(
             first_trade_id(after.call()),
-            first_trade_id(&reference_leaf(&after_symbol, root)),
+            first_trade_id(&reference_leaf(&after_symbol, 51000, root)),
             "a book created after set_trade_id_namespace uses the derived namespace"
         );
         // A book created BEFORE the set kept the default random namespace, so it
@@ -3179,7 +3207,7 @@ mod tests {
         let before_symbol = before.call().symbol().to_string();
         assert_ne!(
             first_trade_id(before.call()),
-            first_trade_id(&reference_leaf(&before_symbol, root)),
+            first_trade_id(&reference_leaf(&before_symbol, 50000, root)),
             "a book created before set_trade_id_namespace keeps the default namespace"
         );
     }

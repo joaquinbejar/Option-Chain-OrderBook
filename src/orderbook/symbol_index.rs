@@ -9,7 +9,9 @@
 //! [`StrikeOrderBook`](super::strike::StrikeOrderBook) is created, both call
 //! and put symbols are automatically registered.
 
+use super::expiration_key::ExpirationKey;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use optionstratlib::{ExpirationDate, OptionStyle};
 
 /// Reference to locate an [`OptionOrderBook`](super::book::OptionOrderBook)
@@ -100,6 +102,15 @@ impl std::fmt::Display for SymbolRef {
 /// The index is automatically populated when strikes are created through
 /// the hierarchy and cleaned up when strikes are removed.
 ///
+/// ## Same-day expirations
+///
+/// A leaf symbol carries only the expiration day, so two expirations of one
+/// underlying on the same day at different instants share their symbols.
+/// Each entry is identified by its symbol **and** its full expiration, so
+/// they stay distinct entries. [`get`](Self::get) answers only when a symbol
+/// names one entry; use [`get_at`](Self::get_at) or [`get_all`](Self::get_all)
+/// for a symbol that names several.
+///
 /// ## Thread Safety
 ///
 /// Uses [`DashMap`] for concurrent reads and writes via sharded locking.
@@ -126,8 +137,8 @@ impl std::fmt::Display for SymbolRef {
 /// assert!(index.get("ETH-20260130-3000-P").is_none());
 /// ```
 pub struct SymbolIndex {
-    /// Symbol string → SymbolRef mapping.
-    index: DashMap<String, SymbolRef>,
+    /// Symbol string → the entries of that symbol, one per expiration.
+    index: DashMap<String, Vec<SymbolRef>>,
 }
 
 impl SymbolIndex {
@@ -141,8 +152,9 @@ impl SymbolIndex {
 
     /// Registers a symbol in the index.
     ///
-    /// If the symbol already exists, it is overwritten and this method
-    /// returns `true` to indicate a duplicate registration occurred.
+    /// An entry with the same symbol and the same expiration is overwritten,
+    /// and this method returns `true`. The same symbol with another
+    /// expiration is a new entry.
     ///
     /// # Arguments
     ///
@@ -151,12 +163,22 @@ impl SymbolIndex {
     ///
     /// # Returns
     ///
-    /// `true` if the symbol was already present (overwritten), `false` if new.
+    /// `true` if the entry was already present (overwritten), `false` if new.
     pub fn register(&self, symbol: impl Into<String>, sym_ref: SymbolRef) -> bool {
-        self.index.insert(symbol.into(), sym_ref).is_some()
+        let mut entries = self.index.entry(symbol.into()).or_default();
+        let key = ExpirationKey::from(sym_ref.expiration());
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| ExpirationKey::from(entry.expiration()) == key)
+        {
+            *entry = sym_ref;
+            return true;
+        }
+        entries.push(sym_ref);
+        false
     }
 
-    /// Deregisters a symbol from the index.
+    /// Deregisters every entry of a symbol.
     ///
     /// # Arguments
     ///
@@ -169,6 +191,28 @@ impl SymbolIndex {
         self.index.remove(symbol).is_some()
     }
 
+    /// Deregisters the entry of a symbol at one expiration, leaving the
+    /// entries of the same symbol at other expirations.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the entry was present and removed, `false` otherwise.
+    pub fn deregister_at(&self, symbol: &str, expiration: &ExpirationDate) -> bool {
+        let Entry::Occupied(mut occupied) = self.index.entry(symbol.to_string()) else {
+            return false;
+        };
+        let key = ExpirationKey::from(expiration);
+        let before = occupied.get().len();
+        occupied
+            .get_mut()
+            .retain(|entry| ExpirationKey::from(entry.expiration()) != key);
+        let removed = occupied.get().len() != before;
+        if occupied.get().is_empty() {
+            occupied.remove();
+        }
+        removed
+    }
+
     /// Looks up a symbol reference by its string representation.
     ///
     /// # Arguments
@@ -177,25 +221,48 @@ impl SymbolIndex {
     ///
     /// # Returns
     ///
-    /// The symbol reference if found, `None` otherwise.
+    /// The symbol reference if the symbol names exactly one entry. `None` if
+    /// it is not registered or names several: never an arbitrary one of them.
     #[must_use]
     #[inline]
     pub fn get(&self, symbol: &str) -> Option<SymbolRef> {
-        self.index.get(symbol).map(|entry| entry.value().clone())
+        match self.index.get(symbol)?.value().as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 
-    /// Returns `true` if the symbol is registered.
+    /// Looks up the entry of a symbol at one expiration.
+    #[must_use]
+    pub fn get_at(&self, symbol: &str, expiration: &ExpirationDate) -> Option<SymbolRef> {
+        let key = ExpirationKey::from(expiration);
+        self.index
+            .get(symbol)?
+            .iter()
+            .find(|entry| ExpirationKey::from(entry.expiration()) == key)
+            .cloned()
+    }
+
+    /// Returns every entry of a symbol, in registration order.
+    #[must_use]
+    pub fn get_all(&self, symbol: &str) -> Vec<SymbolRef> {
+        self.index
+            .get(symbol)
+            .map_or_else(Vec::new, |entries| entries.value().clone())
+    }
+
+    /// Returns `true` if the symbol has at least one entry.
     #[must_use]
     #[inline]
     pub fn contains(&self, symbol: &str) -> bool {
         self.index.contains_key(symbol)
     }
 
-    /// Returns the number of registered symbols.
+    /// Returns the number of registered entries. Same-day expirations that
+    /// share a symbol count once each.
     #[must_use]
-    #[inline]
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index.iter().map(|entry| entry.value().len()).sum()
     }
 
     /// Returns `true` if no symbols are registered.
@@ -205,13 +272,15 @@ impl SymbolIndex {
         self.index.is_empty()
     }
 
-    /// Returns a snapshot `Vec` of all registered symbols, in unspecified order.
+    /// Returns a snapshot `Vec` of the distinct registered symbols, in
+    /// unspecified order.
     #[must_use]
     pub fn symbols(&self) -> Vec<String> {
         self.index.iter().map(|entry| entry.key().clone()).collect()
     }
 
-    /// Returns a snapshot of all registered `(symbol, SymbolRef)` pairs.
+    /// Returns a snapshot of all registered `(symbol, SymbolRef)` pairs. A
+    /// symbol with several entries appears once per entry.
     ///
     /// The returned `Vec` is a point-in-time snapshot — concurrent
     /// registrations that occur after the call begins may or may not
@@ -241,7 +310,14 @@ impl SymbolIndex {
     pub fn entries(&self) -> Vec<(String, SymbolRef)> {
         self.index
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .flat_map(|entry| {
+                let symbol = entry.key().clone();
+                entry
+                    .value()
+                    .iter()
+                    .map(|sym_ref| (symbol.clone(), sym_ref.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 }
@@ -259,6 +335,67 @@ mod tests {
 
     fn test_expiration() -> ExpirationDate {
         ExpirationDate::Days(pos_or_panic!(30.0))
+    }
+
+    fn at_hour(hour: u32) -> ExpirationDate {
+        ExpirationDate::DateTime(
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 1, 30, hour, 0, 0)
+                .single()
+                .expect("valid instant"),
+        )
+    }
+
+    #[test]
+    fn test_same_day_instants_are_distinct_entries() {
+        let index = SymbolIndex::new();
+        let symbol = "BTC-20260130-50000-C";
+        let morning = SymbolRef::new("BTC", at_hour(8), 50000, OptionStyle::Call);
+        let afternoon = SymbolRef::new("BTC", at_hour(16), 50000, OptionStyle::Call);
+
+        assert!(!index.register(symbol, morning));
+        assert!(!index.register(symbol, afternoon));
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.entries().len(), 2);
+        assert_eq!(index.symbols().len(), 1);
+        assert_eq!(index.get_all(symbol).len(), 2);
+        assert!(
+            index.get(symbol).is_none(),
+            "an ambiguous symbol has no answer"
+        );
+        for hour in [8, 16] {
+            let found = index.get_at(symbol, &at_hour(hour)).expect("registered");
+            assert!(matches!(
+                (found.expiration(), at_hour(hour)),
+                (ExpirationDate::DateTime(a), ExpirationDate::DateTime(b)) if *a == b
+            ));
+        }
+        assert!(index.get_at(symbol, &at_hour(12)).is_none());
+    }
+
+    #[test]
+    fn test_deregister_at_keeps_the_other_instant() {
+        let index = SymbolIndex::new();
+        let symbol = "BTC-20260130-50000-C";
+        index.register(
+            symbol,
+            SymbolRef::new("BTC", at_hour(8), 50000, OptionStyle::Call),
+        );
+        index.register(
+            symbol,
+            SymbolRef::new("BTC", at_hour(16), 50000, OptionStyle::Call),
+        );
+
+        assert!(!index.deregister_at(symbol, &at_hour(12)));
+        assert!(index.deregister_at(symbol, &at_hour(8)));
+        assert_eq!(index.len(), 1);
+        assert!(
+            index.get(symbol).is_some(),
+            "one entry left: unambiguous again"
+        );
+        assert!(index.deregister_at(symbol, &at_hour(16)));
+        assert!(index.is_empty());
+        assert!(!index.contains(symbol));
+        assert!(!index.deregister_at(symbol, &at_hour(16)));
     }
 
     #[test]

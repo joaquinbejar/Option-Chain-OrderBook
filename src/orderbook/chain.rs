@@ -1215,7 +1215,7 @@ impl OptionChainOrderBookManager {
     ///
     /// Existing chains are not affected. Only newly created chains via
     /// [`get_or_create`](Self::get_or_create) will have this root propagated down
-    /// to their strike manager, where each leaf derives `UUIDv5(root, symbol)`.
+    /// to their strike manager, where each leaf derives its namespace from the root and its full path.
     #[inline]
     pub fn set_trade_id_namespace(&self, namespace: Uuid) {
         self.trade_id_root_namespace.set(Some(namespace));

@@ -224,3 +224,78 @@ fn test_construction_setters_reach_only_nodes_built_after_them() {
         .call_arc();
     assert!(Arc::ptr_eq(under_new_underlying.inner().clock(), &clock));
 }
+
+/// Regression for #179: same-day expirations at different instants share a
+/// symbol, but not an index entry or a trade-ID stream.
+mod same_day_expirations {
+    use super::*;
+    use option_chain_orderbook::Error;
+
+    const SYMBOL: &str = "BTC-20260130-50000-C";
+
+    fn at_hour(hour: u32) -> ExpirationDate {
+        ExpirationDate::DateTime(
+            Utc.with_ymd_and_hms(2026, 1, 30, hour, 0, 0)
+                .single()
+                .expect("valid instant"),
+        )
+    }
+
+    fn leaf(manager: &UnderlyingOrderBookManager, hour: u32) -> Arc<OptionOrderBook> {
+        manager
+            .get_or_create("BTC")
+            .get_or_create_expiration(at_hour(hour))
+            .get_or_create_strike(50_000)
+            .call_arc()
+    }
+
+    fn deterministic_manager() -> UnderlyingOrderBookManager {
+        let clock: Arc<dyn Clock> = Arc::new(StubClock::new());
+        manager(Some(clock), Some(Uuid::from_u128(0x00C0_FFEE)))
+    }
+
+    #[test]
+    fn test_distinct_index_entries_and_lookup_by_instant() {
+        let manager = deterministic_manager();
+        let morning = leaf(&manager, 8);
+        let afternoon = leaf(&manager, 16);
+        assert_eq!(morning.symbol(), SYMBOL);
+        assert_eq!(afternoon.symbol(), SYMBOL);
+        assert!(!Arc::ptr_eq(&morning, &afternoon));
+
+        assert!(matches!(
+            manager.get_by_symbol(SYMBOL),
+            Err(Error::AmbiguousSymbol { count: 2, .. })
+        ));
+        let found = manager.get_by_symbol_at(SYMBOL, &at_hour(8)).expect("8h");
+        assert!(Arc::ptr_eq(&found, &morning));
+        let found = manager.get_by_symbol_at(SYMBOL, &at_hour(16)).expect("16h");
+        assert!(Arc::ptr_eq(&found, &afternoon));
+    }
+
+    #[test]
+    fn test_removing_one_strike_keeps_the_other_instant_indexed() {
+        let manager = deterministic_manager();
+        let morning = leaf(&manager, 8);
+        let afternoon = leaf(&manager, 16);
+        drop(morning);
+        let underlying = manager.get("BTC").expect("underlying");
+        let expiration = underlying.get_expiration(&at_hour(8)).expect("expiration");
+        assert!(expiration.chain().strikes().remove(50_000));
+
+        let found = manager.get_by_symbol(SYMBOL).expect("one entry left");
+        assert!(Arc::ptr_eq(&found, &afternoon));
+    }
+
+    #[test]
+    fn test_distinct_trade_streams_repeatable_across_hierarchies() {
+        let first = deterministic_manager();
+        let second = deterministic_manager();
+        let morning = trade_ids(&leaf(&first, 8));
+        let afternoon = trade_ids(&leaf(&first, 16));
+        assert!(!morning.is_empty());
+        assert_ne!(morning, afternoon, "same symbol, distinct namespaces");
+        assert_eq!(morning, trade_ids(&leaf(&second, 8)));
+        assert_eq!(afternoon, trade_ids(&leaf(&second, 16)));
+    }
+}

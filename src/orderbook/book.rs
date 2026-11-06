@@ -164,6 +164,13 @@ pub(crate) struct BookConfig {
     /// distinct namespaces. Combined with an injected deterministic clock this
     /// makes trade IDs byte-identical across runs sharing the same root.
     pub trade_id_root_namespace: Option<Uuid>,
+    /// The leaf's own trade-ID namespace, used as is instead of deriving it
+    /// from the root and the symbol.
+    ///
+    /// The strike manager sets it from the leaf's full path, expiration
+    /// instant included (see [`super::node_id`]), because a symbol carries
+    /// only the expiration day.
+    pub trade_id_namespace: Option<Uuid>,
     /// The leaf's node id, derived from its path by the strike manager when a
     /// root namespace is configured (see [`super::node_id`]). `None` gives
     /// the leaf a random id.
@@ -184,6 +191,7 @@ impl std::fmt::Debug for BookConfig {
             .field("enable_state_tracking", &self.enable_state_tracking)
             .field("clock", &self.clock)
             .field("trade_id_root_namespace", &self.trade_id_root_namespace)
+            .field("trade_id_namespace", &self.trade_id_namespace)
             .field("node_id", &self.node_id);
         // The NATS listeners are boxed closures and carry no `Debug`; surface
         // only whether they are present so the impl stays informative.
@@ -203,6 +211,7 @@ impl Default for BookConfig {
             enable_state_tracking: true,
             clock: None,
             trade_id_root_namespace: None,
+            trade_id_namespace: None,
             node_id: None,
             #[cfg(feature = "nats")]
             nats_listeners: None,
@@ -412,18 +421,11 @@ impl OptionOrderBook {
         // 0.15.2 on, never derives the default trade-ID namespace, so
         // building it reads no wall clock, no process id and no construction
         // counter. With 0.15.1 it still derives one and discards it: the
-        // consumer must resolve orderbook-rs to 0.15.2 or later. The leaf's namespace is
-        // `UUIDv5(root, symbol_bytes)`: call and put carry distinct symbols,
-        // so they get distinct namespaces from the same root, and the same
-        // (root, symbol) pair yields the same namespace in every run.
-        let mut book = if let (Some(clock), Some(root)) =
-            (config.clock.clone(), config.trade_id_root_namespace)
+        // consumer must resolve orderbook-rs to 0.15.2 or later.
+        let mut book = if let (Some(clock), Some(namespace)) =
+            (config.clock.clone(), Self::leaf_namespace(&symbol, &config))
         {
-            let mut book = DefaultOrderBook::with_clock_and_namespace(
-                &symbol,
-                clock,
-                Uuid::new_v5(&root, symbol.as_bytes()),
-            );
+            let mut book = DefaultOrderBook::with_clock_and_namespace(&symbol, clock, namespace);
             if config.stp_mode != STPMode::None {
                 book.set_stp_mode(config.stp_mode);
             }
@@ -575,10 +577,21 @@ impl OptionOrderBook {
         // Applied once, before any order is submitted, so the upstream
         // counter-restart caveat of `set_trade_id_namespace` is moot. `None`
         // keeps the upstream default namespace.
-        if let Some(root) = config.trade_id_root_namespace {
-            book.set_trade_id_namespace(Uuid::new_v5(&root, symbol.as_bytes()));
+        if let Some(namespace) = Self::leaf_namespace(symbol, config) {
+            book.set_trade_id_namespace(namespace);
         }
         book
+    }
+
+    /// The configured trade-ID namespace of a leaf: the explicit one, else
+    /// `UUIDv5(root, symbol_bytes)`. The same inputs give the same namespace
+    /// in every run.
+    fn leaf_namespace(symbol: &str, config: &BookConfig) -> Option<Uuid> {
+        config.trade_id_namespace.or_else(|| {
+            config
+                .trade_id_root_namespace
+                .map(|root| Uuid::new_v5(&root, symbol.as_bytes()))
+        })
     }
 
     // ── Public constructors ─────────────────────────────────────────────
@@ -4481,6 +4494,7 @@ mod tests {
                 enable_state_tracking: true,
                 clock: None,
                 trade_id_root_namespace: None,
+                trade_id_namespace: None,
                 node_id: None,
                 #[cfg(feature = "nats")]
                 nats_listeners: None,
