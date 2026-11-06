@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-06
+
 ### Breaking
 
 - **Same-day expirations no longer collide in the symbol index or the trade-ID namespace ([#179](https://github.com/joaquinbejar/Option-Chain-OrderBook/issues/179)).** A leaf symbol still carries only the expiration day and its format does not change.
