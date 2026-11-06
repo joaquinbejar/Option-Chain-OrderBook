@@ -5,6 +5,7 @@
 #![allow(clippy::disallowed_methods)]
 
 mod deterministic_construction_tests;
+#[cfg(feature = "clock")]
 mod expiration_formatting_tests;
 mod layering_tests;
 mod orderbook_tests;

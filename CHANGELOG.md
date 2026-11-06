@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `UnderlyingOrderBookManager::get_by_symbol` returns the new `Error::AmbiguousSymbol` for such a symbol.
   - `BookConfig` has a new public field, `trade_id_namespace`.
 
+- **The wall clock is an opt-in `clock` feature, off by default ([#176](https://github.com/joaquinbejar/Option-Chain-OrderBook/issues/176)).** `chrono` is now built without default features and `optionstratlib` moves to 0.24. With the feature off, `cargo tree -e features -i chrono` shows no `clock`. A consumer that uses the following must enable `clock`:
+  - `GreeksEngine` and the rest of `orderbook::greeks_engine`, including `calculate_tte_years`, which do not exist without it.
+  - `ExpirationDate::Days` resolved to a date. Without the feature, `format_expiration_yyyymmdd` returns the new `Error::ClockRequired`, and `expiration_label` and the symbols of a `Days` leaf carry the day count (`BTC-30 days-50000-C`) instead of a date.
+
 ### Added
 
 - `SymbolIndex::get_at`, `get_all` and `deregister_at`, and `UnderlyingOrderBookManager::get_by_symbol_at`, which select an entry by its full expiration.
@@ -28,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known limitation
 
 - Same-day leaves still share a display symbol, and everything keyed by it. `SymbolParser` resolves a symbol to the canonical expiry time of its day, so sequencer commands addressed by symbol reach only an expiration at that instant. NATS subjects built from the symbol are shared too.
+- The `clock` feature covers `chrono`. Without it, the library still reads `std::time::SystemTime` for the default event-envelope timestamp and the index price feed timestamps (`nanos_since_epoch`), unless a source is injected.
 
 ## [0.14.3] - 2026-11-02
 

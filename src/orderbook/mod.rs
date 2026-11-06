@@ -65,6 +65,7 @@ mod expiry_lifecycle;
 mod expiry_scheduler;
 mod fees;
 pub mod greeks_aggregator;
+#[cfg(feature = "clock")]
 pub mod greeks_engine;
 mod index_feed;
 mod index_price_feed;
@@ -105,6 +106,7 @@ pub use expiry_lifecycle::{
 };
 pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
 pub use greeks_aggregator::{AggregatedGreeks, GreeksAggregator, Position};
+#[cfg(feature = "clock")]
 pub use greeks_engine::{
     FlatVolSurface, GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener,
     VolSurface, calculate_tte_years,

@@ -176,6 +176,14 @@ pub enum Error {
         symbol: String,
     },
 
+    /// Error when resolving an expiration needs the wall clock and the crate
+    /// was built without the `clock` feature.
+    #[error("resolving expiration {expiration} needs the `clock` feature")]
+    ClockRequired {
+        /// The expiration that could not be resolved.
+        expiration: String,
+    },
+
     /// Error when a symbol names several same-day expirations, so a lookup by
     /// symbol alone cannot choose one.
     #[error("ambiguous symbol {symbol}: {count} expirations share it")]
@@ -361,6 +369,14 @@ impl Error {
     pub fn symbol_not_found(symbol: impl Into<String>) -> Self {
         Self::SymbolNotFound {
             symbol: symbol.into(),
+        }
+    }
+
+    /// Creates a new clock required error.
+    #[must_use]
+    pub fn clock_required(expiration: impl Into<String>) -> Self {
+        Self::ClockRequired {
+            expiration: expiration.into(),
         }
     }
 

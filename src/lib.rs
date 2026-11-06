@@ -105,9 +105,9 @@
 //! - **Mark price**: [`orderbook::MarkPriceCalculator`] computes a configurable
 //!   weighted average of index / mid / last-trade prices with `Decimal`
 //!   dampening to bound per-update movement.
-//! - **Greeks**: [`orderbook::GreeksEngine`] prices each contract through
+//! - **Greeks** (`clock` feature): `orderbook::GreeksEngine` prices each contract through
 //!   `optionstratlib` from a supplied implied volatility (read from a
-//!   [`orderbook::VolSurface`] by the integrator and passed in — the engine
+//!   `orderbook::VolSurface` by the integrator and passed in — the engine
 //!   takes the IV directly, it does not query the surface itself), and
 //!   [`orderbook::GreeksAggregator`] sums per-position Greeks across the
 //!   hierarchy into [`orderbook::AggregatedGreeks`] using `Decimal`.
@@ -181,7 +181,7 @@
 //!   with an identically-behaving clock; otherwise leaves stamp and admit
 //!   against the wall clock.
 //! - **Pricing inputs are supplied by the integrator.** The crate ships only a
-//!   trivial [`orderbook::FlatVolSurface`] and mock / static index feeds
+//!   trivial `orderbook::FlatVolSurface` and mock / static index feeds
 //!   ([`orderbook::MockPriceFeed`], [`orderbook::StaticPriceFeed`]); a
 //!   production volatility surface and a live index price feed are the caller's
 //!   responsibility.
@@ -359,9 +359,8 @@ pub use orderbook::{
     Clock, ContractSpecs, ContractSpecsBuilder, CycleRule, ExerciseStyle, ExpirationCallback,
     ExpirationEvictExpiredResult, ExpirationManagerStats, ExpirationMassCancelResult,
     ExpirationOrderBook, ExpirationOrderBookManager, ExpiryCycleConfig, ExpiryLifecycleManager,
-    ExpiryScheduler, ExpiryType, FeeSchedule, FlatVolSurface, GlobalEvictExpiredResult,
-    GlobalMassCancelResult, GlobalStats, GreeksAggregator, GreeksEngine, GreeksRecalcTrigger,
-    GreeksUpdate, GreeksUpdateListener, Hash32, IndexPriceFeed, InstrumentInfo, InstrumentRegistry,
+    ExpiryScheduler, ExpiryType, FeeSchedule, GlobalEvictExpiredResult, GlobalMassCancelResult,
+    GlobalStats, GreeksAggregator, Hash32, IndexPriceFeed, InstrumentInfo, InstrumentRegistry,
     InstrumentStatus, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
     MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder, MassCancelResult, MockPriceFeed,
     MonotonicClock, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
@@ -372,7 +371,12 @@ pub use orderbook::{
     StrikeRangeConfigBuilder, StubClock, SubscriptionId, SymbolIndex, SymbolRef,
     TerminalOrderSummary, TimeInForce, TimestampMs, TradeResult, UnderlyingEvictExpiredResult,
     UnderlyingMassCancelResult, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
-    Uuid, ValidationConfig, VolSurface, calculate_tte_years, wire_feed_to_calculator,
+    Uuid, ValidationConfig, wire_feed_to_calculator,
+};
+#[cfg(feature = "clock")]
+pub use orderbook::{
+    FlatVolSurface, GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener,
+    VolSurface, calculate_tte_years,
 };
 
 #[cfg(feature = "nats")]

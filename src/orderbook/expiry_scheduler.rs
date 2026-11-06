@@ -17,7 +17,7 @@
 //! use option_chain_orderbook::orderbook::{
 //!     ExpiryScheduler, ExpiryCycleConfig, StrikeRangeConfig, UnderlyingOrderBook,
 //! };
-//! use chrono::Utc;
+//! use chrono::{TimeZone, Utc};
 //!
 //! let book = UnderlyingOrderBook::new("BTC");
 //! let expiry_config = ExpiryCycleConfig::default();
@@ -31,7 +31,7 @@
 //!
 //! let result = ExpiryScheduler::refresh_expirations(
 //!     &book,
-//!     Utc::now(),
+//!     Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date"),
 //!     &expiry_config,
 //!     &strike_config,
 //!     50000,
@@ -156,7 +156,7 @@ impl ExpiryScheduler {
     /// use option_chain_orderbook::orderbook::{
     ///     ExpiryScheduler, ExpiryCycleConfig, StrikeRangeConfig, UnderlyingOrderBook,
     /// };
-    /// use chrono::Utc;
+    /// use chrono::{TimeZone, Utc};
     ///
     /// let book = UnderlyingOrderBook::new("BTC");
     /// let expiry_config = ExpiryCycleConfig::default();
@@ -170,7 +170,7 @@ impl ExpiryScheduler {
     ///
     /// let result = ExpiryScheduler::refresh_expirations(
     ///     &book,
-    ///     Utc::now(),
+    ///     Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date"),
     ///     &expiry_config,
     ///     &strike_config,
     ///     50000,
@@ -269,7 +269,7 @@ impl ExpiryScheduler {
     ///     ExpiryScheduler, ExpiryCycleConfig, ExpiryType, StrikeRangeConfig,
     ///     UnderlyingOrderBook,
     /// };
-    /// use chrono::Utc;
+    /// use chrono::{TimeZone, Utc};
     ///
     /// let book = UnderlyingOrderBook::new("BTC");
     ///
@@ -284,7 +284,7 @@ impl ExpiryScheduler {
     ///         .expect("valid"),
     /// ).expect("valid");
     ///
-    /// let result = ExpiryScheduler::refresh_from_underlying(&book, Utc::now(), 50000, None)
+    /// let result = ExpiryScheduler::refresh_from_underlying(&book, Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date"), 50000, None)
     ///     .expect("refresh should succeed");
     /// ```
     pub fn refresh_from_underlying(
@@ -331,7 +331,7 @@ impl ExpiryScheduler {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "clock"))]
 // Tests read the wall clock to build relative expiries and check them.
 #[allow(clippy::disallowed_methods)]
 mod tests {

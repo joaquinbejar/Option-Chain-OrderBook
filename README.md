@@ -119,9 +119,9 @@ matching engine itself is `orderbook-rs`. On top of that engine it provides:
 - **Mark price**: [`orderbook::MarkPriceCalculator`] computes a configurable
   weighted average of index / mid / last-trade prices with `Decimal`
   dampening to bound per-update movement.
-- **Greeks**: [`orderbook::GreeksEngine`] prices each contract through
+- **Greeks** (`clock` feature): `orderbook::GreeksEngine` prices each contract through
   `optionstratlib` from a supplied implied volatility (read from a
-  [`orderbook::VolSurface`] by the integrator and passed in — the engine
+  `orderbook::VolSurface` by the integrator and passed in — the engine
   takes the IV directly, it does not query the surface itself), and
   [`orderbook::GreeksAggregator`] sums per-position Greeks across the
   hierarchy into [`orderbook::AggregatedGreeks`] using `Decimal`.
@@ -195,7 +195,7 @@ matching engine itself is `orderbook-rs`. On top of that engine it provides:
   with an identically-behaving clock; otherwise leaves stamp and admit
   against the wall clock.
 - **Pricing inputs are supplied by the integrator.** The crate ships only a
-  trivial [`orderbook::FlatVolSurface`] and mock / static index feeds
+  trivial `orderbook::FlatVolSurface` and mock / static index feeds
   ([`orderbook::MockPriceFeed`], [`orderbook::StaticPriceFeed`]); a
   production volatility surface and a live index price feed are the caller's
   responsibility.
