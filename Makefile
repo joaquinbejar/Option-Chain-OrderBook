@@ -65,8 +65,16 @@ run:
 fix:
 	cargo fix --allow-staged --allow-dirty
 
+# With the clock feature off: no chrono clock in the graph, and the tests pass.
+.PHONY: test-no-clock
+test-no-clock:
+	@if cargo tree -e features -i chrono | grep -q 'chrono feature "clock"'; then \
+		echo "chrono/clock is in the graph without the clock feature"; exit 1; fi
+	cargo clippy --all-targets -- -D warnings
+	LOGLEVEL=WARN cargo test
+
 .PHONY: pre-push
-pre-push: fix fmt lint-fix lint-selftest test readme doc
+pre-push: fix fmt lint-fix lint-selftest test test-no-clock readme doc
 
 .PHONY: doc
 doc:

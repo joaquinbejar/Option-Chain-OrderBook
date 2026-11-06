@@ -47,6 +47,9 @@ uuid = { workspace = true }
 
 [features]
 default = []
+# The wall clock: the `Days` expiration arm and the Greeks engine. Off, no
+# package in this crate's graph enables `chrono/clock`.
+clock = ["chrono/clock", "optionstratlib/clock"]
 nats = ["dep:async-nats", "dep:bytes", "dep:tokio", "orderbook-rs/nats"]
 sequencer = ["dep:tokio", "orderbook-rs/journal"]
 
@@ -74,7 +77,7 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [workspace.dependencies]
-optionstratlib = { version = "0.23", default-features = false, features = ["pricing"] }
+optionstratlib = { version = "0.24", default-features = false, features = ["pricing"] }
 orderbook-rs = { version = "0.15", features = ["special_orders"] }
 uuid = { version = "1.27", features = ["v4", "v5"] }
 # Must track the `async-nats` line orderbook-rs uses, so both crates share one
@@ -89,7 +92,7 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 rust_decimal = { version = "1.43", features = ["serde-with-float", "maths"] }
 rust_decimal_macros = "1.40"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 thiserror = "2.0"
 crossbeam-skiplist = "0.1"
 pricelevel = "0.10"

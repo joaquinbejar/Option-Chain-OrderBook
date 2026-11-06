@@ -18,7 +18,7 @@ log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 # The log is parsed: no colour codes, whatever CI sets. Clippy exits 0 here:
 # the probe hits are warnings, not denied.
-if ! CARGO_TERM_COLOR=never cargo clippy --lib --color never --message-format=short \
+if ! CARGO_TERM_COLOR=never cargo clippy --lib --features clock --color never --message-format=short \
     -- --cfg ocob_lint_probe >"$log" 2>&1; then
     cat "$log" >&2
     fail "clippy failed on the probe"

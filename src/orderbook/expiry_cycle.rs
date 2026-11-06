@@ -65,10 +65,10 @@ pub struct CycleRule {
 ///
 /// ```
 /// use option_chain_orderbook::orderbook::ExpiryCycleConfig;
-/// use chrono::Utc;
+/// use chrono::{TimeZone, Utc};
 ///
 /// let config = ExpiryCycleConfig::default();
-/// let dates = config.generate_dates(Utc::now()).expect("should succeed");
+/// let dates = config.generate_dates(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date")).expect("should succeed");
 /// assert!(!dates.is_empty());
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,14 +216,14 @@ impl ExpiryCycleConfig {
     ///
     /// ```
     /// use option_chain_orderbook::orderbook::{CycleRule, ExpiryType, ExpiryCycleConfig};
-    /// use chrono::{NaiveTime, Utc};
+    /// use chrono::{NaiveTime, TimeZone, Utc};
     ///
     /// let config = ExpiryCycleConfig {
     ///     cycles: vec![CycleRule { cycle_type: ExpiryType::Daily, count: 3 }],
     ///     expiry_time_utc: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
     ///     settlement_time_utc: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
     /// };
-    /// let dates = config.generate_dates(Utc::now()).expect("should succeed");
+    /// let dates = config.generate_dates(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date")).expect("should succeed");
     /// assert_eq!(dates.len(), 3);
     /// ```
     pub fn generate_dates(&self, from: DateTime<Utc>) -> Result<Vec<ExpirationDate>> {
@@ -496,9 +496,10 @@ mod tests {
     }
 
     fn expiration_naive(exp: &ExpirationDate) -> NaiveDate {
-        exp.get_date()
-            .expect("test date should be valid")
-            .date_naive()
+        match exp {
+            ExpirationDate::DateTime(dt) => dt.date_naive(),
+            ExpirationDate::Days(_) => panic!("expected an absolute expiration"),
+        }
     }
 
     // ── Default ──────────────────────────────────────────────────────────────

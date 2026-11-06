@@ -23,6 +23,8 @@ use std::sync::Once;
 /// # Errors
 ///
 /// Returns an error if a `Days` expiration cannot be resolved to a date.
+/// Without the `clock` feature it never can: the error is
+/// [`Error::ClockRequired`].
 ///
 /// # Examples
 ///
@@ -39,6 +41,7 @@ use std::sync::Once;
 pub fn format_expiration_yyyymmdd(expiration: &ExpirationDate) -> Result<String> {
     match expiration {
         ExpirationDate::DateTime(dt) => Ok(format_yyyymmdd(*dt)),
+        #[cfg(feature = "clock")]
         ExpirationDate::Days(_) => {
             #[expect(
                 clippy::disallowed_methods,
@@ -47,6 +50,8 @@ pub fn format_expiration_yyyymmdd(expiration: &ExpirationDate) -> Result<String>
             let date = expiration.get_date()?;
             Ok(format_yyyymmdd(date))
         }
+        #[cfg(not(feature = "clock"))]
+        ExpirationDate::Days(_) => Err(Error::clock_required(expiration_label(expiration))),
     }
 }
 
@@ -64,7 +69,9 @@ fn format_yyyymmdd(instant: DateTime<Utc>) -> String {
 /// instant alone, without reading the wall clock (`Display` resolves the
 /// date against the wall clock even then). A relative
 /// [`ExpirationDate::Days`] uses `Display`, which reads the wall clock, as
-/// it must.
+/// it must. Without the `clock` feature it reads no clock and gives the day
+/// count (`30 days`) instead, which is also what a `Days` leaf's symbol
+/// carries then.
 ///
 /// # Examples
 ///
@@ -491,8 +498,28 @@ impl SymbolParser {
 mod tests {
     use super::*;
     use chrono::{Datelike, TimeZone, Utc};
+    #[cfg(feature = "clock")]
     use optionstratlib::prelude::pos_or_panic;
 
+    fn absolute(expiration: &ExpirationDate) -> DateTime<Utc> {
+        match expiration {
+            ExpirationDate::DateTime(dt) => *dt,
+            ExpirationDate::Days(_) => panic!("expected an absolute expiration"),
+        }
+    }
+
+    #[cfg(not(feature = "clock"))]
+    #[test]
+    fn test_days_expiration_without_clock_is_refused_and_labelled_by_count() {
+        let expiration = ExpirationDate::Days(optionstratlib::prelude::pos_or_panic!(30.0));
+        assert!(matches!(
+            format_expiration_yyyymmdd(&expiration),
+            Err(Error::ClockRequired { .. })
+        ));
+        assert_eq!(expiration_label(&expiration), "30 days");
+    }
+
+    #[cfg(feature = "clock")]
     #[test]
     fn test_format_expiration_yyyymmdd_days() {
         let expiration = ExpirationDate::Days(pos_or_panic!(30.0));
@@ -634,7 +661,7 @@ mod tests {
     #[test]
     fn test_parsed_symbol_expiration_date_correctness() {
         let parsed = SymbolParser::parse("BTC-20260130-50000-C").expect("should parse");
-        let date = parsed.expiration().get_date().expect("should get date");
+        let date = absolute(parsed.expiration());
         assert_eq!(date.year(), 2026);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 30);
@@ -645,7 +672,7 @@ mod tests {
         let result = parse_yyyymmdd("20260130", "test");
         assert!(result.is_ok());
         let exp = result.expect("should parse");
-        let date = exp.get_date().expect("should get date");
+        let date = absolute(&exp);
         assert_eq!(date.year(), 2026);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 30);

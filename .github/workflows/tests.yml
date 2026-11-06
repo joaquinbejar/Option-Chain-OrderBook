@@ -50,3 +50,6 @@ jobs:
 
       - name: Run tests
         run: make test
+
+      - name: Run tests without the clock feature
+        run: make test-no-clock

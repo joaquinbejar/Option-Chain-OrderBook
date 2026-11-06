@@ -28,7 +28,7 @@
 //!     ExpiryLifecycleManager, ExpiryCycleConfig, LifecycleConfig,
 //!     UnderlyingOrderBook,
 //! };
-//! use chrono::Utc;
+//! use chrono::{TimeZone, Utc};
 //!
 //! let book = UnderlyingOrderBook::new("BTC");
 //! let expiry_config = ExpiryCycleConfig::default();
@@ -36,7 +36,7 @@
 //!
 //! let result = ExpiryLifecycleManager::check_expirations(
 //!     &book,
-//!     Utc::now(),
+//!     Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date"),
 //!     &expiry_config,
 //!     &lifecycle_config,
 //!     None,
@@ -237,7 +237,7 @@ impl ExpiryLifecycleManager {
     ///     ExpiryLifecycleManager, ExpiryCycleConfig, LifecycleConfig,
     ///     UnderlyingOrderBook,
     /// };
-    /// use chrono::Utc;
+    /// use chrono::{TimeZone, Utc};
     ///
     /// let book = UnderlyingOrderBook::new("BTC");
     /// let expiry_config = ExpiryCycleConfig::default();
@@ -245,7 +245,7 @@ impl ExpiryLifecycleManager {
     ///
     /// let result = ExpiryLifecycleManager::check_expirations(
     ///     &book,
-    ///     Utc::now(),
+    ///     Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).single().expect("valid date"),
     ///     &expiry_config,
     ///     &lifecycle_config,
     ///     None,
