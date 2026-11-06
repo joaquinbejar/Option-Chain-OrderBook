@@ -1111,7 +1111,7 @@ fn test_sequenced_identical_runs_produce_identical_trade_ids() {
     // namespace, AND a deterministic envelope timestamp source (#157), driven
     // through the identical command stream, produce FULLY byte-identical
     // journals — no field normalization. The namespace fixes the trade-ID root
-    // (each leaf derives UUIDv5(root, symbol)), the stub clock fixes the engine
+    // (each leaf derives a namespace from the root and its full path), the stub clock fixes the engine
     // timestamps, and the injected timestamp source fixes the one field that
     // previously had to be normalized: the event envelope `timestamp_ns`.
     fn run(root: Uuid) -> Vec<serde_json::Value> {

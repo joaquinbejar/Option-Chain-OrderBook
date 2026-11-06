@@ -10,7 +10,7 @@
 //! # Path encoding (version 1)
 //!
 //! `b"ocob-node/1"`, then the level tag (`1` expiration, `2` chain, `3`
-//! strike, `4` leaf), then the fields of that level, in this order:
+//! strike, `4` leaf, `5` leaf trade-ID namespace), then the fields of that level, in this order:
 //!
 //! - underlying: its UTF-8 length as an unsigned LEB128 varint, then its
 //!   bytes;
@@ -20,7 +20,7 @@
 //!   an `i64` and the sub-second nanoseconds as a `u32`, both little endian,
 //!   for [`ExpirationDate::DateTime`] (the full instant, not only the day);
 //! - strike (strike and leaf levels): the `u64` strike, little endian;
-//! - style (leaf level): `0` call, `1` put.
+//! - style (leaf and trade-ID namespace levels): `0` call, `1` put.
 //!
 //! So each level encodes exactly these fields after its tag:
 //!
@@ -30,12 +30,17 @@
 //! | chain | `2` | underlying, expiration |
 //! | strike | `3` | underlying, expiration, strike |
 //! | leaf | `4` | underlying, expiration, strike, style |
+//! | leaf trade-ID namespace | `5` | underlying, expiration, strike, style |
 //!
 //! The level tag fixes which fields follow, and every field has a fixed
 //! width or a length prefix, so two distinct paths never encode to the same
 //! bytes. Distinct encodings give distinct ids up to the collision
 //! resistance of UUIDv5 (SHA-1, truncated to 122 bits): the encoding is
 //! unambiguous, the hash is not a proof of injectivity.
+//!
+//! The trade-ID namespace of a hierarchy leaf uses the same encoding, so two
+//! expirations on one day at different instants get distinct trade-ID
+//! streams even though their leaves share a symbol.
 
 use super::expiration_key::ExpirationKey;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -56,6 +61,8 @@ pub(crate) enum NodeLevel {
     Strike,
     /// An [`OptionOrderBook`](super::OptionOrderBook) leaf.
     Leaf,
+    /// The trade-ID namespace of a leaf.
+    LeafTradeNamespace,
 }
 
 impl NodeLevel {
@@ -65,6 +72,7 @@ impl NodeLevel {
             Self::Chain => 2,
             Self::Strike => 3,
             Self::Leaf => 4,
+            Self::LeafTradeNamespace => 5,
         }
     }
 }
@@ -137,6 +145,23 @@ impl<'a> NodePath<'a> {
         }
     }
 
+    /// The path of the trade-ID namespace of a call or put leaf.
+    #[must_use]
+    pub(crate) const fn leaf_trade_namespace(
+        underlying: &'a str,
+        expiration: &'a ExpirationDate,
+        strike: u64,
+        style: OptionStyle,
+    ) -> Self {
+        Self {
+            level: NodeLevel::LeafTradeNamespace,
+            underlying,
+            expiration,
+            strike: Some(strike),
+            style: Some(style),
+        }
+    }
+
     /// The version 1 encoding of this path (see the module docs).
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -188,6 +213,13 @@ fn push_varint(bytes: &mut Vec<u8>, mut value: usize) {
 #[must_use]
 pub(crate) fn derived_node_id(root: Uuid, path: &NodePath<'_>) -> OrderId {
     OrderId::from_uuid(Uuid::new_v5(&root, &path.encode()))
+}
+
+/// The trade-ID namespace of the leaf at `path` under `root`:
+/// `UUIDv5(root, path)`.
+#[must_use]
+pub(crate) fn derived_trade_namespace(root: Uuid, path: &NodePath<'_>) -> Uuid {
+    Uuid::new_v5(&root, &path.encode())
 }
 
 /// A random node id, for a node built without a trade-ID root namespace.

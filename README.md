@@ -177,7 +177,7 @@ matching engine itself is `orderbook-rs`. On top of that engine it provides:
   default each leaf's trade-ID namespace is a random `Uuid::new_v4()`, so
   trade IDs and timestamps differ from run to run. Inject a root namespace
   via the sequencer's `set_trade_id_namespace` (each leaf then derives
-  `UUIDv5(root, symbol)`) together with a deterministic clock via `set_clock`,
+  a namespace from `root` and its full path, expiration instant included) together with a deterministic clock via `set_clock`,
   both before the first submit: two identically-seeded sequenced runs on
   fresh instances then produce identical trade payloads (ids, engine trade
   timestamps, `engine_seq`). Additionally injecting an event-envelope

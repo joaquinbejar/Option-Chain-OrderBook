@@ -176,6 +176,16 @@ pub enum Error {
         symbol: String,
     },
 
+    /// Error when a symbol names several same-day expirations, so a lookup by
+    /// symbol alone cannot choose one.
+    #[error("ambiguous symbol {symbol}: {count} expirations share it")]
+    AmbiguousSymbol {
+        /// The ambiguous symbol.
+        symbol: String,
+        /// How many expirations share it.
+        count: usize,
+    },
+
     /// Error when a command's symbol names a different underlying than the book
     /// it is routed to (e.g. an ETH command submitted to a BTC book).
     #[error(
@@ -351,6 +361,15 @@ impl Error {
     pub fn symbol_not_found(symbol: impl Into<String>) -> Self {
         Self::SymbolNotFound {
             symbol: symbol.into(),
+        }
+    }
+
+    /// Creates a new ambiguous symbol error.
+    #[must_use]
+    pub fn ambiguous_symbol(symbol: impl Into<String>, count: usize) -> Self {
+        Self::AmbiguousSymbol {
+            symbol: symbol.into(),
+            count,
         }
     }
 

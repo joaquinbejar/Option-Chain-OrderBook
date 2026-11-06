@@ -13,7 +13,7 @@ use super::index_feed::IndexPriceFeed;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::shared::Shared;
 use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
-use super::symbol_index::SymbolIndex;
+use super::symbol_index::{SymbolIndex, SymbolRef};
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crate::utils::{checked_accumulate, expiration_label};
@@ -1452,7 +1452,7 @@ impl UnderlyingOrderBookManager {
     /// Existing books are not affected. Only newly created books via
     /// [`get_or_create`](Self::get_or_create) will have this root propagated down
     /// to their expirations, chains, and strikes, where each leaf derives
-    /// `UUIDv5(root, symbol)` at construction. Set it before the first order for
+    /// a namespace from the root and its full path at construction. Set it before the first order for
     /// deterministic trade IDs across runs sharing the root.
     #[inline]
     pub fn set_trade_id_namespace(&self, namespace: Uuid) {
@@ -1500,6 +1500,8 @@ impl UnderlyingOrderBookManager {
     /// # Errors
     ///
     /// Returns `Error::SymbolNotFound` if the symbol is not registered.
+    /// Returns `Error::AmbiguousSymbol` if same-day expirations share the
+    /// symbol; use [`get_by_symbol_at`](Self::get_by_symbol_at) for those.
     /// Returns hierarchy errors if the underlying/expiration/strike no longer exists.
     ///
     /// # Note
@@ -1509,11 +1511,39 @@ impl UnderlyingOrderBookManager {
     /// `StrikeNotFound` rather than `SymbolNotFound`. This is acceptable since
     /// strike removal is rare and the symbol is correctly deregistered.
     pub fn get_by_symbol(&self, symbol: &str) -> Result<Arc<super::book::OptionOrderBook>> {
+        let mut entries = self.symbol_index.get_all(symbol);
+        if entries.len() > 1 {
+            return Err(Error::ambiguous_symbol(symbol, entries.len()));
+        }
+        let sym_ref = entries
+            .pop()
+            .ok_or_else(|| Error::symbol_not_found(symbol))?;
+        self.book_at(&sym_ref)
+    }
+
+    /// Gets an option order book by its symbol and full expiration.
+    ///
+    /// A symbol carries only the expiration day; this names the instant too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::SymbolNotFound` if the symbol has no entry at that
+    /// expiration. Returns hierarchy errors if the underlying, expiration or
+    /// strike no longer exists.
+    pub fn get_by_symbol_at(
+        &self,
+        symbol: &str,
+        expiration: &ExpirationDate,
+    ) -> Result<Arc<super::book::OptionOrderBook>> {
         let sym_ref = self
             .symbol_index
-            .get(symbol)
+            .get_at(symbol, expiration)
             .ok_or_else(|| Error::symbol_not_found(symbol))?;
+        self.book_at(&sym_ref)
+    }
 
+    /// Walks the hierarchy to the leaf of an index entry.
+    fn book_at(&self, sym_ref: &SymbolRef) -> Result<Arc<super::book::OptionOrderBook>> {
         let underlying = self.get(sym_ref.underlying())?;
         let expiration = underlying.get_expiration(sym_ref.expiration())?;
         let strike = expiration.get_strike(sym_ref.strike())?;

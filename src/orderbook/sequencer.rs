@@ -43,7 +43,7 @@
 //! set via
 //! [`set_trade_id_namespace`](SequencedUnderlyingOrderBook::set_trade_id_namespace)
 //! propagates down the hierarchy, and each leaf derives its own
-//! `UUIDv5(root, symbol)` at construction (so a strike's call and put get
+//! a namespace from the root and its full path at construction (so a strike's call and put get
 //! distinct namespaces from their distinct symbols). Set the root — and an
 //! injected [`Clock`] via
 //! [`set_clock`](SequencedUnderlyingOrderBook::set_clock) — BEFORE the first
@@ -1137,7 +1137,7 @@ impl SequencedUnderlyingOrderBook {
     ///
     /// Delegates to [`UnderlyingOrderBook::set_trade_id_namespace`], so the root
     /// is propagated to expirations, chains, and strikes created *after* this
-    /// call; each leaf derives its own `UUIDv5(root, symbol)` at construction
+    /// call; each leaf derives its own namespace from the root and its full path at construction
     /// (call and put get distinct namespaces from their distinct symbols). Set it
     /// BEFORE the first [`submit`](Self::submit): leaves vivified by earlier
     /// commands keep whatever namespace they were built with (the upstream

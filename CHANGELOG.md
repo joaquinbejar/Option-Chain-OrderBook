@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **Same-day expirations no longer collide in the symbol index or the trade-ID namespace ([#179](https://github.com/joaquinbejar/Option-Chain-OrderBook/issues/179)).** A leaf symbol still carries only the expiration day and its format does not change.
+  - A hierarchy leaf's trade-ID namespace is now `UUIDv5(root, path)`, with the encoding of `orderbook::node_id` and the full expiration instant, instead of `UUIDv5(root, symbol)`. **This changes the namespace and every trade id of every hierarchy leaf with a root namespace, same-day or not.** Identical inputs still give identical ids across runs and hierarchies. A journal or replay that compares recorded trade ids must be recorded again. A standalone `OptionOrderBook` with `trade_id_root_namespace` and no `trade_id_namespace` keeps `UUIDv5(root, symbol)`.
+  - `SymbolIndex` keeps one entry per symbol and expiration. `SymbolIndex::get` returns `None` for a symbol shared by several expirations instead of one of them. `register` overwrites only an entry with the same expiration, `deregister` removes every entry of the symbol, and `len` counts entries.
+  - `UnderlyingOrderBookManager::get_by_symbol` returns the new `Error::AmbiguousSymbol` for such a symbol.
+  - `BookConfig` has a new public field, `trade_id_namespace`.
+
+### Added
+
+- `SymbolIndex::get_at`, `get_all` and `deregister_at`, and `UnderlyingOrderBookManager::get_by_symbol_at`, which select an entry by its full expiration.
+
+### Known limitation
+
+- Same-day leaves still share a display symbol, and everything keyed by it. `SymbolParser` resolves a symbol to the canonical expiry time of its day, so sequencer commands addressed by symbol reach only an expiration at that instant. NATS subjects built from the symbol are shared too.
+
 ## [0.14.3] - 2026-11-02
 
 ### Fixed
