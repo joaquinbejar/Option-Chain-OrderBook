@@ -118,17 +118,17 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) · [crates.io](https://crates.io/crates/orderbook-rs) | High-performance, lock-free limit order book and matching engine. |
-| [PriceLevel](https://github.com/joaquinbejar/PriceLevel) · [crates.io](https://crates.io/crates/pricelevel) | Lock-free price level implementation for limit order books. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Option contract types, expiration dates and pricing used to key and value the chain. |
+| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | The lock-free matching engine that backs the order book of each option. |
+| [PriceLevel](https://github.com/joaquinbejar/PriceLevel) | Price level and order primitives shared with the underlying order books. |
 
 ### Used by
 
 | Repository | Description |
 |------------|-------------|
-| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange-in-a-box: local options exchange simulator with realistic matching, FIX/WS/REST APIs and historical replay. |
-| [IronCondor](https://github.com/joaquinbejar/IronCondor) | Backtesting engine for options strategies with order-book-level fill simulation. |
-| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) | Quantitative market making strategies, starting with the Avellaneda-Stoikov model. |
-| [Option-Chain-OrderBook-Backend](https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend) | REST and WebSocket backend service exposing Option-Chain-OrderBook. |
+| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange-in-a-box options venue simulator; uses the chain books and sequencer as its matching core. |
+| [IronCondor](https://github.com/joaquinbejar/IronCondor) | Options backtesting engine; uses Option-Chain-OrderBook for order-book-level fill simulation. |
+| [market-maker-rs](https://github.com/joaquinbejar/market-maker-rs) | Quantitative market making library; uses Option-Chain-OrderBook for options quoting across the chain. |
+| [Option-Chain-OrderBook-Backend](https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend) | Axum REST and WebSocket backend that serves Option-Chain-OrderBook over HTTP with market making and JWT auth. |
 
 <!-- related-projects:end -->
